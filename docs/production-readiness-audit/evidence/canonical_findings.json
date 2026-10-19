@@ -1,0 +1,1331 @@
+[
+  {
+    "id": "F-001",
+    "severity": "P0",
+    "title": "Older double-opt-in challenges can restore permission after a later denial or withdrawal",
+    "category": "Consent state",
+    "status": "CONFIRMED \u2014 memory reproduction; durable implementation traced",
+    "evidence": [
+      "internal/service/service.go:256-325",
+      "internal/store/postgres.go:340-383",
+      "internal/store/postgres.go:142-143",
+      "internal/store/memory.go:286-314"
+    ],
+    "impact": "A previously issued challenge remains usable after the subject changes their mind. Confirmation makes the old row newest and evaluation returns allowed=true. Two audit probes reproduced denial and withdrawal being overridden. This breaks the documented withdrawal/effective-state safety rule.",
+    "work": "Introduce a transactionally controlled preference generation or current-state record keyed by tenant, canonical subject, purpose and channel. Bind every challenge to that generation. Denial, withdrawal and superseding challenges must atomically invalidate prior challenges. Recheck generation, current policy and expiry under the same YSQL transaction before creating receipt/audit/outbox. Preserve historical evidence; migrate additively.",
+    "criteria": [
+      "Starting a challenge, recording a later denial, and confirming the older challenge never grants permission.",
+      "An older challenge cannot restore a newer consent after that newer consent is withdrawn.",
+      "Concurrent confirm/deny/withdraw operations converge to the approved order with one atomic state/audit/outbox outcome.",
+      "Re-run the two stale-challenge audit probes and equivalent tests on real YSQL."
+    ],
+    "effort": [
+      4,
+      7
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-03"
+    ],
+    "apis": [
+      "API-04",
+      "API-05",
+      "API-09",
+      "API-10"
+    ],
+    "tables": [
+      "consents",
+      "consent_receipts",
+      "consent_audit_events",
+      "consent_outbox_events"
+    ],
+    "roles": "Data subjects, writers and all consuming apps",
+    "task": "T-001",
+    "acceptance": "AT-001",
+    "gate": "G-001"
+  },
+  {
+    "id": "F-002",
+    "severity": "P1",
+    "title": "Double-opt-in confirmation omits the self-service customer boundary",
+    "category": "Authorization",
+    "status": "CONFIRMED \u2014 HTTP handler reproduction with memory store",
+    "evidence": [
+      "cmd/server/main.go:109-118",
+      "cmd/server/main.go:343-362",
+      "internal/service/service.go:305-325",
+      "README.md:41"
+    ],
+    "impact": "A self_service JWT for customer B confirmed customer A's valid token in the same tenant and received A's granted consent. A valid victim challenge token is required; the audit does not claim tokens can be guessed or cross-tenant confirmation succeeds.",
+    "work": "Pass the authenticated principal/customer constraint into a confirmation operation that resolves the pending challenge and enforces object authorization before any mutation. Recheck inside the atomic confirmation path or bind authorization to the locked record. Preserve broader tenant roles deliberately; reject self_service tokens missing customer_subject_id. Avoid leaking receipt or consent data on rejection.",
+    "criteria": [
+      "Customer B using customer A's challenge token receives a uniform forbidden/not-found result and causes no state, receipt, audit or outbox mutation.",
+      "Own-subject confirmation and approved tenant-wide writer/admin flows succeed.",
+      "Cross-tenant, missing-customer-claim and mixed-role cases follow an approved permission matrix."
+    ],
+    "effort": [
+      1,
+      3
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-06"
+    ],
+    "apis": [
+      "API-10"
+    ],
+    "tables": [
+      "consents",
+      "consent_receipts"
+    ],
+    "roles": "self_service",
+    "task": "T-002",
+    "acceptance": "AT-002",
+    "gate": "G-002"
+  },
+  {
+    "id": "F-003",
+    "severity": "P1",
+    "title": "Self-service receives the secret needed to bypass independent double-opt-in confirmation",
+    "category": "Double opt-in integration",
+    "status": "CONFIRMED \u2014 HTTP start and immediate confirmation reproduced; delivery design undecided",
+    "evidence": [
+      "cmd/server/main.go:319-340",
+      "internal/domain/model.go:127-130",
+      "internal/service/service.go:271-302"
+    ],
+    "impact": "A self-service caller receives confirmation_token and immediately echoes it to obtain allowed=true without any delivery step. The challenge is bound to a channel label, not a verified destination. No message-delivery adapter or trusted delivery contract is present.",
+    "work": "Decide which trusted NVUTO component owns confirmation delivery. Return an opaque challenge reference/status to untrusted callers; keep the raw secret within an approved delivery path. Bind the challenge to tenant, canonical subject, purpose, channel, verified destination/version, notice and generation. Define resend, cancel, maximum lifetime, retry and abuse controls without exposing tokens in events or logs.",
+    "criteria": [
+      "A self-service initiation response cannot disclose the confirmation capability.",
+      "An approved sandbox delivery journey proves the intended destination receives the challenge and confirmation is bound to that destination and subject.",
+      "Resend/cancel/expiry/replay and partial delivery failures have documented, tested outcomes."
+    ],
+    "effort": [
+      4,
+      8
+    ],
+    "dependencies": [
+      "T-001",
+      "T-002"
+    ],
+    "decisions": [
+      "D-02",
+      "D-07"
+    ],
+    "apis": [
+      "API-09",
+      "API-10"
+    ],
+    "tables": [
+      "consents",
+      "consent_outbox_events"
+    ],
+    "roles": "self_service, trusted delivery integrator",
+    "task": "T-003",
+    "acceptance": "AT-003",
+    "gate": "G-003"
+  },
+  {
+    "id": "F-004",
+    "severity": "P1",
+    "title": "Receipt hashes do not survive the actual pgx timestamp precision round trip",
+    "category": "Evidence integrity",
+    "status": "CONFIRMED \u2014 pgx codec reproduction; live YSQL round trip not run",
+    "evidence": [
+      "internal/service/service.go:108-117",
+      "internal/store/postgres.go:119-122",
+      "internal/store/postgres.go:289-297",
+      "migrations/002_policy_governance.sql:57-70"
+    ],
+    "impact": "receiptHash hashes a Go IssuedAt with nanoseconds, while the real pgx timestamptz codec changes .123456789 to .123456. Re-hashing that decoded receipt fails. Existing tests only check a nonempty hash, so they miss this defect.",
+    "work": "Define a versioned canonical receipt serialization and timestamp precision before hashing. Persist the exact signed/hashed payload or normalize every hashed field to a stable representation. Add a verifier that distinguishes old and new receipt formats; never rewrite immutable historic receipts to hide mismatches. Decide how existing non-verifiable receipts will be annotated and reconciled.",
+    "criteria": [
+      "Hash verification succeeds before storage, after a real YSQL read, and after JSON export/import.",
+      "Nanosecond input, timezone offsets, map ordering and unicode cases produce deterministic documented bytes.",
+      "Historic receipt remediation preserves original evidence and produces a reviewable reconciliation report."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-05"
+    ],
+    "apis": [
+      "API-04",
+      "API-10",
+      "API-11"
+    ],
+    "tables": [
+      "consent_receipts"
+    ],
+    "roles": "Privacy reviewers, data subjects, consuming apps",
+    "task": "T-004",
+    "acceptance": "AT-004",
+    "gate": "G-004"
+  },
+  {
+    "id": "F-005",
+    "severity": "P1",
+    "title": "Notice and receipt records do not bind the accepted notice content and full decision",
+    "category": "Consent evidence",
+    "status": "CONFIRMED \u2014 schema and source gap",
+    "evidence": [
+      "README.md:16",
+      "internal/domain/model.go:71-97",
+      "internal/service/service.go:115-117",
+      "migrations/002_policy_governance.sql:48-71"
+    ],
+    "impact": "Notices contain only tenant, version, jurisdiction, published_at and active. Receipts carry a notice identifier and supplied evidence hash, but no immutable notice content/hash/reference, consent status, legal basis, policy version or actor. A nonempty hash is not proof of what text and decision were accepted.",
+    "work": "Agree the minimum evidence contract with the privacy owner. Store or immutably reference the notice artifact, digest algorithm, content digest, language and version; bind decision/legal-basis/policy version and collection/confirmation facts into the canonical receipt. Define a separate retirement/supersession record because existing notice rows prohibit updates/deletes. Keep legal sufficiency subject to review.",
+    "criteria": [
+      "An exported receipt can resolve and verify the exact accepted notice artifact and the decision/legal basis represented.",
+      "A notice identifier cannot silently refer to altered content.",
+      "Notice retirement preserves existing receipts and has a tested effect on new capture and evaluation under the approved rule."
+    ],
+    "effort": [
+      3,
+      6
+    ],
+    "dependencies": [
+      "T-004"
+    ],
+    "decisions": [
+      "D-05",
+      "D-14"
+    ],
+    "apis": [
+      "API-03",
+      "API-04",
+      "API-10",
+      "API-11"
+    ],
+    "tables": [
+      "consent_privacy_notices",
+      "consent_receipts"
+    ],
+    "roles": "All service users",
+    "task": "T-005",
+    "acceptance": "AT-005",
+    "gate": "G-005"
+  },
+  {
+    "id": "F-006",
+    "severity": "P1",
+    "title": "Evaluation time and current-state ordering do not implement a deterministic consent timeline",
+    "category": "Decision engine",
+    "status": "CONFIRMED behavior \u2014 time semantics and supersession require decision",
+    "evidence": [
+      "internal/service/service.go:342-387",
+      "internal/store/postgres.go:142-143",
+      "internal/store/memory.go:76-92",
+      "cmd/server/main.go:37-42"
+    ],
+    "impact": "A governed grant was reported allowed one hour before it existed when its notice already existed. Evaluation always loads current suppression/latest updated row, and updated_at ties have no deterministic tiebreaker. Withdrawing an older row can supersede a newer grant; that latter rule is undocumented.",
+    "work": "Choose and publish whether at supports historical evaluation, future scheduling, or only present-time decisions. If historical evaluation is supported, query immutable state/policy/suppression intervals as of at and enforce granted/effective boundaries. Otherwise reject unsupported at values explicitly. Use a transactionally sequenced preference revision, not wall-clock ordering alone. Define older-record withdrawal and equal-timestamp behavior. If full historical evaluation is approved, this ticket must own the shared immutable timeline/policy/suppression foundation before dependent policy enforcement and audit export work; re-estimate that expanded scope through T-032/D-03 rather than introducing a dependency cycle.",
+    "criteria": [
+      "Evaluation never claims permission before the applicable grant/effective time.",
+      "Past withdrawal/suppression cases return historical results or an explicit unsupported-time error according to the approved contract.",
+      "Equal timestamps, concurrent writes and older-record withdrawal produce one documented deterministic result in memory and YSQL."
+    ],
+    "effort": [
+      4,
+      8
+    ],
+    "dependencies": [
+      "T-001"
+    ],
+    "decisions": [
+      "D-03",
+      "D-12"
+    ],
+    "apis": [
+      "API-04",
+      "API-05",
+      "API-07",
+      "API-08"
+    ],
+    "tables": [
+      "consents",
+      "consent_suppressions"
+    ],
+    "roles": "All service users",
+    "task": "T-006",
+    "acceptance": "AT-006",
+    "gate": "G-006"
+  },
+  {
+    "id": "F-007",
+    "severity": "P1",
+    "title": "Stronger policy requirements are not re-enforced against existing grants or pending confirmations",
+    "category": "Policy governance",
+    "status": "CONFIRMED \u2014 memory counterexamples; grandfathering undecided",
+    "evidence": [
+      "internal/service/service.go:88-105",
+      "internal/service/service.go:134-136",
+      "internal/service/service.go:305-325",
+      "internal/service/service.go:373-385"
+    ],
+    "impact": "Changing a purpose to require affirmative consent left a contract-based grant allowed. Requiring double opt-in left an unconfirmed grant allowed. Confirmation also does not re-run policy validation. The current evaluator checks active/channel/category/notice only; no explicit grandfathering rule exists.",
+    "work": "Version policy rules and decide when changes invalidate, grandfather or require recapture. Store the policy/evidence provenance used for each decision. Revalidate all applicable requirements at evaluation and confirmation using a consistent policy snapshot, or implement explicitly approved grandfathering with visible reasons and boundaries. Handle policy updates racing with writes.",
+    "criteria": [
+      "Policy-transition tests cover affirmative, DOI, evidence, active, category and channel changes.",
+      "A grant incompatible with current mandatory policy is denied or covered by a recorded approved grandfathering rule.",
+      "Pending confirmation cannot silently bypass policy changes made after initiation."
+    ],
+    "effort": [
+      3,
+      6
+    ],
+    "dependencies": [
+      "T-001",
+      "T-006"
+    ],
+    "decisions": [
+      "D-04"
+    ],
+    "apis": [
+      "API-01",
+      "API-02",
+      "API-07",
+      "API-08",
+      "API-10"
+    ],
+    "tables": [
+      "consent_purposes",
+      "consent_lawful_bases",
+      "consents"
+    ],
+    "roles": "All service users",
+    "task": "T-007",
+    "acceptance": "AT-007",
+    "gate": "G-007"
+  },
+  {
+    "id": "F-008",
+    "severity": "P1",
+    "title": "Upgraded legacy grants bypass all governed-policy checks when notice_version is blank",
+    "category": "Migration safety",
+    "status": "CONFIRMED \u2014 migration and evaluator source; deployed legacy volume unknown",
+    "evidence": [
+      "migrations/002_policy_governance.sql:6-13",
+      ".github/workflows/ci.yml:58-62",
+      "internal/service/service.go:373-387"
+    ],
+    "impact": "Migration 002 retains legacy rows with blank notice_version, and evaluation skips every registry check for those rows. CI explicitly asserts the blank value remains. Existing production data, if any, was not supplied, so affected record counts are unknown.",
+    "work": "Create a read-only legacy classification query and obtain policy-owner decisions for each class. Backfill verified evidence/provenance where possible; otherwise quarantine or require recapture rather than assuming consent. Add an explicit legacy eligibility rule to the evaluator. Rehearse the additive migration against representative synthetic legacy data and retain reconciliation evidence.",
+    "criteria": [
+      "Every legacy record category has a documented eligibility decision and reconciliation count.",
+      "Blank-notice records cannot bypass an affirmative-consent requirement by default.",
+      "Fresh install and 001-to-latest upgrade tests exercise both safe and unsafe legacy cases without deleting evidence."
+    ],
+    "effort": [
+      3,
+      6
+    ],
+    "dependencies": [
+      "T-005",
+      "T-007"
+    ],
+    "decisions": [
+      "D-04",
+      "D-14"
+    ],
+    "apis": [
+      "API-07",
+      "API-08"
+    ],
+    "tables": [
+      "consents"
+    ],
+    "roles": "All service users",
+    "task": "T-008",
+    "acceptance": "AT-008",
+    "gate": "G-008"
+  },
+  {
+    "id": "F-009",
+    "severity": "P1",
+    "title": "Outbox lease completion and retry are not fenced to the current worker",
+    "category": "Outbox reliability",
+    "status": "CONFIRMED \u2014 source defect; failover scenario not executed",
+    "evidence": [
+      "cmd/outbox-worker/main.go:46-79",
+      "cmd/outbox-worker/main.go:116-134",
+      "cmd/outbox-worker/main.go:215-231"
+    ],
+    "impact": "A whole batch of 50 events receives a two-minute lease and is published sequentially. After expiry another worker may claim it; complete/retry only use event ID, so a stale worker can mutate another worker's lease. This does not by itself prove permanent event loss, but HA ownership is not established.",
+    "work": "Add an unguessable claim generation/token and require it in completion, retry and renewal updates. Bound publish time per event and batch; renew only owned leases or keep batches within the lease budget. Stop claiming during shutdown and define recovery after publish acknowledgement but before SQL completion. Keep NATS message-ID deduplication and require idempotent consumers.",
+    "criteria": [
+      "A stale worker cannot complete, clear or reschedule a row owned by a newer claim.",
+      "Slow publish, killed worker and acknowledgement/commit-gap tests preserve eventual delivery without conflicting state transitions.",
+      "Shutdown releases or safely expires claims within the approved budget."
+    ],
+    "effort": [
+      3,
+      6
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-08"
+    ],
+    "apis": [],
+    "tables": [
+      "consent_outbox_events"
+    ],
+    "roles": "Operators and all event consumers",
+    "task": "T-009",
+    "acceptance": "AT-009",
+    "gate": "G-009"
+  },
+  {
+    "id": "F-010",
+    "severity": "P1",
+    "title": "Events lack the ordering and reconciliation contract needed to keep consumers consistent",
+    "category": "Event contracts",
+    "status": "CONFIRMED \u2014 payload/schema gap; consumer behavior unavailable",
+    "evidence": [
+      "internal/domain/model.go:141-151",
+      "internal/service/service.go:49-84",
+      "internal/service/service.go:147-148",
+      "internal/service/service.go:197-198",
+      "internal/service/service.go:232-233",
+      "internal/store/postgres.go:106-115",
+      "cmd/outbox-worker/main.go:82-113"
+    ],
+    "impact": "schema_version is an event-format version, not a preference revision. Events omit an aggregate state version; registry payloads omit key rules; aggregate_type defaults to consent even for registries/suppressions. Multiple workers and retries can publish out of order. Expiry is evaluated on reads without an expiry event. No consumer reconciliation contract is supplied.",
+    "work": "Define versioned event schemas with correct aggregate types, tenant/canonical subject, aggregate revision, effective timestamp and enough information or a resolvable read API to reconcile. Choose consumer behavior for out-of-order events, duplicate IDs, expiry, withdrawal and policy changes. Prefer a current-state re-evaluation before communication where safety requires it; do not promise exactly-once delivery from finite broker dedup alone.",
+    "criteria": [
+      "All eight event families have versioned examples and contract tests.",
+      "Grant then withdrawal delivered in reverse order cannot leave a consumer permitted to communicate.",
+      "Replay beyond the dedup window and expiry/policy-change scenarios converge through the documented consumer contract."
+    ],
+    "effort": [
+      4,
+      7
+    ],
+    "dependencies": [
+      "T-001",
+      "T-006",
+      "T-007",
+      "T-009"
+    ],
+    "decisions": [
+      "D-07",
+      "D-13"
+    ],
+    "apis": [],
+    "tables": [
+      "consent_outbox_events"
+    ],
+    "roles": "All eight named consuming products",
+    "task": "T-010",
+    "acceptance": "AT-010",
+    "gate": "G-010"
+  },
+  {
+    "id": "F-011",
+    "severity": "P1",
+    "title": "Pinned toolchain and dependencies fail the current vulnerability gate",
+    "category": "Dependency security",
+    "status": "CONFIRMED \u2014 scanner results; exploitability varies by configuration",
+    "evidence": [
+      "go.mod:3-21",
+      "Dockerfile:1-8",
+      "Dockerfile.worker:1-8",
+      ".github/workflows/ci.yml:18-28"
+    ],
+    "impact": "govulncheck v1.7.0 with the 2026-10-08 database reported ten symbol-level advisories: nine Go standard-library advisories and one x/text advisory. Nine additional package/module-only findings are not proven called. Text conversion of the same result exited with findings. This is not a claim that all ten are exploitable in the deployed configuration.",
+    "work": "Upgrade the Go build/CI/container toolchain consistently to a maintained patched release; official advisories identify Go 1.26.9 or the current 1.27.2 line. Upgrade x/text to at least the indicated fixed version v0.41.0, then resolve the compatible dependency graph. Triage module-only findings and scan runtime/container images. Preserve the scanner database date, platform, SBOM and final image digests.",
+    "criteria": [
+      "The standard CI vulnerability gate exits successfully or has narrowly documented, time-bound security-owner exceptions with configuration evidence.",
+      "Both API and worker are built from the same approved patched toolchain and pass regression/race checks.",
+      "Runtime image and transitive-dependency scans are attached to the immutable release artifacts."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [],
+    "decisions": [],
+    "apis": [
+      "OPS-01",
+      "OPS-02"
+    ],
+    "tables": [],
+    "roles": "Operators, all API users",
+    "task": "T-011",
+    "acceptance": "AT-011",
+    "gate": "G-011"
+  },
+  {
+    "id": "F-012",
+    "severity": "P1",
+    "title": "Database work cannot follow request cancellation or a bounded transaction budget",
+    "category": "Backend reliability",
+    "status": "CONFIRMED \u2014 source gap; operational impact not load-tested",
+    "evidence": [
+      "internal/store/memory.go:15-35",
+      "internal/store/postgres.go:125-143",
+      "internal/store/postgres.go:238-286",
+      "internal/store/idempotency.go:59-98",
+      "cmd/server/main.go:435"
+    ],
+    "impact": "The Repository interface has no request context; durable methods use context.Background. HTTP timeouts do not cancel those operations. A slow/unavailable database or lock wait can retain work and exhaust fixed pools. Transaction retry behavior for YSQL conflicts is not defined.",
+    "work": "Thread context.Context through handlers, service and repository. Add bounded request, SQL and whole-transaction deadlines with cancellation-aware retries only for approved transient errors. Ensure a retry does not duplicate receipt/audit/outbox effects; record retry limits and backoff. Size API and worker pools against total replica capacity rather than an isolated process.",
+    "criteria": [
+      "A cancelled/timed-out request promptly cancels pending database work and releases pool resources.",
+      "Serialization/transaction conflict and lost-response tests either retry safely or return a retryable error without duplicate effects.",
+      "Load tests at the approved replica count demonstrate bounded connections, latency and queue growth."
+    ],
+    "effort": [
+      3,
+      5
+    ],
+    "dependencies": [
+      "T-001",
+      "T-009"
+    ],
+    "decisions": [
+      "D-08"
+    ],
+    "apis": [
+      "API-01",
+      "API-02",
+      "API-03",
+      "API-04",
+      "API-05",
+      "API-06",
+      "API-07",
+      "API-08",
+      "API-09",
+      "API-10",
+      "API-11"
+    ],
+    "tables": [
+      "All runtime tables"
+    ],
+    "roles": "All service users",
+    "task": "T-012",
+    "acceptance": "AT-012",
+    "gate": "G-012"
+  },
+  {
+    "id": "F-013",
+    "severity": "P2",
+    "title": "Unexpected database errors are returned as 422 with internal error text",
+    "category": "API error contract",
+    "status": "CONFIRMED \u2014 source defect",
+    "evidence": [
+      "cmd/server/main.go:59-85",
+      "internal/store/postgres.go:44-55",
+      "internal/service/service.go:88-103"
+    ],
+    "impact": "writeError defaults all unrecognized errors to 422 and exposes err.Error(). Infrastructure failures can look like client validation faults and may expose SQL/schema details. Some policy lookups mask infrastructure errors as validation or policy_unavailable, reducing diagnosis quality.",
+    "work": "Introduce typed validation, conflict, authorization, unavailable and internal errors. Return stable public codes/statuses and a correlation ID; log sanitized internal causes with that ID. Preserve safe-deny behavior for unavailable policy while distinguishing operational health. Document which failures clients may retry and keep receipt/token material out of logs.",
+    "criteria": [
+      "Injected database timeout/outage/internal SQL errors return the approved 5xx/503 shape without internal details.",
+      "Validation remains actionable 4xx and conflicts/replays keep their documented semantics.",
+      "Client and operator logs can correlate one failure without storing bearer/confirmation secrets."
+    ],
+    "effort": [
+      1,
+      3
+    ],
+    "dependencies": [
+      "T-012"
+    ],
+    "decisions": [],
+    "apis": [
+      "All business APIs"
+    ],
+    "tables": [],
+    "roles": "All service users",
+    "task": "T-013",
+    "acceptance": "AT-013",
+    "gate": "G-013"
+  },
+  {
+    "id": "F-014",
+    "severity": "P1",
+    "title": "Unknown JWT key IDs trigger an unbounded JWKS refresh path",
+    "category": "Authentication availability",
+    "status": "CONFIRMED \u2014 five misses caused five local JWKS fetches",
+    "evidence": [
+      "internal/auth/auth.go:41-47",
+      "internal/auth/auth.go:95-116",
+      "internal/auth/auth.go:151-163"
+    ],
+    "impact": "Untrusted RS256 token key IDs force a fresh outbound request even while the cache is fresh. Five distinct misses caused five fetches in the audit. No refresh coalescing, cooldown, negative cache or inbound rate limiter exists; invalid requests can amplify load on Consent and the identity provider.",
+    "work": "Add per-JWKS singleflight refresh, a bounded negative cache/cooldown and explicit key rotation behavior. Enforce token/header size and request-rate limits at an owned boundary. Validate HTTPS/trusted JWKS configuration and define bounded last-known-good key behavior during outages without accepting unknown keys.",
+    "criteria": [
+      "Bursts of distinct unknown kids do not produce an unbounded number of JWKS fetches.",
+      "Legitimate key rotation works within the approved delay, and unknown keys always fail closed.",
+      "Concurrent refresh, identity-provider outage, expiry and rate-limit tests meet documented budgets."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-08",
+      "D-10"
+    ],
+    "apis": [
+      "All authenticated APIs"
+    ],
+    "tables": [],
+    "roles": "All service users",
+    "task": "T-014",
+    "acceptance": "AT-014",
+    "gate": "G-014"
+  },
+  {
+    "id": "F-015",
+    "severity": "P1",
+    "title": "Readiness can report healthy while authentication or required schema is unusable",
+    "category": "Operational readiness",
+    "status": "CONFIRMED \u2014 source behavior; cluster not exercised",
+    "evidence": [
+      "cmd/server/main.go:386-398",
+      "cmd/server/main.go:413-435",
+      "internal/service/service.go:390",
+      "internal/store/postgres.go:38-41"
+    ],
+    "impact": "Readiness checks only database Ping. Missing/invalid authentication configuration or a reachable database missing migration tables still yields ready. Health endpoints accept every method, including CONNECT, which matters to a scanner-identified standard-library precondition.",
+    "work": "Validate required auth mode, issuer/audience/JWKS transport, production store and configuration at startup. Verify a compatible recorded schema version before readiness without making every probe depend on a live IdP call. Restrict probe methods and define API/worker startup/readiness/liveness meanings. Fail deployment on unusable configuration.",
+    "criteria": [
+      "Missing auth settings or required migrations keep the deployment unready or fail startup with a sanitized diagnostic.",
+      "Liveness remains independent of routine dependency outages; readiness behavior is specified and tested.",
+      "Health endpoints reject unsupported methods and worker health exposes meaningful progress/lag."
+    ],
+    "effort": [
+      1,
+      3
+    ],
+    "dependencies": [
+      "T-011",
+      "T-017"
+    ],
+    "decisions": [
+      "D-09",
+      "D-10"
+    ],
+    "apis": [
+      "OPS-01",
+      "OPS-02"
+    ],
+    "tables": [],
+    "roles": "All service users",
+    "task": "T-015",
+    "acceptance": "AT-015",
+    "gate": "G-015"
+  },
+  {
+    "id": "F-016",
+    "severity": "P1",
+    "title": "Durable API, transaction and multi-node Yugabyte behavior remain unverified",
+    "category": "Release evidence",
+    "status": "NOT VERIFIED \u2014 required infrastructure unavailable in audit",
+    "evidence": [
+      "README.md:45-51",
+      "cmd/server/postgres_integration_test.go:17-83",
+      "internal/store/idempotency_integration_test.go:14-73",
+      "cmd/outbox-worker/postgres_integration_test.go:15-120"
+    ],
+    "impact": "All three external-integration tests skipped in the audit. The server database test calls Service directly, not authenticated HTTP. No current CI run artifact, production-equivalent YSQL universe, failover evidence or real provider credentials was supplied. Passing memory tests cannot establish durable production behavior.",
+    "work": "Provision an explicitly isolated target-version YSQL environment and NATS test account. Run every database test plus authenticated HTTP-to-YSQL workflows, transaction fault injection, restarts, concurrent writes and receipt round trips. Separately run multi-node placement/failure tests on the approved production topology. Record exact versions, sanitized config, timestamps, test logs and database assertions.",
+    "criteria": [
+      "All three existing external tests execute rather than skip, and new critical HTTP/YSQL tests pass.",
+      "A fault between state/receipt/audit/outbox writes leaves either all committed or none.",
+      "Restart, node loss and transaction contention preserve the approved current-state and delivery invariants."
+    ],
+    "effort": [
+      4,
+      8
+    ],
+    "dependencies": [
+      "T-001",
+      "T-002",
+      "T-004",
+      "T-007",
+      "T-008",
+      "T-009",
+      "T-011",
+      "T-012",
+      "T-017"
+    ],
+    "decisions": [
+      "D-08",
+      "D-09"
+    ],
+    "apis": [
+      "API-01",
+      "API-02",
+      "API-03",
+      "API-04",
+      "API-05",
+      "API-06",
+      "API-07",
+      "API-08",
+      "API-09",
+      "API-10",
+      "API-11"
+    ],
+    "tables": [
+      "All runtime tables"
+    ],
+    "roles": "All service users",
+    "task": "T-016",
+    "acceptance": "AT-016",
+    "gate": "G-016"
+  },
+  {
+    "id": "F-017",
+    "severity": "P1",
+    "title": "CI omits durable idempotency coverage and migration 003 upgrade verification",
+    "category": "CI and migration testing",
+    "status": "CONFIRMED \u2014 workflow and fixture omissions",
+    "evidence": [
+      ".github/workflows/ci.yml:20-28",
+      ".github/workflows/ci.yml:51-72",
+      "internal/store/idempotency_integration_test.go:14-46",
+      "migrations/003_governed_idempotency.sql:1-11"
+    ],
+    "impact": "The general test job has no database. The YSQL job selects only server and worker tests, leaving the store idempotency integration test skipped everywhere. The upgrade path stops at002. That test also uses globally fixed record IDs despite a unique tenant, making reruns unsafe against a reused test database.",
+    "work": "Run every integration package against a deliberately isolated YSQL database using one consistent test-DSN contract. Fail the required job when prerequisites are missing rather than silently skipping. Upgrade001 through every current migration including003; exercise persisted state and idempotency after upgrade. Use run-unique global fixture IDs and preserve machine-readable test artifacts.",
+    "criteria": [
+      "CI evidence shows the store concurrency test actually executed on YSQL.",
+      "Fresh install and001-to-latest upgrade include003 and verify idempotent replay/conflict after upgrade.",
+      "The suite can run twice in its designated isolated environment without fixture-ID collisions."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [],
+    "decisions": [],
+    "apis": [],
+    "tables": [
+      "consent_idempotency",
+      "consents",
+      "consent_receipts",
+      "consent_outbox_events"
+    ],
+    "roles": "All service users",
+    "task": "T-017",
+    "acceptance": "AT-017",
+    "gate": "G-017"
+  },
+  {
+    "id": "F-018",
+    "severity": "P1",
+    "title": "Release packaging and deployment are not reproducible from the supplied manifests",
+    "category": "Deployment",
+    "status": "CONFIRMED \u2014 configuration gaps; actual hosting unknown",
+    "evidence": [
+      "deploy/k8s.yaml:39-64",
+      "deploy/outbox-worker.yaml:34-56",
+      ".github/workflows/ci.yml:27-30",
+      "Dockerfile:1-10",
+      "Dockerfile.worker:1-10"
+    ],
+    "impact": "The API uses :latest and the worker :latest-worker without explicit pull policy/digests. CI builds test images but does not publish the referenced release images. Required ConfigMap, Secrets, database, NATS and ingress ownership are external and unspecified. The manifests are a baseline, not a complete release procedure.",
+    "work": "Define environment overlays or equivalent deployment inputs, immutable image digests, release provenance and an owned artifact publication/promotion flow. Supply secure references/templates for required configuration and document external infrastructure dependencies. Rehearse rollout and image rollback with additive schema compatibility. Do not embed real secret values in the repository.",
+    "criteria": [
+      "A new authorized engineer can deploy the same exact API/worker digests in staging using the documented inputs.",
+      "Missing configuration is detected before rollout; API and worker run the intended release after rolling update.",
+      "Rollback uses a known prior digest and passes current-schema compatibility checks."
+    ],
+    "effort": [
+      3,
+      6
+    ],
+    "dependencies": [
+      "T-011",
+      "T-015",
+      "T-017"
+    ],
+    "decisions": [
+      "D-09"
+    ],
+    "apis": [],
+    "tables": [],
+    "roles": "Release engineer and platform operator",
+    "task": "T-018",
+    "acceptance": "AT-018",
+    "gate": "G-018"
+  },
+  {
+    "id": "F-019",
+    "severity": "P1",
+    "title": "Transport security and least-privilege service identities are not established",
+    "category": "Infrastructure security",
+    "status": "NOT VERIFIED / source enforcement gap",
+    "evidence": [
+      "internal/auth/auth.go:41-47",
+      "cmd/server/main.go:435-439",
+      "cmd/outbox-worker/main.go:185-194",
+      "deploy/outbox-worker.yaml:38-56",
+      "README.md:47-51"
+    ],
+    "impact": "JWKS accepts configurable HTTP URLs; API serves plaintext behind an unspecified boundary; NATS credentials do not themselves require TLS. The manifest uses nats:// and no CA setting. Database TLS/roles and broker tenant ACLs are not supplied. This is not evidence that actual production traffic is plaintext.",
+    "work": "Specify and verify every trust boundary: ingress/API, API/JWKS, API-worker/YSQL and worker/NATS. Require authenticated TLS or an approved equivalent channel; verify hostname/CA behavior. Separate migration, API and worker database roles; restrict broker subjects/stream administration and tenant consumer access. Reject development modes in production deployment policy.",
+    "criteria": [
+      "Staging handshakes prove certificate/hostname validation and fail on a wrong CA or downgraded endpoint.",
+      "The API cannot modify outbox delivery bookkeeping/DDL and the worker cannot mutate consent/receipts except as explicitly needed by its role.",
+      "Tenant consumer credentials cannot subscribe to another tenant's data; header tenant metadata alone is not treated as an ACL."
+    ],
+    "effort": [
+      3,
+      6
+    ],
+    "dependencies": [
+      "T-018"
+    ],
+    "decisions": [
+      "D-09",
+      "D-10"
+    ],
+    "apis": [],
+    "tables": [],
+    "roles": "Security/platform operators",
+    "task": "T-019",
+    "acceptance": "AT-019",
+    "gate": "G-019"
+  },
+  {
+    "id": "F-020",
+    "severity": "P1",
+    "title": "Existing NATS streams are accepted without checking durability, subjects or retention",
+    "category": "Broker configuration",
+    "status": "CONFIRMED \u2014 source gap; broker configuration unknown",
+    "evidence": [
+      "cmd/outbox-worker/main.go:137-146",
+      "cmd/outbox-worker/main.go:155-169",
+      "deploy/outbox-worker.yaml:45-50"
+    ],
+    "impact": "ensureStream returns immediately for any existing stream name. It does not verify subject coverage, storage, replicas, dedup window or retention. Creation has finite10-minute dedup but no explicit size/age/message limits. A stale/misconfigured stream can contradict the documented three-replica baseline.",
+    "work": "Move stream ownership to a controlled provisioning role or validate its configuration against the approved contract at startup. Define retention/capacity/discard policy, dedup horizon, subject permissions and safe change procedures. Alert on configuration drift and publish rejections; avoid silently altering shared broker resources from an application worker.",
+    "criteria": [
+      "An existing mismatched stream produces an actionable blocked-startup/rollout result.",
+      "Approved retention/replica/storage/subject settings are verified in staging and attached to release evidence.",
+      "Capacity exhaustion and retry beyond dedup horizon follow the documented at-least-once consumer contract."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [
+      "T-009",
+      "T-010",
+      "T-019"
+    ],
+    "decisions": [
+      "D-08",
+      "D-09",
+      "D-13"
+    ],
+    "apis": [],
+    "tables": [],
+    "roles": "Messaging/platform operators",
+    "task": "T-020",
+    "acceptance": "AT-020",
+    "gate": "G-020"
+  },
+  {
+    "id": "F-021",
+    "severity": "P1",
+    "title": "Operators cannot reliably detect stalled consent propagation or diagnose request failures",
+    "category": "Observability",
+    "status": "CONFIRMED \u2014 source/configuration gap",
+    "evidence": [
+      "cmd/outbox-worker/main.go:206-231",
+      "cmd/server/main.go:59-98",
+      "deploy/outbox-worker.yaml:34-72",
+      "deploy/k8s.yaml:65-81"
+    ],
+    "impact": "Logging is basic process/error text. There are no request traces, API latency/error metrics, worker progress probes, outbox-age alerts or dashboards. Worker claim/publish failure loops can persist without an owned operational signal; retry attempts never enter a bounded quarantine/review workflow.",
+    "work": "Instrument request counts/latency, decision reasons, auth failures, database pool saturation, JWKS refresh and outbox lag/attempts/publish acknowledgements. Add worker progress/health signals, dashboards, alert routing and runbooks with privacy-safe labels. Define poison-event handling and manual replay authorization while preserving durable evidence.",
+    "criteria": [
+      "Simulated database/broker/IdP failures and a poison event trigger the expected operator signal with a traceable cause.",
+      "Dashboard distinguishes API health from consumer propagation lag.",
+      "Operators can quarantine/replay an event safely without exposing tokens or recording unbounded subject identifiers in metrics."
+    ],
+    "effort": [
+      3,
+      5
+    ],
+    "dependencies": [
+      "T-009",
+      "T-012",
+      "T-013",
+      "T-015"
+    ],
+    "decisions": [
+      "D-08",
+      "D-09"
+    ],
+    "apis": [],
+    "tables": [],
+    "roles": "SRE, support, privacy operations",
+    "task": "T-021",
+    "acceptance": "AT-021",
+    "gate": "G-021"
+  },
+  {
+    "id": "F-022",
+    "severity": "P1",
+    "title": "Backup, restore, retention and recovery procedures are not production-evidenced",
+    "category": "Data operations",
+    "status": "NOT VERIFIED \u2014 required operational policy absent",
+    "evidence": [
+      "README.md:51",
+      "migrations/ROLLBACK.md:3-5",
+      "migrations/002_policy_governance.sql:91-110"
+    ],
+    "impact": "README delegates TLS, placement, backup/PITR and recovery to the target YSQL universe. No actual backup schedule, successful restore, recovery objectives or retention policy is present. ROLLBACK refers to a PostgreSQL backup despite YSQL being the intended production system; compatibility of the prior image is asserted but untested here.",
+    "work": "Approve retention/RPO/RTO and assign owners. Produce a target-YSQL backup/PITR and restore runbook, with encrypted access-controlled evidence storage and tests. Reconcile restored consent/receipt/audit/idempotency/outbox state with already delivered broker events. Define lawful evidence retention/deletion procedures that do not bypass immutable triggers ad hoc.",
+    "criteria": [
+      "A restore into an isolated target-version universe meets the approved RPO/RTO and verifies representative receipts, decisions and outbox replay.",
+      "A prior-image rollback and forward-correction drill retain evidence and do not resurrect withdrawn permission.",
+      "Retention/deletion and recovery responsibilities are approved and documented; no legal-compliance claim rests on schema alone."
+    ],
+    "effort": [
+      3,
+      7
+    ],
+    "dependencies": [
+      "T-008",
+      "T-016",
+      "T-019",
+      "T-020"
+    ],
+    "decisions": [
+      "D-05",
+      "D-08",
+      "D-09",
+      "D-14"
+    ],
+    "apis": [],
+    "tables": [
+      "All durable state and broker events"
+    ],
+    "roles": "DBA/SRE/privacy owner",
+    "task": "T-022",
+    "acceptance": "AT-022",
+    "gate": "G-022"
+  },
+  {
+    "id": "F-023",
+    "severity": "P1",
+    "title": "Named NVUTO product integrations have no end-to-end verification in this repository",
+    "category": "Platform integration",
+    "status": "NOT VERIFIED \u2014 consumer repositories and evidence not supplied",
+    "evidence": [
+      "README.md:9-11",
+      "cmd/server/main.go:399-409",
+      "cmd/outbox-worker/main.go:102-113"
+    ],
+    "impact": "Engage, Service, Contact Center, Customer Portal, CRM, Conversations, AI and Integration Hub are named consumers only. No actual client, frontend, subscription, contact delivery or fail-closed communication test is supplied. Building this service does not prove those products respect consent.",
+    "work": "Approve the launch consumer set and assign an owner to each integration. Publish identity, HTTP and event contracts, map canonical Customer Graph IDs, and run each launch workflow from actual user/application action through YSQL and messaging to the consumer outcome. Define timeout/error handling and the pre-send consent check. Non-launch consumers remain explicitly deferred.",
+    "criteria": [
+      "Each approved launch consumer has a reproducible integration/UAT record using real staging wiring.",
+      "No-consent, denial, withdrawal, suppression, expiry and service-unavailable cases prevent disallowed communication.",
+      "A subject change is reflected after page reload and consumer restart, within the approved propagation budget."
+    ],
+    "effort": [
+      4,
+      10
+    ],
+    "dependencies": [
+      "T-003",
+      "T-010",
+      "T-016",
+      "T-019",
+      "T-020",
+      "T-024",
+      "T-030"
+    ],
+    "decisions": [
+      "D-01",
+      "D-07",
+      "D-08",
+      "D-10"
+    ],
+    "apis": [],
+    "tables": [],
+    "roles": "All launch product teams",
+    "task": "T-023",
+    "acceptance": "AT-023",
+    "gate": "G-023"
+  },
+  {
+    "id": "F-024",
+    "severity": "P2",
+    "title": "Preference discovery, registry reads and a machine-readable client contract are absent",
+    "category": "API completeness",
+    "status": "CONFIRMED absence \u2014 new endpoint scope requires decision",
+    "evidence": [
+      "README.md:5-11",
+      "cmd/server/main.go:386-410",
+      "internal/domain/model.go:15-125"
+    ],
+    "impact": "The service exposes writes, evaluation and receipt-by-ID, but no subject preference list, consent-by-ID GET, registry list, suppression list or audit export route. External portals may rely on another owned projection; none is provided. OpenAPI/SDK examples and errors/pagination contracts are also absent.",
+    "work": "Choose the authoritative read owner for the self-service/admin experiences. If Consent owns it, specify tenant/subject-authorized read APIs with bounded pagination and exact frontend DTOs; otherwise document and prove the external projection. Publish an OpenAPI contract for all11 existing operations and approved additions, including error/retry/idempotency and CORS/gateway requirements.",
+    "criteria": [
+      "A portal can load the approved current preferences and necessary policy/notice data through a documented authorized source.",
+      "Contract tests validate request/response models for every launch endpoint, including negative authorization cases.",
+      "Pagination/filtering and origin/session behavior are explicitly specified where needed; absent frontend is not misrepresented as an implemented screen."
+    ],
+    "effort": [
+      3,
+      6
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-01",
+      "D-07"
+    ],
+    "apis": [
+      "All business APIs; proposed read APIs require approval"
+    ],
+    "tables": [],
+    "roles": "Portal/admin frontend and client engineers",
+    "task": "T-024",
+    "acceptance": "AT-024",
+    "gate": "G-024"
+  },
+  {
+    "id": "F-025",
+    "severity": "P2",
+    "title": "Idempotency replay semantics change with policy and current consent state",
+    "category": "Idempotency contract",
+    "status": "CONFIRMED \u2014 source behavior; intended replay semantics undecided",
+    "evidence": [
+      "internal/service/idempotency.go:17-30",
+      "internal/service/idempotency.go:55-81",
+      "internal/store/idempotency.go:27-41",
+      "internal/store/idempotency.go:67-83"
+    ],
+    "impact": "Policy is revalidated before looking up the key, so a legitimate replay can fail after a policy change. The ledger returns the current consent row, not the original response, so a withdrawn record can replace the original granted response. The fingerprint includes actor and uses timestamp representations; retention is undefined.",
+    "work": "Specify whether a key guarantees original response replay or only one resource creation, how actor/token rotation affects it, and the retention/security namespace. Resolve authorized existing-key replay before current-policy creation checks where the approved contract requires it. Canonicalize semantic times and store a response snapshot if exact replay is promised; do not allow replay to bypass current subject authorization.",
+    "criteria": [
+      "Same-key replay after withdrawal, policy change, actor rotation and time-offset normalization matches the published contract.",
+      "Changed semantic payload returns409 and concurrent identical writes create exactly one consent/receipt/audit/outbox set on YSQL.",
+      "Retention, cleanup and consumer use of evaluation instead of stale create-response status are documented."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [
+      "T-007",
+      "T-017"
+    ],
+    "decisions": [
+      "D-11"
+    ],
+    "apis": [
+      "API-04"
+    ],
+    "tables": [
+      "consent_idempotency",
+      "consents"
+    ],
+    "roles": "All service users",
+    "task": "T-025",
+    "acceptance": "AT-025",
+    "gate": "G-025"
+  },
+  {
+    "id": "F-026",
+    "severity": "P2",
+    "title": "Memory-store composite keys collide across tenants and diverge from durable behavior",
+    "category": "Development-store correctness",
+    "status": "CONFIRMED \u2014 tenant collision reproduced; production disabled by default",
+    "evidence": [
+      "internal/store/memory.go:60-74",
+      "internal/store/memory.go:145-168",
+      "internal/store/memory.go:218-235",
+      "internal/store/idempotency.go:20-41",
+      "cmd/server/main.go:425-430"
+    ],
+    "impact": "Unescaped colon concatenation permits a lookup in tenant audit-parent to return a record from tenant audit-parent:child when the ID is prefixed accordingly. This was reproduced through Service. Memory suppression updates also preserve the old ID but do not repair audit/outbox IDs, and memory events skip durable normalization.",
+    "work": "Use typed composite keys/nested maps and defensive tenant checks. Make memory suppression/event/immutability semantics match the public repository contract, clone mutable data where required, and keep the idempotency ledger owned by each Memory instance. Retain the explicit development opt-in and enforce its prohibition in approved production configuration.",
+    "criteria": [
+      "Delimiter-rich tenant/subject/code/ID combinations cannot cross boundaries.",
+      "Memory and YSQL contract tests agree on suppression IDs, event metadata, concurrency and immutable values.",
+      "Production configuration tests reject ALLOW_MEMORY_STORE."
+    ],
+    "effort": [
+      1,
+      3
+    ],
+    "dependencies": [],
+    "decisions": [],
+    "apis": [
+      "Development-mode APIs"
+    ],
+    "tables": [],
+    "roles": "Developers and local test tenants",
+    "task": "T-026",
+    "acceptance": "AT-026",
+    "gate": "G-026"
+  },
+  {
+    "id": "F-027",
+    "severity": "P2",
+    "title": "Input normalization and validation leave ambiguous or surprising API behavior",
+    "category": "API quality",
+    "status": "CONFIRMED \u2014 trailing JSON reproduced; other cases source-traced",
+    "evidence": [
+      "cmd/server/main.go:78-85",
+      "internal/service/service.go:79-103",
+      "internal/service/service.go:131-139",
+      "internal/service/service.go:202-234",
+      "internal/service/service.go:264-265"
+    ],
+    "impact": "A valid JSON object followed by a second object is accepted. Boolean active defaults false on API-decoded structs despite SQL defaults true; evidence hash format is not checked; consent expiry may precede creation; challenge lifetime and many identifiers have no semantic maximum. Denial capture also requires the same current policy/evidence checks as grant.",
+    "work": "Define an explicit input contract. Require exactly one JSON document; implement approved content-type/body-size behavior and field bounds. Distinguish omitted booleans from explicit false where needed. Validate evidence format and timestamp relationships. Decide how a subject can deny/withdraw when policy is unavailable without accidentally authorizing consent.",
+    "criteria": [
+      "Trailing JSON and malformed/oversized/wrong-type inputs return stable4xx without mutation.",
+      "Omitted active, invalid expiry and invalid evidence produce documented outcomes rather than accidental defaults.",
+      "Deny/withdraw error paths allow the approved opt-out journey under policy-change/unavailable conditions."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-02",
+      "D-05"
+    ],
+    "apis": [
+      "All JSON-consuming business APIs"
+    ],
+    "tables": [],
+    "roles": "All service users",
+    "task": "T-027",
+    "acceptance": "AT-027",
+    "gate": "G-027"
+  },
+  {
+    "id": "F-028",
+    "severity": "P2",
+    "title": "Database constraints do not enforce several tenant and state relationships",
+    "category": "Schema integrity",
+    "status": "CONFIRMED \u2014 schema gap; no cross-tenant SQL exploit demonstrated",
+    "evidence": [
+      "migrations/001_init.sql:1-45",
+      "migrations/002_policy_governance.sql:24-89",
+      "migrations/003_governed_idempotency.sql:1-11"
+    ],
+    "impact": "Only receipt.consent_id has a foreign key, and it does not include tenant. Receipt_id on consent and consent_id on idempotency have no FK; registry references are logical. Suppression field shapes, evidence JSON structure and temporal/state relations are mostly enforced only in service code. SQL queries do use tenant parameters.",
+    "work": "Define invariant ownership and add appropriate composite tenant keys/FKs/checks after read-only data validation. Avoid inappropriate FKs for intentionally external subjects or polymorphic audit targets. Reconcile existing violations additively, test insertion ordering/deferrability on YSQL, and document application-vs-database guarantees.",
+    "criteria": [
+      "Representative cross-tenant receipt/idempotency reference attempts and invalid state shapes are rejected by the approved layer.",
+      "Existing-data validation reports zero unexplained violations before constraints are enforced.",
+      "Fresh install and upgrade preserve performance and transactional write order under YSQL."
+    ],
+    "effort": [
+      2,
+      5
+    ],
+    "dependencies": [
+      "T-005",
+      "T-008",
+      "T-017"
+    ],
+    "decisions": [],
+    "apis": [],
+    "tables": [
+      "consents",
+      "consent_receipts",
+      "consent_idempotency",
+      "consent_suppressions"
+    ],
+    "roles": "All service users",
+    "task": "T-028",
+    "acceptance": "AT-028",
+    "gate": "G-028"
+  },
+  {
+    "id": "F-029",
+    "severity": "P1",
+    "title": "Immutable audit rows cannot reconstruct policy and suppression history",
+    "category": "Auditability",
+    "status": "CONFIRMED \u2014 schema and mutation payload gap",
+    "evidence": [
+      "internal/domain/model.go:132-139",
+      "internal/service/service.go:58-59",
+      "internal/service/service.go:71-72",
+      "internal/service/service.go:232-233",
+      "internal/store/postgres.go:154-160",
+      "internal/store/postgres.go:307-315"
+    ],
+    "impact": "Audit rows contain ID, tenant, actor, action, consent_id and time only. Mutable registries and suppression rows overwrite values; audit rows do not retain before/after rules or resource type/revision. A row-level immutability trigger prevents changes but does not make missing history reconstructable.",
+    "work": "Add typed resource identifiers, immutable policy/suppression versions or complete before/after change records, correlation/source and reason where approved. Provide an authorized export/query path or owned external audit projection. Apply least privilege to the append-only tables and define redaction/retention with the privacy owner.",
+    "criteria": [
+      "An auditor can reconstruct the exact policy and suppression states used for a historical consent decision.",
+      "Updates retain actor, resource type, revision, time and approved change reason without overwriting historical values.",
+      "Audit exports are tenant/role-scoped and the normal app role cannot alter history."
+    ],
+    "effort": [
+      3,
+      5
+    ],
+    "dependencies": [
+      "T-005",
+      "T-006",
+      "T-007"
+    ],
+    "decisions": [
+      "D-05",
+      "D-14"
+    ],
+    "apis": [
+      "API-01",
+      "API-02",
+      "API-06",
+      "Dependent evaluation and authorized history/export workflows"
+    ],
+    "tables": [
+      "consent_audit_events",
+      "consent_purposes",
+      "consent_lawful_bases",
+      "consent_suppressions"
+    ],
+    "roles": "Privacy administrator, auditor, authorized support",
+    "task": "T-029",
+    "acceptance": "AT-029",
+    "gate": "G-029"
+  },
+  {
+    "id": "F-030",
+    "severity": "P1",
+    "title": "Mixed self-service and reader roles can authorize tenant-wide writes",
+    "category": "Authorization and permission policy",
+    "status": "CONFIRMED \u2014 source-level role composition; live issued combinations NOT VERIFIED",
+    "evidence": [
+      "cmd/server/main.go:109-118",
+      "cmd/server/main.go:241-258",
+      "internal/auth/auth.go:27-31",
+      "internal/auth/auth.go:180-199"
+    ],
+    "impact": "The developer role is accepted in production JWTs if issued, service is read-only, and privileged roles override a self_service restriction on a mixed-role token. Specifically, self_service plus service or consent_reader admits writes through self_service and then bypasses the subject restriction through the read role, allowing tenant-wide subject writes; this is source-traced, not dynamically probed. A self_service user may set active=false on their own global/channel suppression regardless of who created it. No finer policy distinguishes user preferences from administrative/legal suppression.",
+    "work": "Authorize the requested action and subject scope together, preventing a tenant-wide reader role from expanding a self-service writer into tenant-wide writes. Until fixed, any proposed deployment exclusion must be enforced and tested in the issuer/configuration, not assumed. Approve exact Authentik role/claim mappings and suppression authority. Decide whether to separate user preference opt-outs from administrative/legal blocks and how mixed roles behave. Add provenance/owner fields only where that approved rule requires them; test every role and mixed-role combination against every operation and resource boundary, including self_service plus service or consent_reader. Keep identity account signup/recovery external as README states.",
+    "criteria": [
+      "Mixed self_service plus service or consent_reader tokens cannot write another subject solely by combining separate role checks; any broader writer authority must be explicitly granted and tested.",
+      "A signed role-permission matrix matches production IdP mappings and backend tests for all seven roles.",
+      "Self-service cannot clear a protected administrative suppression if the approved policy distinguishes that class.",
+      "Production deployment disallows development authentication/roles according to the approved identity contract."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-06",
+      "D-10"
+    ],
+    "apis": [
+      "All authenticated APIs"
+    ],
+    "tables": [
+      "consent_suppressions"
+    ],
+    "roles": "Identity owner, privacy owner, all seven JWT roles",
+    "task": "T-030",
+    "acceptance": "AT-030",
+    "gate": "G-030"
+  },
+  {
+    "id": "F-031",
+    "severity": "P2",
+    "title": "Legacy Record and Upsert helpers preserve a non-atomic governance bypass path",
+    "category": "Maintainability",
+    "status": "CONFIRMED \u2014 internal-only path, not an active HTTP endpoint",
+    "evidence": [
+      "internal/service/service.go:152-178",
+      "internal/store/postgres.go:125-135",
+      "internal/store/memory.go:15-35",
+      "internal/service/service_test.go:10-90"
+    ],
+    "impact": "The legacy Record helper writes consent then independently appends audit/outbox while ignoring their errors. It bypasses governed policy/receipt rules. Current HTTP /v1/consents uses RecordGoverned, so this is not an identified public-route transaction bypass; future reuse and legacy tests can hide risk.",
+    "work": "Remove, restrict or explicitly deprecate the legacy helper and unsafe Upsert surface after confirming any external Go consumers. Route required compatibility behavior through one atomic governed implementation or an explicitly isolated migration adapter. Align tests with production-reachable paths; retain a clear legacy-data migration contract.",
+    "criteria": [
+      "No production entry point can create consent while silently losing audit/outbox/receipt effects.",
+      "Compatibility consumers are inventoried or explicitly absent before removing exported behavior.",
+      "Production behavior tests exercise the governed path and legacy migration tests remain separate."
+    ],
+    "effort": [
+      1,
+      2
+    ],
+    "dependencies": [
+      "T-008",
+      "T-017"
+    ],
+    "decisions": [],
+    "apis": [],
+    "tables": [
+      "consents",
+      "consent_audit_events",
+      "consent_outbox_events"
+    ],
+    "roles": "All service users",
+    "task": "T-031",
+    "acceptance": "AT-031",
+    "gate": "G-031"
+  },
+  {
+    "id": "F-032",
+    "severity": "P2",
+    "title": "Approved launch requirements, capacity and regional policy decisions are not supplied",
+    "category": "Product handover",
+    "status": "DECISION REQUIRED \u2014 only README/rollback prose exists",
+    "evidence": [
+      "README.md:1-51",
+      "migrations/ROLLBACK.md:1-5"
+    ],
+    "impact": "The attached audit brief expects detailed PRDs/TRDs/flows; the32-file archive contains none. Revenue model, operating regions, exact personas, data scope, capacity/SLOs and acceptance ownership are undocumented. NG appears in tests; it does not establish applicable legal obligations. There is no Git history/commit in the ZIP.",
+    "work": "Review this evidence-based reconstruction with product/privacy/architecture owners, approve or amend the scope and decision register, recover any missing upstream specifications and record the exact source commit. Resolve requirements before expanding frontend, authentication, payment or geographic functionality. Define release owners and measurable nonfunctional targets with explicit approvals.",
+    "criteria": [
+      "Every launch-critical requirement has an owner, source, acceptance case and implementation/gap link.",
+      "All release-affecting decisions are recorded and approved; deferred scope is explicit.",
+      "The release evidence identifies a source commit, approved configuration, SLO/capacity/RPO/RTO and regional privacy review owner."
+    ],
+    "effort": [
+      2,
+      4
+    ],
+    "dependencies": [],
+    "decisions": [
+      "D-01",
+      "D-03",
+      "D-04",
+      "D-05",
+      "D-06",
+      "D-07",
+      "D-08",
+      "D-09",
+      "D-10",
+      "D-11",
+      "D-12",
+      "D-13",
+      "D-14"
+    ],
+    "apis": [],
+    "tables": [],
+    "roles": "Product, architecture, privacy and release owners",
+    "task": "T-032",
+    "acceptance": "AT-032",
+    "gate": "G-032"
+  }
+]

@@ -1,0 +1,90 @@
+package auth
+
+// Audit-only regression probe. This file is intended for an isolated copy of
+// internal/auth; it does not change the supplied source archive.
+
+import (
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestAuditJWKSUnknownKeyRefreshBounded(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal("failed to generate synthetic audit key")
+	}
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+			"kid": "audit-known-key", "kty": "RSA", "use": "sig",
+			"n": base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.PublicKey.E)).Bytes()),
+		}}})
+	}))
+	defer server.Close()
+
+	t.Setenv("JWT_JWKS_URL", server.URL)
+	t.Setenv("JWT_ISSUER", "https://issuer.audit.invalid/")
+	t.Setenv("JWT_AUDIENCE", "nvuto-consent-audit")
+	t.Setenv("JWT_HMAC_SECRET", "")
+	t.Setenv("ALLOW_HMAC_AUTH", "false")
+	t.Setenv("ALLOW_DEV_HEADERS", "false")
+
+	// Preserve process-global cache state to keep this probe independent of the
+	// ordering of the repository's other auth tests.
+	jwksCache.Lock()
+	previousURL, previousKeys, previousFetchedAt := jwksCache.url, jwksCache.keys, jwksCache.fetchedAt
+	jwksCache.url, jwksCache.keys, jwksCache.fetchedAt = "", map[string]*rsa.PublicKey{}, time.Time{}
+	jwksCache.Unlock()
+	t.Cleanup(func() {
+		jwksCache.Lock()
+		jwksCache.url, jwksCache.keys, jwksCache.fetchedAt = previousURL, previousKeys, previousFetchedAt
+		jwksCache.Unlock()
+	})
+
+	requestWithKeyID := func(keyID string) *http.Request {
+		claims := Claims{
+			TenantID: "audit-tenant", SubjectID: "audit-customer", Roles: []string{"self_service"},
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject: "audit-actor", Issuer: "https://issuer.audit.invalid/",
+				Audience: jwt.ClaimStrings{"nvuto-consent-audit"},
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			},
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		token.Header["kid"] = keyID
+		raw, signErr := token.SignedString(key)
+		if signErr != nil {
+			t.Fatal("failed to sign synthetic audit token")
+		}
+		request := httptest.NewRequest(http.MethodPost, "/v1/evaluate", nil)
+		request.Header.Set("Authorization", "Bearer "+raw)
+		return request
+	}
+
+	if _, err := FromRequest(requestWithKeyID("audit-known-key")); err != nil {
+		t.Fatal("baseline synthetic token was unexpectedly rejected")
+	}
+	warmRequests := requests.Load()
+	for i := 0; i < 5; i++ {
+		if _, err := FromRequest(requestWithKeyID(fmt.Sprintf("audit-unknown-key-%d", i))); err == nil {
+			t.Fatal("unknown signing key must remain rejected")
+		}
+	}
+	if refreshes := requests.Load() - warmRequests; refreshes > 1 {
+		t.Fatalf("five untrusted JWT key IDs caused %d JWKS refreshes despite a fresh cache; expected at most one bounded refresh", refreshes)
+	}
+}

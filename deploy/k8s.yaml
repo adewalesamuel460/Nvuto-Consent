@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nvuto-consent
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consent-api
+  namespace: nvuto-consent
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: consent-api
+  template:
+    metadata:
+      labels:
+        app: consent-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: consent-api
+      containers:
+        - name: api
+          image: ghcr.io/atlasfsp/nvuto-consent:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: consent-secrets
+                  key: database-url
+            - name: JWT_JWKS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: consent-runtime
+                  key: authentik-jwks-url
+            - name: JWT_ISSUER
+              valueFrom:
+                configMapKeyRef:
+                  name: consent-runtime
+                  key: authentik-issuer
+            - name: JWT_AUDIENCE
+              valueFrom:
+                configMapKeyRef:
+                  name: consent-runtime
+                  key: authentik-audience
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: consent-api
+  namespace: nvuto-consent
+spec:
+  selector:
+    app: consent-api
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: consent-api
+  namespace: nvuto-consent
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: consent-api
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: consent-api
+  namespace: nvuto-consent
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: consent-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

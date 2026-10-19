@@ -1,0 +1,194 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Build, test and scan with exactly the pinned toolchain; never auto-download.
+  GOTOOLCHAIN: local
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.2'
+          cache: false
+      - name: Verify one patched Go toolchain across go.mod, CI and both images
+        run: |
+          want="$(awk '$1 == "go" { print $2; exit }' go.mod)"
+          test "$(go env GOVERSION)" = "go${want}"
+          for file in Dockerfile Dockerfile.worker; do
+            grep -Eq "^FROM golang:${want}-alpine@sha256:[0-9a-f]{64} AS build$" "$file"
+          done
+      - run: go mod download
+      - run: go mod verify
+      - name: Check module graph is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - name: Scan reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+      - run: go test -race ./...
+      - run: go build ./cmd/server
+      - run: go build ./cmd/outbox-worker
+      - run: docker build -t nvuto-consent:test .
+      - run: docker build -f Dockerfile.worker -t nvuto-consent-worker:test .
+
+  yugabytedb-functional:
+    runs-on: ubuntu-latest
+    env:
+      YUGABYTEDB_CONTAINER: nvuto-consent-yugabyte
+      DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
+      TEST_DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
+      TEST_NATS_URL: nats://127.0.0.1:4222
+      UPGRADE_DATABASE_URL: postgres://yugabyte@localhost:5433/consent_upgrade?sslmode=disable
+      ALLOW_MEMORY_STORE: "false"
+      ALLOW_DEV_HEADERS: "true"
+      # Integration tests fail instead of skipping when their DSN is missing.
+      NVUTO_REQUIRE_INTEGRATION: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.2'
+          cache: false
+      - run: go mod download
+      - run: mkdir -p test-results
+      - name: Start real YugabyteDB YSQL
+        run: bash scripts/ci/start-yugabytedb.sh consent
+      - name: Apply YSQL schema
+        run: |
+          for migration in migrations/[0-9][0-9][0-9]_*.sql; do
+            docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -v ON_ERROR_STOP=1 < "$migration"
+          done
+      - name: Prove upgrade from 001 through every migration on YugabyteDB
+        run: |
+          ysql() { docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -v ON_ERROR_STOP=1 "$@"; }
+          q() { ysql -d consent_upgrade -Atc "$1"; }
+          ysql -d yugabyte -c 'CREATE DATABASE consent_upgrade'
+          ysql -d consent_upgrade < migrations/001_init.sql
+          q "INSERT INTO consents(id,tenant_id,subject_id,purpose,channel,legal_basis,status,source,created_at,updated_at) VALUES('legacy','tenant-upgrade','subject-upgrade','service_updates','email','contract','granted','legacy',now(),now())"
+          # Row locked by a pre-005 worker at upgrade time.
+          q "INSERT INTO consent_outbox_events(id,tenant_id,event_type,aggregate_id,occurred_at,attempts,locked_at,locked_by) VALUES('legacy-outbox','tenant-upgrade','consent.granted','legacy',now(),1,now(),'legacy-worker')"
+          ysql -d consent_upgrade < migrations/002_policy_governance.sql
+          test "$(q "SELECT status || ':' || notice_version FROM consents WHERE id='legacy'")" = "granted:"
+          q "INSERT INTO consent_receipts(id,tenant_id,consent_id,subject_id,purpose,channel,notice_version,jurisdiction,evidence,receipt_hash,issued_at) VALUES('legacy-receipt','tenant-upgrade','legacy','subject-upgrade','service_updates','email','','','{}','legacy-v1-hash',now())"
+          ysql -d consent_upgrade < migrations/003_governed_idempotency.sql
+          q "INSERT INTO consent_idempotency(tenant_id,idempotency_key,request_hash,consent_id,created_at) VALUES('tenant-upgrade','legacy-key','legacy-request-hash','legacy',now())"
+          # Every later migration, including ones added in future, in order.
+          for migration in migrations/[0-9][0-9][0-9]_*.sql; do
+            case "$(basename "$migration")" in 001_*|002_*|003_*) continue ;; esac
+            ysql -d consent_upgrade < "$migration"
+          done
+          # Re-applying the full chain must be a no-op.
+          for migration in migrations/[0-9][0-9][0-9]_*.sql; do
+            ysql -d consent_upgrade < "$migration"
+          done
+          test "$(q "SELECT status || ':' || notice_version || ':' || preference_generation FROM consents WHERE id='legacy'")" = "granted::0"
+          test "$(q "SELECT receipt_hash || ':' || hash_version FROM consent_receipts WHERE id='legacy-receipt'")" = "legacy-v1-hash:1"
+          test "$(q "SELECT request_hash || ':' || consent_id FROM consent_idempotency WHERE tenant_id='tenant-upgrade' AND idempotency_key='legacy-key'")" = "legacy-request-hash:legacy"
+          test "$(q "SELECT locked_by || ':' || attempts || ':' || coalesce(claim_token,'none') || ':' || (published_at IS NULL) FROM consent_outbox_events WHERE id='legacy-outbox'")" = "legacy-worker:1:none:true"
+      - name: Prove idempotent replay/conflict and outbox fencing on the upgraded schema
+        run: |
+          set -o pipefail
+          TEST_DATABASE_URL="$UPGRADE_DATABASE_URL" DATABASE_URL="$UPGRADE_DATABASE_URL" \
+            go test -race -count=1 -json ./internal/store \
+              -run '^(TestPostgresGovernedIdempotencyConcurrentReplay|TestPostgresOutboxLeaseFencing)$' \
+            | tee test-results/store-upgraded.jsonl
+          python3 scripts/ci/assert-go-test-json.py test-results/store-upgraded.jsonl \
+            TestPostgresGovernedIdempotencyConcurrentReplay=1 TestPostgresOutboxLeaseFencing=1
+      - name: Prove durable idempotency and outbox fencing on YSQL, run twice against one database
+        run: |
+          set -o pipefail
+          go test -race -count=2 -json ./internal/store \
+              -run '^(TestPostgresGovernedIdempotencyConcurrentReplay|TestPostgresOutboxLeaseFencing)$' \
+            | tee test-results/store-fresh.jsonl
+          python3 scripts/ci/assert-go-test-json.py test-results/store-fresh.jsonl \
+            TestPostgresGovernedIdempotencyConcurrentReplay=2 TestPostgresOutboxLeaseFencing=2
+      - name: Prove YSQL policy transactions and confirmation concurrency
+        run: |
+          set -o pipefail
+          go test -race -count=1 -json ./cmd/server -run '^TestPostgresPolicyTransactionsAndSingleUseConfirmation$' \
+            | tee test-results/server.jsonl
+          python3 scripts/ci/assert-go-test-json.py test-results/server.jsonl \
+            TestPostgresPolicyTransactionsAndSingleUseConfirmation=1
+      - name: Prove HA-safe fenced JetStream outbox publication on YugabyteDB
+        run: |
+          set -o pipefail
+          docker run --rm -d --name consent-ci-nats -p 4222:4222 nats:2.10-alpine -js
+          for i in {1..30}; do
+            nc -z 127.0.0.1 4222 && break
+            sleep 1
+          done
+          go test -race -count=1 -json ./cmd/outbox-worker -run '^TestPostgresJetStreamOutboxConcurrency$' \
+            | tee test-results/outbox-worker.jsonl
+          python3 scripts/ci/assert-go-test-json.py test-results/outbox-worker.jsonl \
+            TestPostgresJetStreamOutboxConcurrency=1
+      - name: Build API
+        run: go build -o /tmp/consent ./cmd/server
+      - name: Start API against YugabyteDB
+        run: |
+          /tmp/consent > /tmp/consent.log 2>&1 &
+          echo $! > /tmp/consent.pid
+          for i in {1..30}; do
+            curl -fsS http://localhost:8080/readyz && exit 0
+            kill -0 "$(cat /tmp/consent.pid)" || break
+            sleep 1
+          done
+          cat /tmp/consent.log
+          exit 1
+      - name: Prove persisted grant evaluate withdraw flow on YugabyteDB
+        run: |
+          H=(-H 'X-Nvuto-Tenant-ID: tenant-a' -H 'X-Nvuto-Actor-ID: ci' -H 'Content-Type: application/json')
+          curl -fsS "${H[@]}" -d '{"code":"marketing","category":"marketing","allowed_channels":["email","whatsapp"],"requires_affirmative_consent":true,"requires_double_opt_in":false,"active":true}' http://localhost:8080/v1/purposes >/dev/null
+          curl -fsS "${H[@]}" -d '{"code":"double_marketing","category":"marketing","allowed_channels":["email"],"requires_affirmative_consent":true,"requires_double_opt_in":true,"active":true}' http://localhost:8080/v1/purposes >/dev/null
+          curl -fsS "${H[@]}" -d '{"code":"consent","allowed_categories":["marketing"],"requires_evidence":true,"active":true}' http://localhost:8080/v1/lawful-bases >/dev/null
+          curl -fsS "${H[@]}" -d '{"version":"2026-08","jurisdiction":"NG","published_at":"2026-08-14T00:00:00Z","active":true}' http://localhost:8080/v1/notices >/dev/null
+          CONSENT=$(curl -fsS "${H[@]}" -d '{"subject_id":"cus-100","purpose":"marketing","channel":"whatsapp","legal_basis":"consent","status":"granted","source":"portal","jurisdiction":"NG","notice_version":"2026-08","evidence":{"method":"ci","artifact_hash":"sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08","collected_at":"2026-08-14T00:00:00Z"}}' http://localhost:8080/v1/consents)
+          ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<< "$CONSENT")
+          RECEIPT_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["receipt_id"])' <<< "$CONSENT")
+          curl -fsS "${H[@]}" http://localhost:8080/v1/receipts/$RECEIPT_ID | python3 -c 'import json,sys; x=json.load(sys.stdin); assert x["receipt_hash"] and x["evidence"]["artifact_hash"]=="sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"'
+          DECISION=$(curl -fsS "${H[@]}" -d '{"subject_id":"cus-100","purpose":"marketing","channel":"whatsapp"}' http://localhost:8080/v1/evaluate)
+          python3 -c 'import json,sys; x=json.load(sys.stdin); assert x["allowed"] is True and x["reason"]=="granted" and x["receipt_id"]' <<< "$DECISION"
+          curl -fsS "${H[@]}" -d '{"subject_id":"cus-100","scope":"channel","channel":"email","reason":"channel_opt_out","active":true}' http://localhost:8080/v1/suppressions >/dev/null
+          curl -fsS "${H[@]}" -d '{"requests":[{"subject_id":"cus-100","purpose":"marketing","channel":"email"},{"subject_id":"cus-100","purpose":"marketing","channel":"whatsapp"}]}' http://localhost:8080/v1/evaluate:batch | python3 -c 'import json,sys; x=json.load(sys.stdin)["decisions"]; assert [d["reason"] for d in x]==["channel_suppression","granted"]'
+          EXPIRES=$(python3 -c 'from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(hours=1)).isoformat())')
+          CHALLENGE=$(curl -fsS "${H[@]}" -d "{\"subject_id\":\"cus-200\",\"purpose\":\"double_marketing\",\"channel\":\"email\",\"source\":\"portal\",\"jurisdiction\":\"NG\",\"notice_version\":\"2026-08\",\"evidence\":{\"method\":\"ci\",\"artifact_hash\":\"sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\"collected_at\":\"2026-08-14T00:00:00Z\"},\"expires_at\":\"$EXPIRES\"}" http://localhost:8080/v1/double-opt-in)
+          TOKEN=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["confirmation_token"])' <<< "$CHALLENGE")
+          curl -fsS "${H[@]}" -d "{\"token\":\"$TOKEN\"}" http://localhost:8080/v1/double-opt-in/confirm >/dev/null
+          STATUS=$(curl -sS -o /tmp/reused-token.json -w '%{http_code}' "${H[@]}" -d "{\"token\":\"$TOKEN\"}" http://localhost:8080/v1/double-opt-in/confirm)
+          test "$STATUS" = "404"
+          curl -fsS "${H[@]}" -X POST http://localhost:8080/v1/consents/$ID/withdraw >/dev/null
+          DECISION=$(curl -fsS "${H[@]}" -d '{"subject_id":"cus-100","purpose":"marketing","channel":"whatsapp"}' http://localhost:8080/v1/evaluate)
+          python3 -c 'import json,sys; x=json.load(sys.stdin); assert x["allowed"] is False and x["reason"]=="withdrawn"' <<< "$DECISION"
+          COUNT=$(docker exec "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -Atc "select count(*) from consent_outbox_events")
+          test "$COUNT" -ge 10
+          if docker exec "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -v ON_ERROR_STOP=1 -c "UPDATE consent_receipts SET receipt_hash='tampered' WHERE id='$RECEIPT_ID'"; then
+            echo 'immutable receipt update unexpectedly succeeded'
+            exit 1
+          fi
+      - name: Verify real YugabyteDB topology
+        run: |
+          SERVERS=$(docker exec "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -Atc 'select count(*) from yb_servers();')
+          test "$SERVERS" -ge 1
+      - name: Dump server log on failure
+        if: failure()
+        run: cat /tmp/consent.log || true
+      - name: Upload machine-readable YSQL test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ysql-test-results
+          path: test-results/
+          if-no-files-found: warn

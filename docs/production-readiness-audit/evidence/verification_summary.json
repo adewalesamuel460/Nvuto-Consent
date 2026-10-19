@@ -1,0 +1,86 @@
+{
+  "baseline": {
+    "pass": 15,
+    "skip": 3
+  },
+  "race": {
+    "pass": 15,
+    "skip": 3
+  },
+  "audit_probes": {
+    "fail": 11,
+    "pass": 1
+  },
+  "probe_count": 12,
+  "probe_finding_count": 9,
+  "statement_coverage_percent": 52.2,
+  "coverage_is_readiness_score": false,
+  "vulnerability_advisories": 19,
+  "symbol_level_advisories": 10,
+  "package_module_only_advisories": 9,
+  "production_database_tests_executed": 0,
+  "production_deployments_performed": 0,
+  "core_verification_commands": 15,
+  "probe_map": {
+    "TestAuditStaleDoubleOptInCannotOverrideLaterDenial": {
+      "finding": "F-001",
+      "observation": "Later denial was overwritten; evaluation returned allowed=true.",
+      "limit": "Memory service; SQL equivalent source-traced, not executed."
+    },
+    "TestAuditStaleDoubleOptInCannotOverrideLaterWithdrawal": {
+      "finding": "F-001",
+      "observation": "An older challenge restored permission after a newer grant was withdrawn.",
+      "limit": "Memory service; no live YSQL concurrency result."
+    },
+    "TestAuditHistoricalEvaluationCannotAllowBeforeGrant": {
+      "finding": "F-006",
+      "observation": "Grant evaluated allowed one hour before it existed; the notice predated that time.",
+      "limit": "Memory; intended historical at support requires D-03/D-12."
+    },
+    "TestAuditTightenedAffirmativePolicyRejectsEarlierContractGrant": {
+      "finding": "F-007",
+      "observation": "Contract-based grant remained allowed after purpose required affirmative consent.",
+      "limit": "Memory; grandfathering policy is D-04, not assumed."
+    },
+    "TestAuditTightenedDoubleOptInPolicyRejectsUnconfirmedGrant": {
+      "finding": "F-007",
+      "observation": "Earlier unconfirmed grant remained allowed after purpose required DOI.",
+      "limit": "Memory; approved transition behavior still requires decision."
+    },
+    "TestAuditMemoryTenantKeyDoesNotExposeOtherTenantConsent": {
+      "finding": "F-026",
+      "observation": "Colliding colon-delimited key returned a different tenant record.",
+      "limit": "Development Memory adapter; not a parameterized SQL tenant bypass."
+    },
+    "TestAuditRecordOlderWithdrawalBehaviorForDecision": {
+      "finding": "F-006",
+      "observation": "Withdrawing an older record made evaluation withdrawn despite a newer separate grant.",
+      "limit": "Observation-only test; no safety assertion and no approved semantic conclusion."
+    },
+    "TestAuditReceiptHashSurvivesPGXTimestampRoundTrip": {
+      "finding": "F-004",
+      "observation": "Actual pgx timestamptz codec truncated .123456789 to .123456; rehash differed.",
+      "limit": "Real pgx codec in process; no database server or durable YSQL read."
+    },
+    "TestAuditSelfServiceCannotConfirmAnotherSubjectChallenge": {
+      "finding": "F-002",
+      "observation": "Customer B confirmed A token in same tenant: HTTP200; A became granted and allowed.",
+      "limit": "Real HTTP handler with synthetic HMAC auth and Memory; possession of valid token required."
+    },
+    "TestAuditSelfServiceStartDoesNotExposeConfirmationSecret": {
+      "finding": "F-003",
+      "observation": "Self-service start201 returned raw token; immediate confirm200 granted without delivery.",
+      "limit": "HTTP handlers/Memory; no independent channel/provider journey occurred."
+    },
+    "TestAuditAPIRejectsTrailingJSONValue": {
+      "finding": "F-027",
+      "observation": "A second JSON object after a valid object was accepted with HTTP200.",
+      "limit": "HTTP decoder behavior; no request-smuggling exploit claimed."
+    },
+    "TestAuditJWKSUnknownKeyRefreshBounded": {
+      "finding": "F-014",
+      "observation": "Five unknown-kid attempts caused five fresh JWKS requests despite a warm cache.",
+      "limit": "Local mock HTTP JWKS; unknown tokens remained rejected; availability amplification, not signature bypass."
+    }
+  }
+}

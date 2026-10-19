@@ -1,0 +1,29 @@
+[
+  {
+    "file": ".github/workflows/ci.yml",
+    "syntax": "PARSED",
+    "documents": 1,
+    "kinds": []
+  },
+  {
+    "file": "deploy/k8s.yaml",
+    "syntax": "PARSED",
+    "documents": 5,
+    "kinds": [
+      "Namespace",
+      "Deployment",
+      "Service",
+      "PodDisruptionBudget",
+      "HorizontalPodAutoscaler"
+    ]
+  },
+  {
+    "file": "deploy/outbox-worker.yaml",
+    "syntax": "PARSED",
+    "documents": 2,
+    "kinds": [
+      "Deployment",
+      "PodDisruptionBudget"
+    ]
+  }
+]

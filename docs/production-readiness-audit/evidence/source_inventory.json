@@ -1,0 +1,194 @@
+[
+  {
+    "path": ".github/workflows/ci.yml",
+    "bytes": 8653,
+    "lines": 122,
+    "sha256": "6a66d757674e201fa6492a407af17e06b5241a3f94549746230c8aa7b80823b2"
+  },
+  {
+    "path": "Dockerfile",
+    "bytes": 363,
+    "lines": 12,
+    "sha256": "3422bbe6d4b9764884b1ab8ae93d0ca8dba1a3338ca61a377767449452d6bc27"
+  },
+  {
+    "path": "Dockerfile.worker",
+    "bytes": 386,
+    "lines": 11,
+    "sha256": "fc5b42063f74aad723d1ab6646e1db75b3ecc8826bd9ba3157af5f27d832ada1"
+  },
+  {
+    "path": "README.md",
+    "bytes": 4145,
+    "lines": 51,
+    "sha256": "88c70b2382d539035db18d9dc28793f5b2d6a2fa568863b3a32ddc283962973f"
+  },
+  {
+    "path": "cmd/outbox-worker/main.go",
+    "bytes": 7648,
+    "lines": 234,
+    "sha256": "fe17948f58cbb0fbc85a3e4ed8f56369fd63ff07eff3572aaf06aff661e130d2"
+  },
+  {
+    "path": "cmd/outbox-worker/main_test.go",
+    "bytes": 856,
+    "lines": 25,
+    "sha256": "e4f844dc9d4112c27f7610d0168b71792f881c6614f85cbc2a8fc32b2d1e4c95"
+  },
+  {
+    "path": "cmd/outbox-worker/postgres_integration_test.go",
+    "bytes": 3141,
+    "lines": 120,
+    "sha256": "2051a1b8c07ac1fae2730e7f36318fd701d28e54c6a7be231796293582213f90"
+  },
+  {
+    "path": "cmd/server/idempotency_test.go",
+    "bytes": 3157,
+    "lines": 80,
+    "sha256": "b92f59ea8e49cd985a193e33fec258211e74653fbe6d8b1a1fb4622e5e892b42"
+  },
+  {
+    "path": "cmd/server/main.go",
+    "bytes": 13245,
+    "lines": 457,
+    "sha256": "6beac3b221703a86238fc08a90513de79591f3013997c98155792061d11ad8ed"
+  },
+  {
+    "path": "cmd/server/main_test.go",
+    "bytes": 5985,
+    "lines": 138,
+    "sha256": "1675ff425173ecd5f869d2f3c4e3a00650060562b3771d212a836a7b8d60dc51"
+  },
+  {
+    "path": "cmd/server/postgres_integration_test.go",
+    "bytes": 3362,
+    "lines": 83,
+    "sha256": "0424ca4c125af5d0356d3ebab78e2f616323846452443d4f47ebc41975025d42"
+  },
+  {
+    "path": "deploy/k8s.yaml",
+    "bytes": 2973,
+    "lines": 129,
+    "sha256": "0cb818c6fb7a2ff3e9ad9c71edd2a6e8fdaaacb7271eb8ac0b6c4f6e3bbd8b65"
+  },
+  {
+    "path": "deploy/outbox-worker.yaml",
+    "bytes": 2268,
+    "lines": 83,
+    "sha256": "407ccef2a9d853cb46eb3e9a62cf422a7ba2f4c9fbc59c401cfa64137ee5888c"
+  },
+  {
+    "path": "go.mod",
+    "bytes": 656,
+    "lines": 22,
+    "sha256": "178007bc5baa07dec56d0360d0a924664d25efdb4f4c5b0400450d40665d0346"
+  },
+  {
+    "path": "go.sum",
+    "bytes": 3472,
+    "lines": 40,
+    "sha256": "714c7946707ce807a632a997d9904520a99b63fd001c5d4649844dbbf9cd77ee"
+  },
+  {
+    "path": "internal/auth/auth.go",
+    "bytes": 5795,
+    "lines": 200,
+    "sha256": "9ef4446e39e1dcdd3ee015cc77c2290de472456305eaa0462093bf537909466e"
+  },
+  {
+    "path": "internal/auth/auth_test.go",
+    "bytes": 5058,
+    "lines": 131,
+    "sha256": "46ef5f99879294fe19cb3e38a502097b7700ccacc51a934deda796e1baa9beb1"
+  },
+  {
+    "path": "internal/domain/model.go",
+    "bytes": 5727,
+    "lines": 151,
+    "sha256": "cc4c96fcbd070bedbb934b71c942909825b1eb90b130e1fbfab3f940476e74a4"
+  },
+  {
+    "path": "internal/service/idempotency.go",
+    "bytes": 4213,
+    "lines": 82,
+    "sha256": "ce392f9b7c8afc952e895f6ac0e5b86c48fad66ca713b633ce3682dce85c7130"
+  },
+  {
+    "path": "internal/service/idempotency_test.go",
+    "bytes": 2097,
+    "lines": 44,
+    "sha256": "63369a4cd133f3980caf4c0961170d06f956323a385261fbb6356b5830a9771e"
+  },
+  {
+    "path": "internal/service/policy_test.go",
+    "bytes": 8082,
+    "lines": 146,
+    "sha256": "9761697dca19dbbe2f4810119da4f9bfee23fa642feb93df4e9ae115b8743c41"
+  },
+  {
+    "path": "internal/service/service.go",
+    "bytes": 20049,
+    "lines": 390,
+    "sha256": "9db1833bd9f2feeaa394f7b433ba14abec90ef059d6af26a2fefb123cfdbf7a0"
+  },
+  {
+    "path": "internal/service/service_test.go",
+    "bytes": 2792,
+    "lines": 91,
+    "sha256": "9b157693ee8ac8aff10007daee33ae961758a0be93630c35cdca0627c6b063b0"
+  },
+  {
+    "path": "internal/store/idempotency.go",
+    "bytes": 3349,
+    "lines": 99,
+    "sha256": "6428ad58e02449bdf7e644cfdc2b5e53838bf2e85d92a4879dd46ec228b83c01"
+  },
+  {
+    "path": "internal/store/idempotency_integration_test.go",
+    "bytes": 2835,
+    "lines": 73,
+    "sha256": "b1a0fc796edce3e89356d2f4e086da11b0b73611f908dce3349192e416fcdea2"
+  },
+  {
+    "path": "internal/store/memory.go",
+    "bytes": 10886,
+    "lines": 340,
+    "sha256": "48a99b7378f71186350ce118e95e2b8c8cb5aee63f5927a790e31866a80d4369"
+  },
+  {
+    "path": "internal/store/postgres.go",
+    "bytes": 19399,
+    "lines": 396,
+    "sha256": "8f5305a6ef788ee22019bcc1c5e0edeb57d45278973b45118489c58720161631"
+  },
+  {
+    "path": "migrations/001_init.sql",
+    "bytes": 1655,
+    "lines": 45,
+    "sha256": "884383a3d78542620d384196128586f72d84b1912c04254bd7ae46c019fcc06e"
+  },
+  {
+    "path": "migrations/002_policy_governance.sql",
+    "bytes": 4174,
+    "lines": 110,
+    "sha256": "213c2687fef2d5a6be5eb8b561b635e2e42b371f65a28732e3a8a8a9f55036ef"
+  },
+  {
+    "path": "migrations/003_governed_idempotency.sql",
+    "bytes": 355,
+    "lines": 11,
+    "sha256": "95f9c138a69eac9f08ac4abfafaa9b1d5c720b9fdff01fb90c4d58dfb29e5eae"
+  },
+  {
+    "path": "migrations/ROLLBACK.md",
+    "bytes": 889,
+    "lines": 5,
+    "sha256": "3156dc01e9647372c6aa14ce0f6f89a27ccb3e567ab78136f6b07d9172c487ea"
+  },
+  {
+    "path": "scripts/ci/start-yugabytedb.sh",
+    "bytes": 1576,
+    "lines": 37,
+    "sha256": "2a402ce1e056d589de8171292acd7e771748eef4a726790bc52dfb50512480e9"
+  }
+]

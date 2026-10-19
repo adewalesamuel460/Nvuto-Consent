@@ -1,0 +1,110 @@
+[
+  {
+    "name": "TestEnvelopeIsVersionedCloudEventOnStableSubject",
+    "path": "cmd/outbox-worker/main_test.go",
+    "line": 9,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestPostgresJetStreamOutboxConcurrency",
+    "path": "cmd/outbox-worker/postgres_integration_test.go",
+    "line": 15,
+    "external_dependencies": true
+  },
+  {
+    "name": "TestConsentAPIIdempotencyKeyReplaysAndConflicts",
+    "path": "cmd/server/idempotency_test.go",
+    "line": 16,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestAPIRequiresExplicitAuthenticationAndProvesGovernedFlow",
+    "path": "cmd/server/main_test.go",
+    "line": 45,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestSelfServiceJWTIsBoundToCanonicalCustomerSubject",
+    "path": "cmd/server/main_test.go",
+    "line": 105,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestPostgresPolicyTransactionsAndSingleUseConfirmation",
+    "path": "cmd/server/postgres_integration_test.go",
+    "line": 17,
+    "external_dependencies": true
+  },
+  {
+    "name": "TestAuthenticationFailsClosedAndDevHeadersRequireExplicitOptIn",
+    "path": "internal/auth/auth_test.go",
+    "line": 26,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestJWTValidationRejectsExpiredWrongAlgorithmAndHeaderFallback",
+    "path": "internal/auth/auth_test.go",
+    "line": 42,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestAuthentikCompatibleJWKSValidation",
+    "path": "internal/auth/auth_test.go",
+    "line": 76,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestGovernedConsentIdempotencyReturnsOriginalAndRejectsSemanticReuse",
+    "path": "internal/service/idempotency_test.go",
+    "line": 12,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestGovernedConsentIdempotencyValidatesKey",
+    "path": "internal/service/idempotency_test.go",
+    "line": 36,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestGovernedConsentCreatesReceiptAndEnforcesRegistries",
+    "path": "internal/service/policy_test.go",
+    "line": 33,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestSuppressionHierarchyAndBatchDecisions",
+    "path": "internal/service/policy_test.go",
+    "line": 79,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestDoubleOptInRequiresSingleUseConfirmation",
+    "path": "internal/service/policy_test.go",
+    "line": 116,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestConsentGrantEvaluateWithdraw",
+    "path": "internal/service/service_test.go",
+    "line": 10,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestNoConsentAndExpirySuppress",
+    "path": "internal/service/service_test.go",
+    "line": 54,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestTenantIsolation",
+    "path": "internal/service/service_test.go",
+    "line": 77,
+    "external_dependencies": false
+  },
+  {
+    "name": "TestPostgresGovernedIdempotencyConcurrentReplay",
+    "path": "internal/store/idempotency_integration_test.go",
+    "line": 14,
+    "external_dependencies": true
+  }
+]

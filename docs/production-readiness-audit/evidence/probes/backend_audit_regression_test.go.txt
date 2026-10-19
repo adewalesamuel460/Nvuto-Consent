@@ -1,0 +1,177 @@
+package service
+
+// Audit-only probes. These tests are intentionally kept outside the supplied
+// source tree. They assert candidate safety requirements, and expose observed
+// counterexamples in the uploaded implementation. Policy grandfathering and
+// historical evaluation semantics still require an explicit product decision.
+
+import (
+	"testing"
+	"time"
+
+	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
+	"github.com/Atlasfsp/Nvuto-Consent/internal/store"
+)
+
+func auditEvidence() domain.Evidence {
+	return domain.Evidence{Method: "audit_fixture", ArtifactHash: "sha256:synthetic-audit-fixture", CollectedAt: time.Now().UTC()}
+}
+
+func TestAuditStaleDoubleOptInCannotOverrideLaterDenial(t *testing.T) {
+	svc := New(store.NewMemory())
+	installPolicyFixture(t, svc, "audit-stale-denial")
+	evidence := auditEvidence()
+	challenge, err := svc.StartDoubleOptIn("audit-stale-denial", "actor", "subject", "double_marketing", "email", "audit", "NG", "2026-08", evidence, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied, err := svc.RecordGoverned("audit-stale-denial", "actor", "subject", "double_marketing", "email", "consent", "denied", "audit", nil, nil, "NG", "2026-08", evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := svc.Evaluate("audit-stale-denial", "subject", "double_marketing", "email", time.Time{})
+	if err != nil || before.Allowed || before.ConsentID != denied.ID {
+		t.Fatalf("fixture must have a later effective denial: decision=%+v error=%v", before, err)
+	}
+	confirmed, confirmationErr := svc.ConfirmDoubleOptIn("audit-stale-denial", "actor", challenge.ConfirmationToken)
+	after, err := svc.Evaluate("audit-stale-denial", "subject", "double_marketing", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Allowed {
+		t.Fatalf("stale challenge created before denial reactivated permission: denial=%s confirmation=%+v confirmation_error=%v effective_decision=%+v", denied.ID, confirmed, confirmationErr, after)
+	}
+}
+
+func TestAuditStaleDoubleOptInCannotOverrideLaterWithdrawal(t *testing.T) {
+	svc := New(store.NewMemory())
+	installPolicyFixture(t, svc, "audit-stale-withdrawal")
+	evidence := auditEvidence()
+	oldChallenge, err := svc.StartDoubleOptIn("audit-stale-withdrawal", "actor", "subject", "double_marketing", "email", "audit", "NG", "2026-08", evidence, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newChallenge, err := svc.StartDoubleOptIn("audit-stale-withdrawal", "actor", "subject", "double_marketing", "email", "audit", "NG", "2026-08", evidence, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newConsent, err := svc.ConfirmDoubleOptIn("audit-stale-withdrawal", "actor", newChallenge.ConfirmationToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawn, err := svc.Withdraw("audit-stale-withdrawal", "actor", newConsent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := svc.Evaluate("audit-stale-withdrawal", "subject", "double_marketing", "email", time.Time{})
+	if err != nil || before.Allowed || before.ConsentID != withdrawn.ID {
+		t.Fatalf("fixture must have a later effective withdrawal: decision=%+v error=%v", before, err)
+	}
+	confirmed, confirmationErr := svc.ConfirmDoubleOptIn("audit-stale-withdrawal", "actor", oldChallenge.ConfirmationToken)
+	after, err := svc.Evaluate("audit-stale-withdrawal", "subject", "double_marketing", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Allowed {
+		t.Fatalf("stale challenge created before a newer grant and withdrawal reactivated permission: withdrawn=%s confirmation=%+v confirmation_error=%v effective_decision=%+v", withdrawn.ID, confirmed, confirmationErr, after)
+	}
+}
+
+func TestAuditHistoricalEvaluationCannotAllowBeforeGrant(t *testing.T) {
+	svc := New(store.NewMemory())
+	installPolicyFixture(t, svc, "audit-historical")
+	_, err := svc.PublishNotice("audit-historical", "admin", domain.PrivacyNotice{Version: "historical-notice", Jurisdiction: "NG", PublishedAt: time.Now().UTC().Add(-24 * time.Hour), Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consent, err := svc.RecordGoverned("audit-historical", "actor", "subject", "marketing", "email", "consent", "granted", "audit", nil, nil, "NG", "historical-notice", auditEvidence())
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := consent.CreatedAt.Add(-time.Hour)
+	decision, err := svc.Evaluate("audit-historical", "subject", "marketing", "email", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Allowed {
+		t.Fatalf("evaluation reports permission one hour before consent existed: created_at=%s granted_at=%s requested_at=%s decision=%+v", consent.CreatedAt, consent.GrantedAt, at, decision)
+	}
+}
+
+func TestAuditTightenedAffirmativePolicyRejectsEarlierContractGrant(t *testing.T) {
+	svc := New(store.NewMemory())
+	installPolicyFixture(t, svc, "audit-affirmative")
+	consent, err := svc.RecordGoverned("audit-affirmative", "actor", "subject", "service_updates", "email", "contract", "granted", "audit", nil, nil, "NG", "2026-08", domain.Evidence{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.RegisterPurpose("audit-affirmative", "admin", domain.Purpose{Code: "service_updates", Category: "service", AllowedChannels: []string{"email", "sms"}, RequiresAffirmativeConsent: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := svc.Evaluate("audit-affirmative", "subject", "service_updates", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Allowed {
+		t.Fatalf("current policy requires affirmative consent but earlier contract grant remains allowed: legal_basis=%s decision=%+v", consent.LegalBasis, decision)
+	}
+}
+
+func TestAuditTightenedDoubleOptInPolicyRejectsUnconfirmedGrant(t *testing.T) {
+	svc := New(store.NewMemory())
+	installPolicyFixture(t, svc, "audit-double-policy")
+	consent, err := svc.RecordGoverned("audit-double-policy", "actor", "subject", "marketing", "email", "consent", "granted", "audit", nil, nil, "NG", "2026-08", auditEvidence())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.RegisterPurpose("audit-double-policy", "admin", domain.Purpose{Code: "marketing", Category: "marketing", AllowedChannels: []string{"email"}, RequiresAffirmativeConsent: true, RequiresDoubleOptIn: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := svc.Evaluate("audit-double-policy", "subject", "marketing", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Allowed {
+		t.Fatalf("current policy requires double opt-in but an unconfirmed earlier grant remains allowed: confirmed_at=%v decision=%+v", consent.ConfirmedAt, decision)
+	}
+}
+
+func TestAuditMemoryTenantKeyDoesNotExposeOtherTenantConsent(t *testing.T) {
+	svc := New(store.NewMemory())
+	installPolicyFixture(t, svc, "audit-parent:child")
+	victim, err := svc.RecordGoverned("audit-parent:child", "victim-actor", "victim-subject", "marketing", "email", "consent", "granted", "audit", nil, nil, "NG", "2026-08", auditEvidence())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.Consent("audit-parent", "child:"+victim.ID)
+	if err == nil {
+		t.Fatalf("delimiter collision exposes another tenant's record: requesting_tenant=audit-parent returned_tenant=%s returned_consent=%s", result.TenantID, result.ID)
+	}
+}
+
+func TestAuditRecordOlderWithdrawalBehaviorForDecision(t *testing.T) {
+	// Observation only: whether withdrawing an older consent should invalidate
+	// a newer distinct grant is an unresolved product rule. Do not count this
+	// successful probe as evidence that either interpretation is correct.
+	svc := New(store.NewMemory())
+	installPolicyFixture(t, svc, "audit-old-withdrawal")
+	evidence := auditEvidence()
+	older, err := svc.RecordGoverned("audit-old-withdrawal", "actor", "subject", "marketing", "email", "consent", "granted", "audit", nil, nil, "NG", "2026-08", evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := svc.RecordGoverned("audit-old-withdrawal", "actor", "subject", "marketing", "email", "consent", "granted", "audit", nil, nil, "NG", "2026-08", evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Withdraw("audit-old-withdrawal", "actor", older.ID); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := svc.Evaluate("audit-old-withdrawal", "subject", "marketing", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("DECISION REQUIRED: withdrawing older=%s after newer=%s yields allowed=%t reason=%s effective_consent=%s", older.ID, newer.ID, decision.Allowed, decision.Reason, decision.ConsentID)
+}

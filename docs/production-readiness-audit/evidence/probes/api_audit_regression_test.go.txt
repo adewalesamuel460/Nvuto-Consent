@@ -1,0 +1,138 @@
+package main
+
+// Temporary audit-only probes. Copy into an isolated disposable cmd/server
+// package before running; do not add these files to the supplied source tree.
+// Assertions express the documented subject boundary and conservative API
+// parsing contract. The unmodified repository is expected to fail these probes.
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/Atlasfsp/Nvuto-Consent/internal/auth"
+	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
+	"github.com/Atlasfsp/Nvuto-Consent/internal/service"
+	"github.com/Atlasfsp/Nvuto-Consent/internal/store"
+	"github.com/golang-jwt/jwt/v5"
+)
+
+const auditAPITenant = "audit-api-tenant"
+const auditAPISecret = "synthetic-audit-local-only-secret"
+
+func auditAPIFixture(t *testing.T) (*service.Service, http.Handler, domain.Evidence) {
+	t.Helper()
+	t.Setenv("JWT_JWKS_URL", "")
+	t.Setenv("JWT_ISSUER", "")
+	t.Setenv("JWT_AUDIENCE", "")
+	t.Setenv("JWT_HMAC_SECRET", auditAPISecret)
+	t.Setenv("ALLOW_HMAC_AUTH", "true")
+	t.Setenv("ALLOW_DEV_HEADERS", "false")
+	svc := service.New(store.NewMemory())
+	if _, err := svc.RegisterPurpose(auditAPITenant, "audit-admin", domain.Purpose{Code: "audit_double", Category: "marketing", AllowedChannels: []string{"email"}, RequiresAffirmativeConsent: true, RequiresDoubleOptIn: true, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.RegisterLawfulBasis(auditAPITenant, "audit-admin", domain.LawfulBasis{Code: "consent", AllowedCategories: []string{"marketing"}, RequiresEvidence: true, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := svc.PublishNotice(auditAPITenant, "audit-admin", domain.PrivacyNotice{Version: "audit-v1", Jurisdiction: "NG", PublishedAt: now.Add(-time.Hour), Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	evidence := domain.Evidence{Method: "audit-fixture", ArtifactHash: "synthetic-non-secret-audit-artifact", CollectedAt: now.Add(-time.Minute)}
+	return svc, newMux(svc), evidence
+}
+
+func auditAPIToken(t *testing.T, subject string, roles ...string) string {
+	t.Helper()
+	claims := auth.Claims{
+		TenantID: auditAPITenant, SubjectID: subject, Roles: roles,
+		RegisteredClaims: jwt.RegisteredClaims{Subject: "audit-actor-" + subject, ExpiresAt: jwt.NewNumericDate(time.Now().Add(10 * time.Minute))},
+	}
+	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(auditAPISecret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+
+func auditAPIPost(t *testing.T, handler http.Handler, path, bearer string, input any) *httptest.ResponseRecorder {
+	t.Helper()
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return auditAPIPostRaw(handler, path, bearer, encoded)
+}
+
+func auditAPIPostRaw(handler http.Handler, path, bearer string, encoded []byte) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	return response
+}
+
+func TestAuditSelfServiceCannotConfirmAnotherSubjectChallenge(t *testing.T) {
+	svc, handler, evidence := auditAPIFixture(t)
+	challenge, err := svc.StartDoubleOptIn(auditAPITenant, "audit-admin", "audit-subject-a", "audit_double", "email", "audit-fixture", "NG", "audit-v1", evidence, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := auditAPIPost(t, handler, "/v1/double-opt-in/confirm", auditAPIToken(t, "audit-subject-b", "self_service"), map[string]string{"token": challenge.ConfirmationToken})
+	var returned domain.Consent
+	_ = json.Unmarshal(response.Body.Bytes(), &returned)
+	decision, err := svc.Evaluate(auditAPITenant, "audit-subject-a", "audit_double", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("observed: HTTP=%d, requester_subject=subject-b, returned_subject=%q, subject-a_allowed=%v", response.Code, returned.SubjectID, decision.Allowed)
+	if response.Code != http.StatusForbidden || decision.Allowed {
+		t.Fatalf("documented self-service subject boundary was not enforced: want HTTP 403 and subject-a still pending; got HTTP %d, allowed=%v", response.Code, decision.Allowed)
+	}
+}
+
+func TestAuditSelfServiceStartDoesNotExposeConfirmationSecret(t *testing.T) {
+	svc, handler, evidence := auditAPIFixture(t)
+	bearer := auditAPIToken(t, "audit-subject-a", "self_service")
+	response := auditAPIPost(t, handler, "/v1/double-opt-in", bearer, map[string]any{
+		"subject_id": "audit-subject-a", "purpose": "audit_double", "channel": "email", "source": "audit-fixture", "jurisdiction": "NG", "notice_version": "audit-v1", "evidence": evidence, "expires_at": time.Now().UTC().Add(time.Hour),
+	})
+	if response.Code == http.StatusForbidden {
+		t.Log("self-service challenge creation is restricted to trusted delivery callers")
+		return
+	}
+	if response.Code != http.StatusCreated && response.Code != http.StatusAccepted {
+		t.Fatalf("fixture failed before token disclosure check: HTTP %d", response.Code)
+	}
+	var challenge domain.DoubleOptInChallenge
+	if err := json.Unmarshal(response.Body.Bytes(), &challenge); err != nil {
+		t.Fatal(err)
+	}
+	if challenge.ConfirmationToken == "" {
+		return
+	}
+	// No message is dispatched and no external channel is contacted. The test
+	// client merely echoes the token it just received from the start endpoint.
+	confirmed := auditAPIPost(t, handler, "/v1/double-opt-in/confirm", bearer, map[string]string{"token": challenge.ConfirmationToken})
+	decision, err := svc.Evaluate(auditAPITenant, "audit-subject-a", "audit_double", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("observed: start_HTTP=%d, raw_token_disclosed=true, immediate_confirm_HTTP=%d, allowed_without_channel_delivery=%v", response.Code, confirmed.Code, decision.Allowed)
+	t.Fatalf("self-service caller received the confirmation secret; immediate confirmation returned HTTP %d and allowed=%v without any independent channel-delivery step", confirmed.Code, decision.Allowed)
+}
+
+func TestAuditAPIRejectsTrailingJSONValue(t *testing.T) {
+	_, handler, _ := auditAPIFixture(t)
+	input := []byte(`{"subject_id":"audit-subject-a","purpose":"audit_double","channel":"email"} {"unexpected":"second-json-value"}`)
+	response := auditAPIPostRaw(handler, "/v1/evaluate", auditAPIToken(t, "audit-reader", "consent_reader"), input)
+	t.Logf("observed: trailing second JSON object returned HTTP %d", response.Code)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("one HTTP request must contain exactly one JSON value: want HTTP 400 for trailing object; got HTTP %d", response.Code)
+	}
+}
