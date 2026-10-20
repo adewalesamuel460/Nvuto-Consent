@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/store"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const doiTenant = "tenant-a"
@@ -258,6 +261,195 @@ func TestConcurrentConfirmAndWithdrawConvergeToWithdrawn(t *testing.T) {
 			t.Fatalf("iteration %d: withdraw failed: %v", i, withdrawErr)
 		}
 		if decision := evaluate(t, svc, subject); decision.Allowed || decision.Reason != string(domain.StatusWithdrawn) {
+			t.Fatalf("iteration %d: converged to %+v", i, decision)
+		}
+	}
+}
+
+func ysqlDSN(t *testing.T) string {
+	t.Helper()
+	for _, name := range []string{"TEST_DATABASE_URL", "DATABASE_URL"} {
+		if dsn := os.Getenv(name); dsn != "" {
+			return dsn
+		}
+	}
+	if strings.EqualFold(os.Getenv("NVUTO_REQUIRE_INTEGRATION"), "true") {
+		t.Fatal("TEST_DATABASE_URL (or DATABASE_URL) is required when NVUTO_REQUIRE_INTEGRATION=true")
+	}
+	t.Skip("TEST_DATABASE_URL / DATABASE_URL not configured")
+	return ""
+}
+
+func newYSQLDOIFixture(t *testing.T) (*store.Postgres, *Service, string, domain.Evidence) {
+	t.Helper()
+	dsn := ysqlDSN(t)
+	repo, err := store.NewPostgres(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repo.Close() })
+	svc := New(repo)
+	tenant := fmt.Sprintf("tenant-ysql-doi-%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+	installPolicyFixture(t, svc, tenant)
+	evidence := domain.Evidence{
+		Method:       "signup_form",
+		ArtifactHash: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+		CollectedAt:  now,
+	}
+	return repo, svc, tenant, evidence
+}
+
+func retryTransientPG[T any](op func() (T, error)) (T, error) {
+	for attempt := 0; ; attempt++ {
+		value, err := op()
+		var pe *pgconn.PgError
+		if err == nil || !errors.As(err, &pe) || (pe.Code != "40001" && pe.Code != "40P01") || attempt >= 20 {
+			return value, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+}
+
+func TestYSQLStaleChallengeCannotOverrideLaterDenial(t *testing.T) {
+	_, svc, tenant, evidence := newYSQLDOIFixture(t)
+	now := time.Now().UTC()
+	challenge, err := svc.StartDoubleOptIn(context.Background(), tenant, "actor", "cus-ysql-deny", "double_marketing", "email", "portal", "NG", "2026-08", evidence, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied, err := svc.RecordGoverned(context.Background(), tenant, "actor", "cus-ysql-deny", "double_marketing", "email", "consent", "denied", "portal", nil, nil, "NG", "2026-08", evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed, err := svc.ConfirmDoubleOptIn(context.Background(), tenant, "actor", TenantWide(), challenge.ConfirmationToken); err == nil {
+		t.Fatalf("stale challenge overrode later denial: %+v", confirmed)
+	}
+	decision, err := svc.Evaluate(context.Background(), tenant, "cus-ysql-deny", "double_marketing", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Allowed || decision.Reason != string(domain.StatusDenied) || decision.ConsentID != denied.ID {
+		t.Fatalf("later denial must remain effective: %+v", decision)
+	}
+}
+
+func TestYSQLStaleChallengeCannotRestoreWithdrawnConsent(t *testing.T) {
+	_, svc, tenant, evidence := newYSQLDOIFixture(t)
+	now := time.Now().UTC()
+	older, err := svc.StartDoubleOptIn(context.Background(), tenant, "actor", "cus-ysql-withdraw", "double_marketing", "email", "portal", "NG", "2026-08", evidence, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := svc.StartDoubleOptIn(context.Background(), tenant, "actor", "cus-ysql-withdraw", "double_marketing", "email", "portal", "NG", "2026-08", evidence, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	granted, err := svc.ConfirmDoubleOptIn(context.Background(), tenant, "actor", TenantWide(), newer.ConfirmationToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Withdraw(context.Background(), tenant, "actor", granted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if confirmed, err := svc.ConfirmDoubleOptIn(context.Background(), tenant, "actor", TenantWide(), older.ConfirmationToken); err == nil {
+		t.Fatalf("superseded challenge restored withdrawn consent: %+v", confirmed)
+	}
+	decision, err := svc.Evaluate(context.Background(), tenant, "cus-ysql-withdraw", "double_marketing", "email", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Allowed || decision.Reason != string(domain.StatusWithdrawn) || decision.ConsentID != granted.ID {
+		t.Fatalf("withdrawal must remain effective: %+v", decision)
+	}
+}
+
+func TestYSQLConcurrentConfirmAndDenyConvergeToDenied(t *testing.T) {
+	repo, svc, tenant, evidence := newYSQLDOIFixture(t)
+	now := time.Now().UTC()
+	for i := range 10 {
+		subject := fmt.Sprintf("cus-ysql-race-deny-%d", i)
+		challenge, err := svc.StartDoubleOptIn(context.Background(), tenant, "actor", subject, "double_marketing", "email", "portal", "NG", "2026-08", evidence, now.Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		var confirmed domain.Consent
+		var confirmErr, denyErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			confirmed, confirmErr = retryTransientPG(func() (domain.Consent, error) {
+				return svc.ConfirmDoubleOptIn(context.Background(), tenant, "actor", TenantWide(), challenge.ConfirmationToken)
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, denyErr = retryTransientPG(func() (domain.Consent, error) {
+				return svc.RecordGoverned(context.Background(), tenant, "actor", subject, "double_marketing", "email", "consent", "denied", "portal", nil, nil, "NG", "2026-08", evidence)
+			})
+		}()
+		close(start)
+		wg.Wait()
+		if denyErr != nil {
+			t.Fatalf("iteration %d: deny failed: %v", i, denyErr)
+		}
+		if confirmErr == nil {
+			receipt, err := repo.GetReceipt(context.Background(), tenant, confirmed.ReceiptID)
+			if err != nil || !VerifyReceipt(receipt).Trusted() {
+				t.Fatalf("iteration %d: confirmed grant lacks a verifiable receipt: %v", i, err)
+			}
+		}
+		decision, err := svc.Evaluate(context.Background(), tenant, subject, "double_marketing", "email", time.Time{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Allowed || decision.Reason != string(domain.StatusDenied) {
+			t.Fatalf("iteration %d: converged to %+v (confirmErr=%v)", i, decision, confirmErr)
+		}
+	}
+}
+
+func TestYSQLConcurrentConfirmAndWithdrawConvergeToWithdrawn(t *testing.T) {
+	_, svc, tenant, evidence := newYSQLDOIFixture(t)
+	now := time.Now().UTC()
+	for i := range 10 {
+		subject := fmt.Sprintf("cus-ysql-race-withdraw-%d", i)
+		challenge, err := svc.StartDoubleOptIn(context.Background(), tenant, "actor", subject, "double_marketing", "email", "portal", "NG", "2026-08", evidence, now.Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		var withdrawErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = retryTransientPG(func() (domain.Consent, error) {
+				return svc.ConfirmDoubleOptIn(context.Background(), tenant, "actor", TenantWide(), challenge.ConfirmationToken)
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, withdrawErr = retryTransientPG(func() (domain.Consent, error) {
+				return svc.Withdraw(context.Background(), tenant, "actor", challenge.Consent.ID)
+			})
+		}()
+		close(start)
+		wg.Wait()
+		if withdrawErr != nil {
+			t.Fatalf("iteration %d: withdraw failed: %v", i, withdrawErr)
+		}
+		decision, err := svc.Evaluate(context.Background(), tenant, subject, "double_marketing", "email", time.Time{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Allowed || decision.Reason != string(domain.StatusWithdrawn) {
 			t.Fatalf("iteration %d: converged to %+v", i, decision)
 		}
 	}

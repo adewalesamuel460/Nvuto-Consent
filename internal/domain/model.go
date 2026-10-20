@@ -174,4 +174,5 @@ type OutboxEvent struct {
 	AggregateID   string         `json:"aggregate_id"`
 	Payload       map[string]any `json:"payload"`
 	OccurredAt    time.Time      `json:"occurred_at"`
+	ClaimToken    string         `json:"claim_token,omitempty"`
 }

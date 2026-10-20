@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/sync/singleflight"
 )
 
 type Principal struct {
@@ -114,12 +115,6 @@ func fetchJWKS(ctx context.Context, url string) (map[string]*rsa.PublicKey, erro
 	return keys, nil
 }
 
-// jwksRefresh is a single in-flight JWKS fetch shared by all concurrent callers.
-type jwksRefresh struct {
-	done chan struct{}
-	err  error
-}
-
 // jwksProvider caches the signing keys of one JWKS endpoint and bounds how
 // often that endpoint is contacted.
 type jwksProvider struct {
@@ -138,7 +133,8 @@ type jwksProvider struct {
 	keys        map[string]*rsa.PublicKey
 	fetchedAt   time.Time
 	lastAttempt time.Time
-	inflight    *jwksRefresh
+	inFlight    bool
+	group       singleflight.Group
 	unknown     map[string]time.Time
 }
 
@@ -174,6 +170,13 @@ func jwksProviderFor(url string) *jwksProvider {
 		jwksProviders.byURL[url] = provider
 	}
 	return provider
+}
+
+// ResetJWKSProviders clears the in-memory provider cache (primarily for tests).
+func ResetJWKSProviders() {
+	jwksProviders.Lock()
+	defer jwksProviders.Unlock()
+	jwksProviders.byURL = map[string]*jwksProvider{}
 }
 
 // key resolves a signing key. Fresh cached keys are served without I/O. Unknown
@@ -218,49 +221,49 @@ func (p *jwksProvider) key(ctx context.Context, keyID string) (*rsa.PublicKey, e
 	return nil, errUnknownKeyID
 }
 
-// refresh joins the in-flight fetch if there is one, otherwise starts a new
-// fetch unless the cooldown since the last attempt has not elapsed.
+// refresh coalesces concurrent fetch attempts using singleflight.Group. If a
+// fetch is already running, callers join the in-flight operation. If no fetch
+// is active and the cooldown since the last attempt has not elapsed, the
+// request is immediately throttled to prevent traffic amplification.
 func (p *jwksProvider) refresh(ctx context.Context) error {
 	p.mu.Lock()
-	call := p.inflight
-	if call == nil {
-		now := p.now()
-		if !p.lastAttempt.IsZero() && now.Sub(p.lastAttempt) < p.minRefreshInterval {
-			p.mu.Unlock()
-			return errRefreshThrottled
-		}
-		call = &jwksRefresh{done: make(chan struct{})}
-		p.inflight = call
-		p.lastAttempt = now
-		go p.runRefresh(call)
+	now := p.now()
+	if !p.inFlight && !p.lastAttempt.IsZero() && now.Sub(p.lastAttempt) < p.minRefreshInterval {
+		p.mu.Unlock()
+		return errRefreshThrottled
 	}
+	if !p.inFlight {
+		p.inFlight = true
+		p.lastAttempt = now
+	}
+	ch := p.group.DoChan("refresh", func() (any, error) {
+		defer func() {
+			p.mu.Lock()
+			p.inFlight = false
+			p.mu.Unlock()
+		}()
+		fetchCtx, cancel := context.WithTimeout(context.Background(), p.fetchTimeout)
+		defer cancel()
+		keys, err := p.fetch(fetchCtx, p.url)
+		p.mu.Lock()
+		if err == nil {
+			p.keys = keys
+			p.fetchedAt = p.now()
+			for keyID := range keys {
+				delete(p.unknown, keyID)
+			}
+		}
+		p.mu.Unlock()
+		return nil, err
+	})
 	p.mu.Unlock()
+
 	select {
-	case <-call.done:
-		return call.err
+	case res := <-ch:
+		return res.Err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-// runRefresh performs the fetch detached from any single request context so
-// that one cancelled caller cannot abort the refresh shared by the others.
-func (p *jwksProvider) runRefresh(call *jwksRefresh) {
-	ctx, cancel := context.WithTimeout(context.Background(), p.fetchTimeout)
-	defer cancel()
-	keys, err := p.fetch(ctx, p.url)
-	p.mu.Lock()
-	if err == nil {
-		p.keys = keys
-		p.fetchedAt = p.now()
-		for keyID := range keys {
-			delete(p.unknown, keyID)
-		}
-	}
-	call.err = err
-	p.inflight = nil
-	p.mu.Unlock()
-	close(call.done)
 }
 
 func (p *jwksProvider) rememberUnknownLocked(keyID string, now time.Time) {

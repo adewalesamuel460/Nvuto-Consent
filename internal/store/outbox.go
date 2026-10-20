@@ -20,6 +20,9 @@ const OutboxLeaseDuration = 2 * time.Minute
 // ErrConflict. The caller must not retry the write.
 var ErrLeaseLost = ErrConflict.Derive("outbox_lease_lost", "outbox lease is owned by a newer claim")
 
+// ErrOutboxClaimLost is an alias for ErrLeaseLost (T-009).
+var ErrOutboxClaimLost = ErrLeaseLost
+
 // OutboxRecord is one pending outbox event as seen by a publisher.
 type OutboxRecord struct {
 	ID            string          `json:"id"`
@@ -32,7 +35,8 @@ type OutboxRecord struct {
 	Payload       json.RawMessage `json:"payload"`
 	OccurredAt    time.Time       `json:"occurred_at"`
 	// Attempts is the number of earlier claims of this row (excluding this one).
-	Attempts int `json:"attempts"`
+	Attempts   int    `json:"attempts"`
+	ClaimToken string `json:"claim_token,omitempty"`
 }
 
 // OutboxClaim is a batch of rows locked under a single token.
@@ -61,6 +65,10 @@ type OutboxLeaser interface {
 	// and does not count the claim as an attempt. ErrLeaseLost if token no
 	// longer owns the row.
 	ReleaseOutbox(ctx context.Context, id, token string) error
+	// RescheduleOutbox is an alias for RetryOutbox under the T-009 specification.
+	RescheduleOutbox(ctx context.Context, id, token string, delay time.Duration) error
+	// ReleaseOutboxBatch releases uncommitted claimed events during graceful shutdown.
+	ReleaseOutboxBatch(ctx context.Context, workerID string, events []OutboxRecord) error
 }
 
 // newClaimToken returns 128 random bits as 32 lowercase hex characters.

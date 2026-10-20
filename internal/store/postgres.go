@@ -741,3 +741,26 @@ func (p *Postgres) RetryOutbox(ctx context.Context, id, token string, delay time
 func (p *Postgres) ReleaseOutbox(ctx context.Context, id, token string) error {
 	return p.fencedOutboxUpdate(ctx, `locked_at=NULL,locked_by=NULL,claim_token=NULL,attempts=GREATEST(attempts-1,0)`, id, token)
 }
+
+func (p *Postgres) RescheduleOutbox(ctx context.Context, id, token string, delay time.Duration) error {
+	return p.RetryOutbox(ctx, id, token, delay)
+}
+
+func (p *Postgres) ReleaseOutboxBatch(ctx context.Context, workerID string, events []OutboxRecord) error {
+	if len(events) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(events))
+	for _, e := range events {
+		if e.ID != "" {
+			ids = append(ids, e.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx, `UPDATE consent_outbox_events
+		SET locked_at=NULL,locked_by=NULL,claim_token=NULL,attempts=GREATEST(attempts-1,0)
+		WHERE id=ANY($1) AND published_at IS NULL AND (locked_by=$2 OR $2='')`, ids, workerID)
+	return err
+}

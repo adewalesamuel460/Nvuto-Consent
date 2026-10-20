@@ -811,3 +811,23 @@ func (m *Memory) ReleaseOutbox(ctx context.Context, id, token string) error {
 	state.Attempts = max(state.Attempts-1, 0)
 	return nil
 }
+
+func (m *Memory) RescheduleOutbox(ctx context.Context, id, token string, delay time.Duration) error {
+	return m.RetryOutbox(ctx, id, token, delay)
+}
+
+func (m *Memory) ReleaseOutboxBatch(ctx context.Context, workerID string, events []OutboxRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, item := range events {
+		state, ok := m.outboxLeases[item.ID]
+		if ok && state.PublishedAt == nil && (workerID == "" || state.LockedBy == workerID) {
+			state.LockedAt, state.LockedBy, state.ClaimToken = nil, "", ""
+			state.Attempts = max(state.Attempts-1, 0)
+		}
+	}
+	return nil
+}

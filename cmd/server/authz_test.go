@@ -287,14 +287,25 @@ func TestDoubleOptInConfirmationEnforcesCustomerBoundary(t *testing.T) {
 }
 
 func TestDoubleOptInConfirmationByTenantWideWriter(t *testing.T) {
-	f := newAuthzFixture(t)
-	challenge, err := f.svc.StartDoubleOptIn(context.Background(), authzTenant, "admin", "cus-a", "double_marketing", "email", "signup_form", "NG", "2026-08", f.evidence, time.Now().UTC().Add(time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	response := f.do(f.token(authzTenant, "", "consent_writer"), http.MethodPost, "/v1/double-opt-in/confirm", map[string]any{"token": challenge.ConfirmationToken})
-	if response.Code != http.StatusOK {
-		t.Fatalf("tenant-wide writer confirm returned %d: %s", response.Code, response.Body.String())
+	for _, role := range []string{"consent_writer", "privacy_admin", "consent_admin", "developer"} {
+		t.Run(role, func(t *testing.T) {
+			f := newAuthzFixture(t)
+			challenge, err := f.svc.StartDoubleOptIn(context.Background(), authzTenant, "admin", "cus-a", "double_marketing", "email", "signup_form", "NG", "2026-08", f.evidence, time.Now().UTC().Add(time.Hour))
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := f.do(f.token(authzTenant, "", role), http.MethodPost, "/v1/double-opt-in/confirm", map[string]any{"token": challenge.ConfirmationToken})
+			if response.Code != http.StatusOK {
+				t.Fatalf("tenant-wide role %s confirm returned %d: %s", role, response.Code, response.Body.String())
+			}
+			stored, err := f.repo.Get(context.Background(), authzTenant, challenge.Consent.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status != domain.StatusGranted || stored.ReceiptID == "" {
+				t.Fatalf("tenant-wide role %s failed to grant consent: %+v", role, stored)
+			}
+		})
 	}
 }
 

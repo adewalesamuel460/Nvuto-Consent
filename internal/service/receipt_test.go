@@ -6,6 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,5 +321,62 @@ func TestServiceReceiptsVerifyAfterStorage(t *testing.T) {
 	}
 	if _, err := svc.VerifyReceipt(context.Background(), "tenant-b", granted.ReceiptID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("receipts must stay tenant-scoped, got %v", err)
+	}
+}
+
+func TestYSQLReceiptHashSurvivesRealRead(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = os.Getenv("DATABASE_URL")
+	}
+	if databaseURL == "" {
+		if strings.EqualFold(os.Getenv("NVUTO_REQUIRE_INTEGRATION"), "true") {
+			t.Fatal("TEST_DATABASE_URL (or DATABASE_URL) is required when NVUTO_REQUIRE_INTEGRATION=true")
+		}
+		t.Skip("TEST_DATABASE_URL / DATABASE_URL not configured")
+	}
+	repo, err := store.NewPostgres(context.Background(), databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repo.Close() })
+	svc := New(repo)
+	tenantID := fmt.Sprintf("tenant-ysql-rcp-%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+	installPolicyFixture(t, svc, tenantID)
+
+	evidence := domain.Evidence{
+		Method:       "integration",
+		ArtifactHash: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+		CollectedAt:  now,
+	}
+	consent, err := svc.RecordGoverned(context.Background(), tenantID, "admin", "cus-ysql-rcp", "marketing", "email", "consent", "granted", "portal", nil, nil, "NG", "2026-08", evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := svc.VerifyReceipt(context.Background(), tenantID, consent.ReceiptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.Status != ReceiptHashVerified || !verification.Trusted() {
+		t.Fatalf("receipt %s must verify after a real YSQL read: %+v", consent.ReceiptID, verification)
+	}
+	receipt, err := svc.Receipt(context.Background(), tenantID, consent.ReceiptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := VerifyReceipt(receipt); v.Status != ReceiptHashVerified {
+		t.Fatalf("receipt must verify from entity: %+v", v)
+	}
+	exported, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var imported domain.ConsentReceipt
+	if err := json.Unmarshal(exported, &imported); err != nil {
+		t.Fatal(err)
+	}
+	if v := VerifyReceipt(imported); v.Status != ReceiptHashVerified {
+		t.Fatalf("receipt must verify after JSON export/import: %+v", v)
 	}
 }

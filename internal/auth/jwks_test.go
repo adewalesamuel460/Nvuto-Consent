@@ -335,6 +335,8 @@ func signRS256(t *testing.T, key *rsa.PrivateKey, kid string, claims Claims) str
 }
 
 func TestFromRequestUnknownKidFloodMakesOneOutboundRequest(t *testing.T) {
+	ResetJWKSProviders()
+	t.Cleanup(ResetJWKSProviders)
 	signing := testRSAKey(t)
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -434,5 +436,172 @@ func TestSelfServiceTokenRequiresCustomerSubjectClaim(t *testing.T) {
 				t.Fatalf("err=%v, wantErr=%v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// AT-014: Concurrency test proving a burst of 100 requests with unknown kids
+// triggers exactly one outbound HTTP request to the mock IdP and fails closed.
+func TestAT014_Burst100UnknownKidsTriggersExactlyOneOutboundRequest(t *testing.T) {
+	ResetJWKSProviders()
+	t.Cleanup(ResetJWKSProviders)
+	signing := testRSAKey(t)
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+			"kid": "good-key", "kty": "RSA", "use": "sig",
+			"n": base64.RawURLEncoding.EncodeToString(signing.PublicKey.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(signing.PublicKey.E)).Bytes()),
+		}}})
+	}))
+	defer server.Close()
+
+	const issuer, audience = "https://auth.nvuto.example/", "nvuto-consent"
+	t.Setenv("JWT_JWKS_URL", server.URL)
+	t.Setenv("JWT_ISSUER", issuer)
+	t.Setenv("JWT_AUDIENCE", audience)
+
+	claims := Claims{
+		TenantID: "tenant-a",
+		Roles:    []string{"consent_reader"},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "svc",
+			Issuer:    issuer,
+			Audience:  jwt.ClaimStrings{audience},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute)),
+		},
+	}
+
+	const requestCount = 100
+	tokens := make([]string, requestCount)
+	for i := range requestCount {
+		tokens[i] = signRS256(t, signing, fmt.Sprintf("unknown-kid-%d", i), claims)
+	}
+
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for _, raw := range tokens {
+		wg.Add(1)
+		go func(token string) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			if _, err := FromRequest(req); err == nil {
+				accepted.Add(1)
+			}
+		}(raw)
+	}
+	wg.Wait()
+
+	if accepted.Load() != 0 {
+		t.Fatalf("%d tokens with unknown kids were accepted; must fail closed", accepted.Load())
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("burst of 100 unknown kids made %d HTTP requests to mock IdP, want exactly 1", got)
+	}
+
+	// Repeat inside cooldown window: must make zero additional outbound requests
+	for i := range 50 {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+tokens[i])
+		if _, err := FromRequest(req); err == nil {
+			t.Fatal("token accepted inside cooldown window")
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("requests within cooldown caused %d HTTP requests, want 1", got)
+	}
+}
+
+// AT-014: Proves that legitimate key rotation succeeds after cooldown expires,
+// and revoked keys fail closed.
+func TestAT014_LegitimateKeyRotationAfterCooldown(t *testing.T) {
+	oldKey, newKey := testRSAKey(t), testRSAKey(t)
+	idp := &fakeIdP{keys: map[string]*rsa.PublicKey{"kid-initial": &oldKey.PublicKey}}
+	clock := &fakeClock{now: time.Unix(1_800_000_000, 0)}
+	provider := newTestProvider(idp, clock)
+	ctx := context.Background()
+
+	// Initial fetch
+	if _, err := provider.key(ctx, "kid-initial"); err != nil {
+		t.Fatalf("initial key resolution failed: %v", err)
+	}
+	if got := idp.fetches.Load(); got != 1 {
+		t.Fatalf("initial key resolution made %d fetches, want 1", got)
+	}
+
+	// IdP rotates keys
+	idp.set(func(f *fakeIdP) {
+		f.keys = map[string]*rsa.PublicKey{"kid-rotated": &newKey.PublicKey}
+	})
+
+	// Before cooldown: request for rotated key is throttled / fails closed
+	if _, err := provider.key(ctx, "kid-rotated"); err == nil {
+		t.Fatal("rotated key accepted before cooldown has elapsed")
+	}
+	if got := idp.fetches.Load(); got != 1 {
+		t.Fatalf("request before cooldown caused fetch: %d, want 1", got)
+	}
+
+	// Advance clock past cooldown duration (e.g. 10s)
+	clock.Advance(provider.minRefreshInterval)
+
+	// Rotated key should trigger a singleflight refresh and succeed
+	key, err := provider.key(ctx, "kid-rotated")
+	if err != nil || key == nil {
+		t.Fatalf("legitimate key rotation failed after cooldown: %v", err)
+	}
+	if key.N.Cmp(newKey.N) != 0 {
+		t.Fatal("retrieved key does not match rotated key")
+	}
+	if got := idp.fetches.Load(); got != 2 {
+		t.Fatalf("rotation fetch count = %d, want 2", got)
+	}
+
+	// Revoked key must fail closed
+	if _, err := provider.key(ctx, "kid-initial"); err == nil {
+		t.Fatal("revoked key must not be served after rotation")
+	}
+}
+
+// AT-014: Proves that identity-provider outages do not clear the last-known-good
+// cache, and unknown keys fail closed during outages.
+func TestAT014_IdPOutagePreservesLastKnownGoodAndUnknownKeysFailClosed(t *testing.T) {
+	signing := testRSAKey(t)
+	idp := &fakeIdP{keys: map[string]*rsa.PublicKey{"kid-valid": &signing.PublicKey}}
+	clock := &fakeClock{now: time.Unix(1_800_000_000, 0)}
+	provider := newTestProvider(idp, clock)
+	ctx := context.Background()
+
+	// Initial warm cache
+	if _, err := provider.key(ctx, "kid-valid"); err != nil {
+		t.Fatalf("failed to cache valid key: %v", err)
+	}
+	if got := idp.fetches.Load(); got != 1 {
+		t.Fatalf("warmup fetches = %d, want 1", got)
+	}
+
+	// Simulate IdP outage
+	idp.set(func(f *fakeIdP) { f.fail = true })
+
+	// Advance past normal cache TTL so keys become stale
+	clock.Advance(provider.ttl + time.Second)
+
+	// Valid cached key must still be accepted from the last-known-good cache
+	key, err := provider.key(ctx, "kid-valid")
+	if err != nil || key == nil {
+		t.Fatalf("valid cached key rejected during IdP outage: %v", err)
+	}
+
+	// Unknown key during outage must fail closed
+	clock.Advance(provider.minRefreshInterval)
+	if _, err := provider.key(ctx, "kid-forged-during-outage"); err == nil {
+		t.Fatal("unknown key accepted during IdP outage; must fail closed")
+	}
+
+	// Valid cached key still works
+	keyAfter, err := provider.key(ctx, "kid-valid")
+	if err != nil || keyAfter == nil {
+		t.Fatalf("valid cached key lost after unknown key failure during outage: %v", err)
 	}
 }

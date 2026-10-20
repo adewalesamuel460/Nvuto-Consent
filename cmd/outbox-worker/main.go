@@ -225,7 +225,7 @@ func (w *worker) complete(ctx context.Context, token string, item event) {
 		case err == nil:
 			w.logEvent(slog.LevelInfo, "complete_succeeded", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.Int("attempt", attempt))
 			return
-		case errors.Is(err, store.ErrLeaseLost):
+		case errors.Is(err, store.ErrLeaseLost) || errors.Is(err, store.ErrOutboxClaimLost):
 			w.logEvent(slog.LevelWarn, "complete_refused", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("reason", "lease_lost"))
 			w.emitLogf("complete %s refused: lease is owned by a newer claim", item.ID)
 			return
@@ -244,7 +244,7 @@ func (w *worker) complete(ctx context.Context, token string, item event) {
 func (w *worker) retry(ctx context.Context, token string, item event) {
 	err := w.leaser.RetryOutbox(ctx, item.ID, token, retryDelay(item.Attempts))
 	switch {
-	case errors.Is(err, store.ErrLeaseLost):
+	case errors.Is(err, store.ErrLeaseLost) || errors.Is(err, store.ErrOutboxClaimLost):
 		w.logEvent(slog.LevelWarn, "retry_refused", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("reason", "lease_lost"))
 		w.emitLogf("retry scheduling %s refused: lease is owned by a newer claim", item.ID)
 	case err != nil:
@@ -259,6 +259,14 @@ func (w *worker) retry(ctx context.Context, token string, item event) {
 // at once. Rows not released before ctx ends stay claimed until the lease
 // expires, which is equally safe.
 func (w *worker) release(ctx context.Context, token string, items []event, reason string) {
+	if len(items) == 0 {
+		return
+	}
+	if err := w.leaser.ReleaseOutboxBatch(ctx, w.id, items); err == nil {
+		w.logEvent(slog.LevelInfo, "release_completed", slog.String("worker_id", w.id), slog.Int("released_count", len(items)), slog.Int("total_items", len(items)), slog.String("reason", reason))
+		w.emitLogf("released %d of %d claimed outbox rows (%s)", len(items), len(items), reason)
+		return
+	}
 	released := 0
 	for i, item := range items {
 		err := w.leaser.ReleaseOutbox(ctx, item.ID, token)
@@ -271,7 +279,7 @@ func (w *worker) release(ctx context.Context, token string, items []event, reaso
 			w.emitLogf("release deadline reached (%s): %d outbox rows left to lease expiry", reason, len(items)-i)
 			break
 		}
-		if !errors.Is(err, store.ErrLeaseLost) {
+		if !errors.Is(err, store.ErrLeaseLost) && !errors.Is(err, store.ErrOutboxClaimLost) {
 			w.logEvent(slog.LevelWarn, "release_failed", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("error", err.Error()))
 			w.emitLogf("release %s failed: %v", item.ID, err)
 		}
