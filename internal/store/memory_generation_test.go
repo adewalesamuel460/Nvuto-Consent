@@ -108,7 +108,7 @@ func TestMemoryConfirmRejectsLegacyGenerationZeroChallenge(t *testing.T) {
 	m := NewMemory()
 	now := time.Now().UTC()
 	legacy := genChallenge("con_legacy", "tok_legacy", now)
-	m.consents[key(genTenant, legacy.ID)] = legacy // pre-migration row: generation 0, token intact
+	m.consents[consentKey{tenantID: genTenant, consentID: legacy.ID}] = legacy // pre-migration row: generation 0, token intact
 
 	calls := 0
 	before := countsOf(m)

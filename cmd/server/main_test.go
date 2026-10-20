@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,5 +136,163 @@ func TestSelfServiceJWTIsBoundToCanonicalCustomerSubject(t *testing.T) {
 	}
 	if response := evaluate("cus-self"); response.Code != http.StatusOK || decodeResponse(t, response)["reason"] != "no_consent" {
 		t.Fatalf("own-subject self-service returned %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestReadinessFailsWhenAuthUnconfigured(t *testing.T) {
+	// 1. Auth unconfigured: /readyz must fail with 503 not_ready (T-015).
+	t.Setenv("JWT_JWKS_URL", "")
+	t.Setenv("JWT_ISSUER", "")
+	t.Setenv("JWT_AUDIENCE", "")
+	t.Setenv("JWT_HMAC_SECRET", "")
+	t.Setenv("ALLOW_HMAC_AUTH", "false")
+	t.Setenv("ALLOW_DEV_HEADERS", "false")
+
+	handler := newMux(service.New(store.NewMemory()))
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for unconfigured auth readiness, got %d: %s", resp.Code, resp.Body.String())
+	}
+	body := decodeResponse(t, resp)
+	if body["status"] != "not_ready" {
+		t.Fatalf("expected status=not_ready, got: %v", body)
+	}
+
+	// 2. Auth properly configured: /readyz must return 200 ready.
+	t.Setenv("ALLOW_DEV_HEADERS", "true")
+	respReady := httptest.NewRecorder()
+	handler.ServeHTTP(respReady, req)
+
+	if respReady.Code != http.StatusOK {
+		t.Fatalf("expected 200 for configured auth readiness, got %d: %s", respReady.Code, respReady.Body.String())
+	}
+	readyBody := decodeResponse(t, respReady)
+	if readyBody["status"] != "ready" {
+		t.Fatalf("expected status=ready, got: %v", readyBody)
+	}
+}
+
+func TestSecureDOIDeliveryBoundaryOpaqueResponse(t *testing.T) {
+	t.Setenv("ALLOW_DEV_HEADERS", "true")
+	repo := store.NewMemory()
+	svc := service.New(repo)
+	handler := newMux(svc)
+
+	// Set up purpose that requires double opt-in.
+	pubResp := request(t, handler, http.MethodPost, "/v1/purposes", map[string]any{
+		"code":                         "doi_newsletter",
+		"category":                     "marketing",
+		"allowed_channels":             []string{"email"},
+		"requires_affirmative_consent": true,
+		"requires_double_opt_in":       true,
+		"active":                       true,
+	}, true)
+	if pubResp.Code != http.StatusCreated {
+		t.Fatalf("failed to create purpose: %d %s", pubResp.Code, pubResp.Body.String())
+	}
+
+	now := time.Now().UTC()
+	request(t, handler, http.MethodPost, "/v1/lawful-bases", map[string]any{
+		"code":               "consent",
+		"allowed_categories": []string{"marketing"},
+		"requires_evidence":  true,
+		"active":             true,
+	}, true)
+	request(t, handler, http.MethodPost, "/v1/notices", map[string]any{
+		"version":      "2026-08",
+		"jurisdiction": "NG",
+		"published_at": now,
+		"active":       true,
+	}, true)
+
+	// Start Double Opt-In via API-09 (T-003).
+	resp := request(t, handler, http.MethodPost, "/v1/double-opt-in", map[string]any{
+		"subject_id":     "cus-doi-user",
+		"purpose":        "doi_newsletter",
+		"channel":        "email",
+		"source":         "signup_form",
+		"jurisdiction":   "NG",
+		"notice_version": "2026-08",
+		"evidence": map[string]any{
+			"method":        "signup_form",
+			"artifact_hash": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+			"collected_at":  now,
+		},
+		"expires_at": now.Add(time.Hour),
+	}, true)
+
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("start double opt-in failed %d: %s", resp.Code, resp.Body.String())
+	}
+
+	rawJSON := resp.Body.String()
+	// T-003: Raw confirmation_token must NEVER be returned in response JSON.
+	if bytes.Contains(resp.Body.Bytes(), []byte("confirmation_token")) {
+		t.Fatalf("start double opt-in response exposed confirmation_token: %s", rawJSON)
+	}
+
+	body := decodeResponse(t, resp)
+	if challengeID, _ := body["challenge_id"].(string); challengeID == "" {
+		t.Fatalf("expected challenge_id in response, got: %v", body)
+	}
+	if status, _ := body["status"].(string); status != "pending_confirmation" {
+		t.Fatalf("expected status=pending_confirmation, got: %v", status)
+	}
+	if consentMap, ok := body["consent"].(map[string]any); !ok || consentMap["id"] == "" {
+		t.Fatalf("expected consent object in response, got: %v", body)
+	}
+}
+
+func TestStructuredJSONLoggingAndSecurityRedaction(t *testing.T) {
+	repo := store.NewMemory()
+	svc := service.New(repo)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	handler := newHandler(svc, 5*time.Second, logger)
+
+	// Send an unauthenticated request with a sensitive Bearer token and body
+	reqBody := `{"subject_id":"cus-secret-user","purpose":"marketing","channel":"email"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/evaluate", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sensitive-secret-jwt-token-xyz")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	cid := resp.Header().Get(correlationHeader)
+	rawLogs := strings.TrimSpace(logBuf.String())
+	if rawLogs == "" {
+		t.Fatal("expected at least one log line from handler")
+	}
+	logLines := strings.Split(rawLogs, "\n")
+
+	foundRequestFailed := false
+	for _, rawLine := range logLines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line is not valid JSON (%v): %s", err, line)
+		}
+		if entry["msg"] == "request_failed" {
+			foundRequestFailed = true
+			if entry["correlation_id"] != cid {
+				t.Fatalf("log correlation_id %v does not match header %v", entry["correlation_id"], cid)
+			}
+			if entry["method"] != "POST" || entry["path"] != "/v1/evaluate" {
+				t.Fatalf("unexpected method/path in log: %v", entry)
+			}
+		}
+		// Security check: raw authorization tokens and evidence hashes must never be logged (T-021)
+		if strings.Contains(line, "sensitive-secret-jwt-token-xyz") {
+			t.Fatalf("log line leaked sensitive token: %s", line)
+		}
+	}
+	if !foundRequestFailed {
+		t.Fatalf("did not find request_failed structured JSON log entry in: %s", logBuf.String())
 	}
 }

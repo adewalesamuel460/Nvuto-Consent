@@ -33,7 +33,7 @@ spec:
                     app: consent-outbox-worker
       containers:
         - name: worker
-          image: ghcr.io/atlasfsp/nvuto-consent:latest-worker
+          image: ghcr.io/atlasfsp/nvuto-consent@sha256:ca50785f29910d634cb9e4a3b81177699479e19d7d2238cfae4f8d5789d6e80b # Must use immutable image digest in production (T-018)
           env:
             - name: DATABASE_URL
               valueFrom:

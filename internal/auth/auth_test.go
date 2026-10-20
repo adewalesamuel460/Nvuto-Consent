@@ -129,3 +129,94 @@ func TestAuthentikCompatibleJWKSValidation(t *testing.T) {
 		t.Fatal("wrong issuer must be rejected")
 	}
 }
+
+func TestValidateConfig(t *testing.T) {
+	clearEnv := func() {
+		t.Setenv("JWT_JWKS_URL", "")
+		t.Setenv("JWT_ISSUER", "")
+		t.Setenv("JWT_AUDIENCE", "")
+		t.Setenv("JWT_HMAC_SECRET", "")
+		t.Setenv("ALLOW_HMAC_AUTH", "false")
+		t.Setenv("ALLOW_DEV_HEADERS", "false")
+	}
+
+	t.Run("unconfigured fails closed", func(t *testing.T) {
+		clearEnv()
+		if err := ValidateConfig(); err == nil {
+			t.Fatal("expected error for unconfigured auth, got nil")
+		}
+	})
+
+	t.Run("valid dev headers mode", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("ALLOW_DEV_HEADERS", "true")
+		if err := ValidateConfig(); err != nil {
+			t.Fatalf("expected nil for ALLOW_DEV_HEADERS=true, got %v", err)
+		}
+	})
+
+	t.Run("valid HMAC mode", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("JWT_HMAC_SECRET", "super-secret-key-12345")
+		t.Setenv("ALLOW_HMAC_AUTH", "true")
+		if err := ValidateConfig(); err != nil {
+			t.Fatalf("expected nil for valid HMAC config, got %v", err)
+		}
+	})
+
+	t.Run("HMAC secret set without ALLOW_HMAC_AUTH fails", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("JWT_HMAC_SECRET", "super-secret-key-12345")
+		t.Setenv("ALLOW_HMAC_AUTH", "false")
+		if err := ValidateConfig(); err == nil {
+			t.Fatal("expected error when ALLOW_HMAC_AUTH is false, got nil")
+		}
+	})
+
+	t.Run("ALLOW_HMAC_AUTH true without secret fails", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("ALLOW_HMAC_AUTH", "true")
+		t.Setenv("JWT_HMAC_SECRET", "")
+		if err := ValidateConfig(); err == nil {
+			t.Fatal("expected error when JWT_HMAC_SECRET is empty, got nil")
+		}
+	})
+
+	t.Run("valid JWKS mode", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("JWT_JWKS_URL", "https://auth.example.com/.well-known/jwks.json")
+		t.Setenv("JWT_ISSUER", "https://auth.example.com/")
+		t.Setenv("JWT_AUDIENCE", "consent-service")
+		if err := ValidateConfig(); err != nil {
+			t.Fatalf("expected nil for valid JWKS config, got %v", err)
+		}
+	})
+
+	t.Run("JWKS missing issuer fails", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("JWT_JWKS_URL", "https://auth.example.com/.well-known/jwks.json")
+		t.Setenv("JWT_AUDIENCE", "consent-service")
+		if err := ValidateConfig(); err == nil {
+			t.Fatal("expected error for missing issuer, got nil")
+		}
+	})
+
+	t.Run("JWKS missing audience fails", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("JWT_JWKS_URL", "https://auth.example.com/.well-known/jwks.json")
+		t.Setenv("JWT_ISSUER", "https://auth.example.com/")
+		if err := ValidateConfig(); err == nil {
+			t.Fatal("expected error for missing audience, got nil")
+		}
+	})
+
+	t.Run("JWKS invalid URL scheme fails", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("JWT_JWKS_URL", "ftp://auth.example.com/jwks")
+		t.Setenv("JWT_ISSUER", "https://auth.example.com/")
+		t.Setenv("JWT_AUDIENCE", "consent-service")
+		if err := ValidateConfig(); err == nil {
+			t.Fatal("expected error for non-http/https URL, got nil")
+		}
+	})
+}

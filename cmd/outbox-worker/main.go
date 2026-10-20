@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -69,6 +69,7 @@ type worker struct {
 	leaseMargin    time.Duration
 	shutdownGrace  time.Duration
 	now            func() time.Time
+	logger         *slog.Logger
 	logf           func(format string, args ...any)
 }
 
@@ -77,7 +78,21 @@ func newWorker(leaser store.OutboxLeaser, publish publishFunc, id string) *worke
 		leaser: leaser, publish: publish, id: id,
 		batchSize: defaultBatchSize, pollInterval: defaultPollInterval,
 		publishTimeout: defaultPublishTimeout, leaseMargin: leaseSafetyMargin,
-		shutdownGrace: defaultShutdownGrace, now: time.Now, logf: log.Printf,
+		shutdownGrace: defaultShutdownGrace, now: time.Now,
+		logger: slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		logf:   nil,
+	}
+}
+
+func (w *worker) logEvent(level slog.Level, msg string, attrs ...slog.Attr) {
+	if w.logger != nil {
+		w.logger.LogAttrs(context.Background(), level, msg, attrs...)
+	}
+}
+
+func (w *worker) emitLogf(format string, args ...any) {
+	if w.logf != nil {
+		w.logf(format, args...)
 	}
 }
 
@@ -122,7 +137,8 @@ func (w *worker) run(stop context.Context) {
 			}
 		}
 		if stop.Err() != nil {
-			w.logf("outbox worker %s: stop requested, claiming no new batches", w.id)
+			w.logEvent(slog.LevelInfo, "stop_requested", slog.String("worker_id", w.id))
+			w.emitLogf("outbox worker %s: stop requested, claiming no new batches", w.id)
 			return
 		}
 		full := w.cycle(soft, hard)
@@ -139,27 +155,35 @@ func (w *worker) cycle(soft, hard context.Context) bool {
 	started := w.now()
 	claim, err := w.leaser.ClaimOutbox(hard, w.id, w.batchSize, w.tenantFilter)
 	if err != nil {
-		w.logf("outbox claim failed: %v", err)
+		w.logEvent(slog.LevelError, "claim_failed", slog.String("worker_id", w.id), slog.String("error", err.Error()))
+		w.emitLogf("outbox claim failed: %v", err)
 		return false
 	}
-	w.process(soft, hard, claim, started)
+	if len(claim.Events) > 0 {
+		w.logEvent(slog.LevelInfo, "claim_succeeded", slog.String("worker_id", w.id), slog.Int("claimed_count", len(claim.Events)), slog.Duration("lease", claim.Lease))
+	}
+	processed := w.process(soft, hard, claim, started)
+	if len(claim.Events) > 0 {
+		w.logEvent(slog.LevelInfo, "batch_completed", slog.String("worker_id", w.id), slog.Int("claimed_count", len(claim.Events)), slog.Int("processed_count", processed), slog.Duration("duration", w.now().Sub(started)))
+	}
 	return len(claim.Events) >= w.batchSize
 }
 
 // process publishes the claimed rows in order. started is the worker clock
 // before the claim, so started+lease is no later than the database lease
 // expiry (up to clock skew, absorbed by leaseMargin).
-func (w *worker) process(soft, hard context.Context, claim store.OutboxClaim, started time.Time) {
+func (w *worker) process(soft, hard context.Context, claim store.OutboxClaim, started time.Time) int {
 	budget := started.Add(claim.Lease - w.leaseMargin)
+	processed := 0
 	for i, item := range claim.Events {
 		if soft.Err() != nil {
 			w.release(hard, claim.Token, claim.Events[i:], "shutdown")
-			return
+			return processed
 		}
 		remaining := budget.Sub(w.now())
 		if remaining <= 0 {
 			w.release(hard, claim.Token, claim.Events[i:], "lease budget exhausted")
-			return
+			return processed
 		}
 		limit := min(remaining, w.publishTimeout)
 		publishCtx, cancel := context.WithTimeout(soft, limit)
@@ -167,7 +191,9 @@ func (w *worker) process(soft, hard context.Context, claim store.OutboxClaim, st
 		budgetHit := errors.Is(publishCtx.Err(), context.DeadlineExceeded) && limit < w.publishTimeout
 		cancel()
 		if err == nil {
+			w.logEvent(slog.LevelInfo, "publish_succeeded", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("event_type", item.EventType), slog.String("aggregate_id", item.AggregateID))
 			w.complete(hard, claim.Token, item)
+			processed++
 			continue
 		}
 		switch {
@@ -175,14 +201,17 @@ func (w *worker) process(soft, hard context.Context, claim store.OutboxClaim, st
 			// The outcome of the interrupted publish is unknown. Releasing lets
 			// the next owner publish again under the same Msg-Id.
 			w.release(hard, claim.Token, claim.Events[i:], "shutdown during publish")
-			return
+			return processed
 		case budgetHit:
 			w.release(hard, claim.Token, claim.Events[i:], "lease budget exhausted during publish")
-			return
+			return processed
 		}
-		w.logf("publish %s failed: %v", item.ID, err)
+		w.logEvent(slog.LevelWarn, "publish_failed", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("event_type", item.EventType), slog.Int("attempts", item.Attempts), slog.String("error", err.Error()))
+		w.emitLogf("publish %s failed: %v", item.ID, err)
 		w.retry(hard, claim.Token, item)
+		processed++
 	}
+	return processed
 }
 
 // complete records publication. A lost lease means a newer claim owns the
@@ -194,12 +223,15 @@ func (w *worker) complete(ctx context.Context, token string, item event) {
 		err := w.leaser.CompleteOutbox(ctx, item.ID, token)
 		switch {
 		case err == nil:
+			w.logEvent(slog.LevelInfo, "complete_succeeded", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.Int("attempt", attempt))
 			return
 		case errors.Is(err, store.ErrLeaseLost):
-			w.logf("complete %s refused: lease is owned by a newer claim", item.ID)
+			w.logEvent(slog.LevelWarn, "complete_refused", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("reason", "lease_lost"))
+			w.emitLogf("complete %s refused: lease is owned by a newer claim", item.ID)
 			return
 		case attempt >= completionAttempts || ctx.Err() != nil:
-			w.logf("complete %s failed, row will be re-claimed after lease expiry: %v", item.ID, err)
+			w.logEvent(slog.LevelError, "complete_failed", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.Int("attempt", attempt), slog.String("error", err.Error()))
+			w.emitLogf("complete %s failed, row will be re-claimed after lease expiry: %v", item.ID, err)
 			return
 		}
 		select {
@@ -213,9 +245,13 @@ func (w *worker) retry(ctx context.Context, token string, item event) {
 	err := w.leaser.RetryOutbox(ctx, item.ID, token, retryDelay(item.Attempts))
 	switch {
 	case errors.Is(err, store.ErrLeaseLost):
-		w.logf("retry scheduling %s refused: lease is owned by a newer claim", item.ID)
+		w.logEvent(slog.LevelWarn, "retry_refused", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("reason", "lease_lost"))
+		w.emitLogf("retry scheduling %s refused: lease is owned by a newer claim", item.ID)
 	case err != nil:
-		w.logf("retry scheduling %s failed, row will be re-claimed after lease expiry: %v", item.ID, err)
+		w.logEvent(slog.LevelError, "retry_failed", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("error", err.Error()))
+		w.emitLogf("retry scheduling %s failed, row will be re-claimed after lease expiry: %v", item.ID, err)
+	default:
+		w.logEvent(slog.LevelInfo, "retry_scheduled", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.Int("attempts", item.Attempts+1))
 	}
 }
 
@@ -231,14 +267,17 @@ func (w *worker) release(ctx context.Context, token string, items []event, reaso
 			continue
 		}
 		if ctx.Err() != nil {
-			w.logf("release deadline reached (%s): %d outbox rows left to lease expiry", reason, len(items)-i)
+			w.logEvent(slog.LevelWarn, "release_deadline_reached", slog.String("worker_id", w.id), slog.String("reason", reason), slog.Int("remaining_count", len(items)-i))
+			w.emitLogf("release deadline reached (%s): %d outbox rows left to lease expiry", reason, len(items)-i)
 			break
 		}
 		if !errors.Is(err, store.ErrLeaseLost) {
-			w.logf("release %s failed: %v", item.ID, err)
+			w.logEvent(slog.LevelWarn, "release_failed", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("error", err.Error()))
+			w.emitLogf("release %s failed: %v", item.ID, err)
 		}
 	}
-	w.logf("released %d of %d claimed outbox rows (%s)", released, len(items), reason)
+	w.logEvent(slog.LevelInfo, "release_completed", slog.String("worker_id", w.id), slog.Int("released_count", released), slog.Int("total_items", len(items)), slog.String("reason", reason))
+	w.emitLogf("released %d of %d claimed outbox rows (%s)", released, len(items), reason)
 }
 
 // retryDelay is the bounded exponential backoff after a failed publish.
@@ -287,15 +326,43 @@ func publish(ctx context.Context, js nats.JetStreamContext, prefix string, item 
 	return err
 }
 
+// verifyStreamConfig verifies that an existing JetStream stream matches the
+// required configuration (subjects, storage type, replica count, and deduplication
+// window) to detect configuration drift (T-020).
+func verifyStreamConfig(cfg nats.StreamConfig, stream, expectedSubject string, replicas int) error {
+	expectedSubjects := []string{expectedSubject}
+	if len(cfg.Subjects) != len(expectedSubjects) || cfg.Subjects[0] != expectedSubjects[0] {
+		return fmt.Errorf("stream %q subjects mismatch: got %v, want %v", stream, cfg.Subjects, expectedSubjects)
+	}
+	if cfg.Storage != nats.FileStorage {
+		return fmt.Errorf("stream %q storage type mismatch: got %v, want %v", stream, cfg.Storage, nats.FileStorage)
+	}
+	if cfg.Replicas != replicas {
+		return fmt.Errorf("stream %q replica count mismatch: got %d, want %d", stream, cfg.Replicas, replicas)
+	}
+	if cfg.Duplicates != jetStreamDuplicateWindow {
+		return fmt.Errorf("stream %q deduplication window mismatch: got %v, want %v", stream, cfg.Duplicates, jetStreamDuplicateWindow)
+	}
+	return nil
+}
+
 func ensureStream(js nats.JetStreamContext, stream, prefix string, replicas int) error {
-	_, err := js.StreamInfo(stream)
+	expectedSubject := strings.TrimSuffix(prefix, ".") + ".>"
+	info, err := js.StreamInfo(stream)
 	if err == nil {
-		return nil
+		return verifyStreamConfig(info.Config, stream, expectedSubject, replicas)
 	}
 	if !errors.Is(err, nats.ErrStreamNotFound) {
 		return err
 	}
-	_, err = js.AddStream(&nats.StreamConfig{Name: stream, Subjects: []string{strings.TrimSuffix(prefix, ".") + ".>"}, Storage: nats.FileStorage, Retention: nats.LimitsPolicy, Duplicates: jetStreamDuplicateWindow, Replicas: replicas})
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:       stream,
+		Subjects:   []string{expectedSubject},
+		Storage:    nats.FileStorage,
+		Retention:  nats.LimitsPolicy,
+		Duplicates: jetStreamDuplicateWindow,
+		Replicas:   replicas,
+	})
 	return err
 }
 
@@ -312,10 +379,20 @@ func durationEnv(name string, fallback, lowest, highest time.Duration) (time.Dur
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	fatal := func(msg string, err error) {
+		if err != nil {
+			logger.Error(msg, slog.String("error", err.Error()))
+		} else {
+			logger.Error(msg)
+		}
+		os.Exit(1)
+	}
+
 	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	natsURL := strings.TrimSpace(os.Getenv("NATS_URL"))
 	if databaseURL == "" || natsURL == "" {
-		log.Fatal("DATABASE_URL and NATS_URL are required")
+		fatal("DATABASE_URL and NATS_URL are required", nil)
 	}
 	stream := strings.TrimSpace(os.Getenv("NATS_STREAM"))
 	if stream == "" {
@@ -329,18 +406,18 @@ func main() {
 	if configured := strings.TrimSpace(os.Getenv("NATS_REPLICAS")); configured != "" {
 		parsed, err := strconv.Atoi(configured)
 		if err != nil || parsed < 1 || parsed > 5 {
-			log.Fatal("NATS_REPLICAS must be between 1 and 5")
+			fatal("NATS_REPLICAS must be between 1 and 5", err)
 		}
 		replicas = parsed
 	}
 	// The grace must stay below the pod's terminationGracePeriodSeconds.
 	shutdownGrace, err := durationEnv("OUTBOX_SHUTDOWN_GRACE", defaultShutdownGrace, time.Second, 5*time.Minute)
 	if err != nil {
-		log.Fatal(err)
+		fatal("invalid OUTBOX_SHUTDOWN_GRACE", err)
 	}
 	publishTimeout, err := durationEnv("OUTBOX_PUBLISH_TIMEOUT", defaultPublishTimeout, time.Second, time.Minute)
 	if err != nil {
-		log.Fatal(err)
+		fatal("invalid OUTBOX_PUBLISH_TIMEOUT", err)
 	}
 	workerID, _ := os.Hostname()
 	if workerID == "" {
@@ -352,33 +429,41 @@ func main() {
 	repo, err := store.NewPostgres(connectCtx, databaseURL)
 	cancelConnect()
 	if err != nil {
-		log.Fatal(err)
+		fatal("postgres connection failed", err)
 	}
 	defer repo.Close()
 	natsOptions := []nats.Option{nats.Name(workerID), nats.Timeout(10 * time.Second), nats.MaxReconnects(-1)}
 	if credentialsFile := strings.TrimSpace(os.Getenv("NATS_CREDS_FILE")); credentialsFile != "" {
 		natsOptions = append(natsOptions, nats.UserCredentials(credentialsFile))
 	} else if !strings.EqualFold(os.Getenv("ALLOW_INSECURE_NATS"), "true") {
-		log.Fatal("NATS_CREDS_FILE is required unless ALLOW_INSECURE_NATS=true")
+		fatal("NATS_CREDS_FILE is required unless ALLOW_INSECURE_NATS=true", nil)
 	}
 	if rootCA := strings.TrimSpace(os.Getenv("NATS_TLS_CA_FILE")); rootCA != "" {
 		natsOptions = append(natsOptions, nats.RootCAs(rootCA))
 	}
 	connection, err := nats.Connect(natsURL, natsOptions...)
 	if err != nil {
-		log.Fatal(err)
+		fatal("nats connection failed", err)
 	}
 	defer connection.Close()
 	js, err := connection.JetStream(nats.PublishAsyncMaxPending(256))
 	if err != nil {
-		log.Fatal(err)
+		fatal("jetstream context failed", err)
 	}
 	if err := ensureStream(js, stream, prefix, replicas); err != nil {
-		log.Fatal(err)
+		fatal("ensure stream failed", err)
 	}
 	w := newWorker(repo, func(ctx context.Context, item event) error { return publish(ctx, js, prefix, item) }, workerID)
+	w.logger = logger
 	w.shutdownGrace, w.publishTimeout = shutdownGrace, publishTimeout
-	log.Printf("consent outbox worker %s started (lease %s, shutdown grace %s)", workerID, store.OutboxLeaseDuration, shutdownGrace)
+	logger.Info("outbox_worker_started",
+		slog.String("worker_id", workerID),
+		slog.Duration("lease", store.OutboxLeaseDuration),
+		slog.Duration("shutdown_grace", shutdownGrace),
+		slog.String("stream", stream),
+		slog.String("subject_prefix", prefix),
+		slog.Int("replicas", replicas),
+	)
 	w.run(stop)
-	log.Printf("consent outbox worker %s stopped", workerID)
+	logger.Info("outbox_worker_stopped", slog.String("worker_id", workerID))
 }

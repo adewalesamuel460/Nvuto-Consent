@@ -67,7 +67,6 @@ type ConfirmFinalizer func(ctx context.Context, policy PolicyReader, pending dom
 // context: cancellation or deadline expiry abandons pending work and leaves
 // no partial state (T-012).
 type Repository interface {
-	Upsert(ctx context.Context, consent domain.Consent) (domain.Consent, error)
 	Get(ctx context.Context, tenantID, id string) (domain.Consent, error)
 	FindEffective(ctx context.Context, tenantID, subjectID, purpose, channel string) (domain.Consent, error)
 	PutPurpose(ctx context.Context, purpose domain.Purpose, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Purpose, error)
@@ -89,44 +88,86 @@ type Repository interface {
 	Ping(ctx context.Context) error
 }
 
+// Memory-store typed composite keys (T-026). In-memory maps use distinct
+// structs as map keys rather than concatenated strings, preventing delimiter
+// collisions (e.g. "tenant" with ID "child:1" vs "tenant:child" with ID "1").
+type consentKey struct {
+	tenantID  string
+	consentID string
+}
+
+type purposeKey struct {
+	tenantID string
+	code     string
+}
+
+type lawfulBasisKey struct {
+	tenantID string
+	code     string
+}
+
+type noticeKey struct {
+	tenantID     string
+	jurisdiction string
+	version      string
+}
+
+type receiptKey struct {
+	tenantID  string
+	receiptID string
+}
+
+type suppressionKey struct {
+	tenantID  string
+	subjectID string
+	scope     domain.SuppressionScope
+	purpose   string
+	channel   string
+}
+
+type preferenceKey struct {
+	tenantID  string
+	subjectID string
+	purpose   string
+	channel   string
+}
+
 type Memory struct {
 	mu           sync.RWMutex
-	consents     map[string]domain.Consent
+	consents     map[consentKey]domain.Consent
 	audit        []domain.AuditEvent
 	outbox       []domain.OutboxEvent
-	purposes     map[string]domain.Purpose
-	bases        map[string]domain.LawfulBasis
-	notices      map[string]domain.PrivacyNotice
-	receipts     map[string]domain.ConsentReceipt
-	suppressions map[string]domain.Suppression
-	generations  map[string]int64 // current preference generation by preferenceKey
+	purposes     map[purposeKey]domain.Purpose
+	bases        map[lawfulBasisKey]domain.LawfulBasis
+	notices      map[noticeKey]domain.PrivacyNotice
+	receipts     map[receiptKey]domain.ConsentReceipt
+	suppressions map[suppressionKey]domain.Suppression
+	generations  map[preferenceKey]int64 // current preference generation by preferenceKey
 	outboxLeases map[string]*OutboxLeaseState
 	clock        func() time.Time
 }
 
 func NewMemory() *Memory {
 	return &Memory{
-		consents:     map[string]domain.Consent{},
-		purposes:     map[string]domain.Purpose{},
-		bases:        map[string]domain.LawfulBasis{},
-		notices:      map[string]domain.PrivacyNotice{},
-		receipts:     map[string]domain.ConsentReceipt{},
-		suppressions: map[string]domain.Suppression{},
-		generations:  map[string]int64{},
+		consents:     map[consentKey]domain.Consent{},
+		purposes:     map[purposeKey]domain.Purpose{},
+		bases:        map[lawfulBasisKey]domain.LawfulBasis{},
+		notices:      map[noticeKey]domain.PrivacyNotice{},
+		receipts:     map[receiptKey]domain.ConsentReceipt{},
+		suppressions: map[suppressionKey]domain.Suppression{},
+		generations:  map[preferenceKey]int64{},
 		outboxLeases: map[string]*OutboxLeaseState{},
 		clock:        time.Now,
 	}
 }
-func key(t, id string) string { return t + ":" + id }
 
-// preferenceKey identifies one preference stream. NUL separators keep the key
-// unambiguous even if identifiers contain the ':' used by key().
-func preferenceKey(tenantID, subjectID, purpose, channel string) string {
-	return tenantID + "\x00" + subjectID + "\x00" + purpose + "\x00" + channel
-}
-
-func consentPreferenceKey(c domain.Consent) string {
-	return preferenceKey(c.TenantID, c.SubjectID, c.Purpose, c.Channel)
+func consentPreferenceKey(c domain.Consent) preferenceKey {
+	return preferenceKey{
+		tenantID:  c.TenantID,
+		subjectID: c.SubjectID,
+		purpose:   c.Purpose,
+		channel:   c.Channel,
+	}
 }
 
 // advanceGenerationLocked increments the preference generation for the
@@ -148,25 +189,13 @@ func (m *Memory) advanceGenerationLocked(c domain.Consent) int64 {
 	return generation
 }
 
-// Upsert is the legacy ungoverned write path. It still expresses intent, so it
-// advances the preference generation.
-func (m *Memory) Upsert(ctx context.Context, c domain.Consent) (domain.Consent, error) {
-	if err := live(ctx); err != nil {
-		return domain.Consent{}, err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	c.PreferenceGeneration = m.advanceGenerationLocked(c)
-	m.consents[key(c.TenantID, c.ID)] = c
-	return c, nil
-}
 func (m *Memory) Get(ctx context.Context, t, id string) (domain.Consent, error) {
 	if err := live(ctx); err != nil {
 		return domain.Consent{}, err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	c, ok := m.consents[key(t, id)]
+	c, ok := m.consents[consentKey{tenantID: t, consentID: id}]
 	if !ok {
 		return domain.Consent{}, ErrNotFound
 	}
@@ -205,13 +234,23 @@ func (m *Memory) PutPurpose(ctx context.Context, purpose domain.Purpose, audit d
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := key(purpose.TenantID, purpose.Code)
+	k := purposeKey{tenantID: purpose.TenantID, code: purpose.Code}
+	var before any
 	if current, ok := m.purposes[k]; ok {
+		before = current
 		purpose.Version = current.Version + 1
 	} else {
 		purpose.Version = 1
 	}
 	m.purposes[k] = purpose
+	if audit.ResourceType == "" {
+		audit.ResourceType = "purpose"
+	}
+	if audit.ConsentID == "" {
+		audit.ConsentID = purpose.Code
+	}
+	audit.Revision = purpose.Version
+	audit.Changes = map[string]any{"before": before, "after": purpose}
 	m.audit = append(m.audit, audit)
 	m.outbox = append(m.outbox, outbox)
 	return purpose, nil
@@ -227,7 +266,7 @@ func (m *Memory) GetPurpose(ctx context.Context, tenantID, code string) (domain.
 }
 
 func (m *Memory) getPurposeLocked(tenantID, code string) (domain.Purpose, error) {
-	purpose, ok := m.purposes[key(tenantID, code)]
+	purpose, ok := m.purposes[purposeKey{tenantID: tenantID, code: code}]
 	if !ok {
 		return domain.Purpose{}, ErrNotFound
 	}
@@ -240,13 +279,23 @@ func (m *Memory) PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis, a
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := key(basis.TenantID, basis.Code)
+	k := lawfulBasisKey{tenantID: basis.TenantID, code: basis.Code}
+	var before any
 	if current, ok := m.bases[k]; ok {
+		before = current
 		basis.Version = current.Version + 1
 	} else {
 		basis.Version = 1
 	}
 	m.bases[k] = basis
+	if audit.ResourceType == "" {
+		audit.ResourceType = "lawful_basis"
+	}
+	if audit.ConsentID == "" {
+		audit.ConsentID = basis.Code
+	}
+	audit.Revision = basis.Version
+	audit.Changes = map[string]any{"before": before, "after": basis}
 	m.audit = append(m.audit, audit)
 	m.outbox = append(m.outbox, outbox)
 	return basis, nil
@@ -262,15 +311,11 @@ func (m *Memory) GetLawfulBasis(ctx context.Context, tenantID, code string) (dom
 }
 
 func (m *Memory) getLawfulBasisLocked(tenantID, code string) (domain.LawfulBasis, error) {
-	basis, ok := m.bases[key(tenantID, code)]
+	basis, ok := m.bases[lawfulBasisKey{tenantID: tenantID, code: code}]
 	if !ok {
 		return domain.LawfulBasis{}, ErrNotFound
 	}
 	return basis, nil
-}
-
-func noticeKey(tenantID, jurisdiction, version string) string {
-	return tenantID + ":" + jurisdiction + ":" + version
 }
 
 func (m *Memory) PutNotice(ctx context.Context, notice domain.PrivacyNotice, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.PrivacyNotice, error) {
@@ -279,11 +324,21 @@ func (m *Memory) PutNotice(ctx context.Context, notice domain.PrivacyNotice, aud
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := noticeKey(notice.TenantID, notice.Jurisdiction, notice.Version)
+	k := noticeKey{tenantID: notice.TenantID, jurisdiction: notice.Jurisdiction, version: notice.Version}
 	if _, exists := m.notices[k]; exists {
 		return domain.PrivacyNotice{}, ErrConflict
 	}
 	m.notices[k] = notice
+	if audit.ResourceType == "" {
+		audit.ResourceType = "privacy_notice"
+	}
+	if audit.ConsentID == "" {
+		audit.ConsentID = notice.Jurisdiction + "/" + notice.Version
+	}
+	if audit.Revision <= 0 {
+		audit.Revision = 1
+	}
+	audit.Changes = map[string]any{"before": nil, "after": notice}
 	m.audit = append(m.audit, audit)
 	m.outbox = append(m.outbox, outbox)
 	return notice, nil
@@ -299,7 +354,7 @@ func (m *Memory) GetNotice(ctx context.Context, tenantID, jurisdiction, version 
 }
 
 func (m *Memory) getNoticeLocked(tenantID, jurisdiction, version string) (domain.PrivacyNotice, error) {
-	notice, ok := m.notices[noticeKey(tenantID, jurisdiction, version)]
+	notice, ok := m.notices[noticeKey{tenantID: tenantID, jurisdiction: jurisdiction, version: version}]
 	if !ok {
 		return domain.PrivacyNotice{}, ErrNotFound
 	}
@@ -330,19 +385,30 @@ func (m *Memory) RecordGoverned(ctx context.Context, consent domain.Consent, rec
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Validate everything before mutating: the memory store has no rollback.
-	if _, exists := m.consents[key(consent.TenantID, consent.ID)]; exists {
+	cKey := consentKey{tenantID: consent.TenantID, consentID: consent.ID}
+	if _, exists := m.consents[cKey]; exists {
 		return domain.Consent{}, ErrConflict
 	}
 	if receipt.ID != "" {
-		if _, exists := m.receipts[key(receipt.TenantID, receipt.ID)]; exists {
+		rKey := receiptKey{tenantID: receipt.TenantID, receiptID: receipt.ID}
+		if _, exists := m.receipts[rKey]; exists {
 			return domain.Consent{}, ErrConflict
 		}
 	}
 	consent.PreferenceGeneration = m.advanceGenerationLocked(consent)
 	if receipt.ID != "" {
-		m.receipts[key(receipt.TenantID, receipt.ID)] = receipt
+		m.receipts[receiptKey{tenantID: receipt.TenantID, receiptID: receipt.ID}] = receipt
 	}
-	m.consents[key(consent.TenantID, consent.ID)] = consent
+	m.consents[cKey] = consent
+	if audit.ResourceType == "" {
+		audit.ResourceType = "consent"
+	}
+	if audit.Revision <= 0 {
+		audit.Revision = 1
+	}
+	if audit.Changes == nil {
+		audit.Changes = map[string]any{"before": nil, "after": consent}
+	}
 	m.audit = append(m.audit, audit)
 	m.outbox = append(m.outbox, outbox)
 	return consent, nil
@@ -357,7 +423,7 @@ func (m *Memory) Withdraw(ctx context.Context, consent domain.Consent, audit dom
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := key(consent.TenantID, consent.ID)
+	k := consentKey{tenantID: consent.TenantID, consentID: consent.ID}
 	current, exists := m.consents[k]
 	if !exists {
 		return domain.Consent{}, ErrNotFound
@@ -365,12 +431,19 @@ func (m *Memory) Withdraw(ctx context.Context, consent domain.Consent, audit dom
 	if current.Status == domain.StatusWithdrawn {
 		return current, nil
 	}
+	var before any = current
 	generation := m.advanceGenerationLocked(current)
 	current = m.consents[k] // advanceGenerationLocked may have invalidated its token
 	consent.Version = current.Version + 1
 	consent.ConfirmationTokenHash = ""
 	consent.PreferenceGeneration = generation
 	m.consents[k] = consent
+	if audit.ResourceType == "" {
+		audit.ResourceType = "consent"
+	}
+	audit.ConsentID = consent.ID
+	audit.Revision = consent.Version
+	audit.Changes = map[string]any{"before": before, "after": consent}
 	m.audit = append(m.audit, audit)
 	m.outbox = append(m.outbox, outbox)
 	return consent, nil
@@ -382,15 +455,11 @@ func (m *Memory) GetReceipt(ctx context.Context, tenantID, id string) (domain.Co
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	receipt, ok := m.receipts[key(tenantID, id)]
+	receipt, ok := m.receipts[receiptKey{tenantID: tenantID, receiptID: id}]
 	if !ok {
 		return domain.ConsentReceipt{}, ErrNotFound
 	}
 	return receipt, nil
-}
-
-func suppressionKey(s domain.Suppression) string {
-	return s.TenantID + ":" + s.SubjectID + ":" + string(s.Scope) + ":" + s.Purpose + ":" + s.Channel
 }
 
 func (m *Memory) SetSuppression(ctx context.Context, suppression domain.Suppression, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Suppression, error) {
@@ -399,14 +468,28 @@ func (m *Memory) SetSuppression(ctx context.Context, suppression domain.Suppress
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := suppressionKey(suppression)
+	k := suppressionKey{
+		tenantID:  suppression.TenantID,
+		subjectID: suppression.SubjectID,
+		scope:     suppression.Scope,
+		purpose:   suppression.Purpose,
+		channel:   suppression.Channel,
+	}
+	var before any
 	if current, ok := m.suppressions[k]; ok {
+		before = current
 		suppression.ID = current.ID
 		suppression.Version = current.Version + 1
 	} else {
 		suppression.Version = 1
 	}
 	m.suppressions[k] = suppression
+	if audit.ResourceType == "" {
+		audit.ResourceType = "suppression"
+	}
+	audit.ConsentID = suppression.ID
+	audit.Revision = suppression.Version
+	audit.Changes = map[string]any{"before": before, "after": suppression}
 	m.audit = append(m.audit, audit)
 	m.outbox = append(m.outbox, outbox)
 	return suppression, nil
@@ -483,7 +566,7 @@ func (m *Memory) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash str
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var k string
+	var k consentKey
 	var consent domain.Consent
 	found := false
 	for candidateKey, candidate := range m.consents {
@@ -512,7 +595,7 @@ func (m *Memory) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash str
 	if receipt.ID == "" || receipt.TenantID != tenantID || receipt.ConsentID != consent.ID {
 		return domain.Consent{}, ErrConflict
 	}
-	if _, exists := m.receipts[key(tenantID, receipt.ID)]; exists {
+	if _, exists := m.receipts[receiptKey{tenantID: tenantID, receiptID: receipt.ID}]; exists {
 		return domain.Consent{}, ErrConflict
 	}
 	// Last cancellation point: a caller that left during finalization gets no
@@ -520,6 +603,7 @@ func (m *Memory) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash str
 	if err := live(ctx); err != nil {
 		return domain.Consent{}, err
 	}
+	before := consent
 	consent.Status = domain.StatusGranted
 	consent.ConfirmedAt = &at
 	consent.GrantedAt = &at
@@ -528,7 +612,13 @@ func (m *Memory) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash str
 	consent.ConfirmationTokenHash = ""
 	consent.ReceiptID = receipt.ID
 	m.consents[k] = consent
-	m.receipts[key(tenantID, receipt.ID)] = receipt
+	m.receipts[receiptKey{tenantID: tenantID, receiptID: receipt.ID}] = receipt
+	if audit.ResourceType == "" {
+		audit.ResourceType = "consent"
+	}
+	audit.ConsentID = consent.ID
+	audit.Revision = consent.Version
+	audit.Changes = map[string]any{"before": before, "after": consent}
 	m.audit = append(m.audit, audit)
 	m.outbox = append(m.outbox, outbox)
 	return consent, nil
@@ -539,6 +629,15 @@ func (m *Memory) AppendAudit(ctx context.Context, e domain.AuditEvent) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if e.ResourceType == "" {
+		e.ResourceType = "consent"
+	}
+	if e.Revision <= 0 {
+		e.Revision = 1
+	}
+	if e.Changes == nil {
+		e.Changes = map[string]any{}
+	}
 	m.audit = append(m.audit, e)
 	return nil
 }

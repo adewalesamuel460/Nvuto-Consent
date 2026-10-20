@@ -10,7 +10,7 @@ Primary consumers: Engage, Service, Contact Center, Customer Portal, CRM, Conver
 
 Functional standard: capture consent with evidence → evaluate purpose/channel decision deterministically → enforce effective/withdrawn state → expose self-service changes → propagate suppression/change events → audit immutable history. No outbound communication workflow may treat missing consent as granted where policy requires affirmative consent.
 
-## Implemented functional slice
+## Implemented Functional Slice
 
 - Tenant-scoped purpose and lawful-basis registries, including service/marketing category separation, allowed channels, affirmative-consent requirements, and evidence requirements.
 - Immutable jurisdictional privacy-notice versions and cryptographically hashed consent receipts containing the accepted notice and collection evidence.
@@ -19,7 +19,7 @@ Functional standard: capture consent with evidence → evaluate purpose/channel 
 - YugabyteDB YSQL transactions keep consent state, immutable audit, receipt, and versioned outbox events atomic. The HA-safe worker publishes CloudEvents to NATS JetStream with message-ID deduplication and bounded retry backoff.
 - Three-replica API and two-replica worker Kubernetes baselines with disruption budgets and restricted pod security.
 
-## API surface
+## API Surface
 
 Administrative registry writes:
 
@@ -40,12 +40,135 @@ Preference and decision operations:
 
 `subject_id` is the canonical Customer Graph party identifier. A `self_service` JWT must carry a matching `customer_subject_id`; service and administrative roles remain tenant-scoped.
 
-## Runtime configuration
+## Observability and Telemetry (T-021)
 
-**YugabyteDB YSQL is the production transactional database for Nvuto Consent.** The service may use a PostgreSQL-compatible driver and connection URI because YSQL speaks the PostgreSQL wire protocol, but PostgreSQL is not the intended production datastore.
+The API service (`cmd/server`) and the Outbox Worker (`cmd/outbox-worker`) implement structured JSON logging using Go standard library `log/slog`.
 
-The API requires `DATABASE_URL` and production authentication via `JWT_JWKS_URL`, `JWT_ISSUER`, and `JWT_AUDIENCE`. HMAC requires the explicit `ALLOW_HMAC_AUTH=true` development opt-in; header authentication likewise requires `ALLOW_DEV_HEADERS=true`, which is never enabled in the deployment manifest. The outbox worker requires `DATABASE_URL`, `NATS_URL`, and a `NATS_CREDS_FILE`; insecure NATS also requires an explicit local-only opt-in. `NATS_STREAM`, `NATS_SUBJECT_PREFIX`, and the three-replica stream baseline are documented in the deployment.
+### Correlation ID & Context Propagation
+- Every incoming HTTP request is assigned a server-generated correlation ID (or adopts the incoming `X-Correlation-ID` header), passed throughout the request context and included in all structured log lines and error responses.
+- Handler failures, input rejections, panics, and readiness failures are logged as structured JSON with attributes: `correlation_id`, `method`, `path`, `status`, `kind`, `code`, and sanitized `cause`.
 
-Migrations are applied in numeric order. See [migrations/ROLLBACK.md](migrations/ROLLBACK.md) for the additive migration rollback strategy. CI boots a real YugabyteDB RF1 node, verifies `yb_servers()`, proves empty install and previous-schema upgrade, executes policy transactions and double-opt-in concurrency against YSQL, proves immutable receipts and persisted grant/evaluate/withdraw behavior, and proves concurrent JetStream outbox publication while using YugabyteDB as the durable ledger.
+### Worker Telemetry
+The outbox worker logs critical batch and lifecycle events in structured JSON:
+- `claim_succeeded` / `claim_failed`: Number of rows claimed, lease duration, or error reason.
+- `publish_succeeded` / `publish_failed`: Event ID, tenant ID, event type, aggregate ID, attempt count, and error description.
+- `complete_succeeded` / `complete_refused` / `complete_failed`: Completion confirmation and lease state.
+- `retry_scheduled` / `retry_refused` / `retry_failed`: Fenced exponential backoff scheduling.
+- `release_completed` / `release_deadline_reached`: Uncommitted row releases during shutdown or lease expiry.
+- `batch_completed`: Number of claimed vs processed records and cycle duration.
 
-Production environments must use the target YugabyteDB universe's TLS, authentication, placement, backup/PITR and recovery policy. A green RF1 CI run is repository evidence, not multi-node Production GA evidence.
+### Security and Privacy Boundaries
+- **No Token Logging:** Bearer tokens, confirmation tokens, HMAC secrets, and outbox claim tokens are strictly excluded from logs.
+- **No Sensitive Evidence Logging:** Evidence payloads, secret fields, and evidence hashes are never logged.
+- **Sanitized Errors:** Error causes are sanitized to strip unprintable/control characters and bounded to prevent log injection or denial-of-service.
+
+## Runtime Configuration
+
+**YugabyteDB YSQL is the production transactional database for Nvuto Consent.** The service uses a PostgreSQL-compatible driver and connection URI because YSQL speaks the PostgreSQL wire protocol, but PostgreSQL is not the intended production datastore.
+
+### Environment Variables
+
+#### API Service (`cmd/server`)
+
+| Variable | Description | Default | Allowed Values / Format | Required |
+|---|---|---|---|---|
+| `DATABASE_URL` | YSQL connection string (e.g., `postgresql://user:pass@host:5433/db?sslmode=verify-full`) | None | Valid PostgreSQL/YSQL URI | Required (unless `ALLOW_MEMORY_STORE=true`) |
+| `ALLOW_MEMORY_STORE` | Opt-in to ephemeral in-memory storage (dev/testing only) | `false` | `true`, `false` | Optional |
+| `REQUEST_TIMEOUT` | Individual HTTP request execution deadline before typed 503 | `10s` | Go duration string (e.g., `5s`, `10s`, `30s`) | Optional |
+| `JWT_JWKS_URL` | Authentik / OIDC JWKS endpoint for RS256 token verification | None | Valid HTTP/HTTPS URL | Required in Production |
+| `JWT_ISSUER` | Expected JWT `iss` claim | None | Non-empty string | Required if `JWT_JWKS_URL` set |
+| `JWT_AUDIENCE` | Expected JWT `aud` claim | None | Non-empty string | Required if `JWT_JWKS_URL` set |
+| `ALLOW_HMAC_AUTH` | Opt-in to HS256 HMAC authentication (dev/testing only) | `false` | `true`, `false` | Optional |
+| `JWT_HMAC_SECRET` | Shared secret for HS256 verification (requires `ALLOW_HMAC_AUTH=true`) | None | Non-empty string | Optional |
+| `ALLOW_DEV_HEADERS` | Opt-in to `X-Nvuto-Tenant-ID` / `X-Nvuto-Actor-ID` headers without tokens | `false` | `true`, `false` | Optional (dev only) |
+
+#### Outbox Worker (`cmd/outbox-worker`)
+
+| Variable | Description | Default | Allowed Values / Format | Required |
+|---|---|---|---|---|
+| `DATABASE_URL` | YSQL connection string for outbox claiming and fencing | None | Valid PostgreSQL/YSQL URI | Required |
+| `NATS_URL` | NATS JetStream server connection URL | None | Valid NATS URI (e.g., `nats://host:4222`) | Required |
+| `NATS_STREAM` | JetStream stream name for outbox events | `NVUTO_CONSENT` | Non-empty string | Optional |
+| `NATS_SUBJECT_PREFIX` | Subject prefix for published CloudEvents | `nvuto.consent` | Non-empty string | Optional |
+| `NATS_REPLICAS` | Number of JetStream stream replicas | `3` | Integer between `1` and `5` | Optional |
+| `NATS_CREDS_FILE` | Path to NATS user credentials file | None | Valid file path | Required (unless `ALLOW_INSECURE_NATS=true`) |
+| `ALLOW_INSECURE_NATS` | Opt-in to unauthenticated NATS connection (local dev only) | `false` | `true`, `false` | Optional |
+| `NATS_TLS_CA_FILE` | Path to custom Root CA certificate for NATS TLS connection | None | Valid file path | Optional |
+| `OUTBOX_SHUTDOWN_GRACE` | Grace period to drain publishes before releasing remaining claims | `30s` | Duration between `1s` and `5m` | Optional |
+| `OUTBOX_PUBLISH_TIMEOUT` | Batch publish timeout budget before releasing remaining claims | `15s` | Duration between `1s` and `1m` | Optional |
+
+## Release Packaging & Deployment (T-018)
+
+### Immutable Image Digests (Mandatory for Production)
+
+Production deployments **must** specify immutable image digests (SHA-256) rather than mutable `:latest` or floating release tags. 
+
+Using mutable tags in production introduces deployment drift, indeterminate rollback states, inconsistent image versions across horizontally autoscaled nodes, and container supply-chain vulnerabilities.
+
+#### Manifest Reference (`deploy/k8s.yaml` & `deploy/outbox-worker.yaml`)
+
+Specify container images using the `@sha256:` digest pin:
+
+```yaml
+# API Container (deploy/k8s.yaml)
+containers:
+  - name: api
+    image: ghcr.io/atlasfsp/nvuto-consent@sha256:baae473c914d7cfec25e5cfad7e1e6951feef869151523ea397a6598c1ea993f
+    ...
+
+# Worker Container (deploy/outbox-worker.yaml)
+containers:
+  - name: worker
+    image: ghcr.io/atlasfsp/nvuto-consent@sha256:ca50785f29910d634cb9e4a3b81177699479e19d7d2238cfae4f8d5789d6e80b
+    ...
+```
+
+#### Generating Release Digests
+When promoting a container image from CI build to staging or production:
+```bash
+# 1. Build and push image
+docker build -t ghcr.io/atlasfsp/nvuto-consent:${RELEASE_TAG} -f Dockerfile .
+docker push ghcr.io/atlasfsp/nvuto-consent:${RELEASE_TAG}
+
+# 2. Extract immutable digest
+DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/atlasfsp/nvuto-consent:${RELEASE_TAG})
+echo "Pinned release image: ${DIGEST}"
+```
+
+## Database Migrations
+
+Database migrations are strictly additive and backward-compatible (expand/contract pattern). They must be executed in numerical sequence against the target YSQL universe before deploying updated application binaries.
+
+### Applied Schema Scripts
+
+1. `001_init.sql` — Initial schema establishing tenants, purposes, lawful bases, privacy notices, consents, and outbox tables.
+2. `002_policy_governance.sql` — Notice versioning, immutable receipts, double-opt-in challenge tracking, and suppressions.
+3. `003_governed_idempotency.sql` — Idempotency key tracking table with payload hashing.
+4. `004_preference_generation_receipt_v2.sql` — Preference generation state (`consent_preference_state`), monotonic generation counter on consents, and SHA-256 canonical receipt hashing v2.
+5. `005_outbox_fencing.sql` — Outbox worker fencing with `claim_token` UUID leases and the `consent_outbox_fence_untokened_writes` trigger to prevent split-brain delivery.
+6. `006_schema_hardening_and_audit.sql` — Schema constraints hardening:
+   - Composite foreign keys on `consent_receipts` and `consent_idempotency` enforcing tenant isolation.
+   - `CHECK` constraints on `consent_suppressions` validating scope shapes (global, channel, purpose-channel).
+   - Audit event reconstruction fields (`resource_type`, `revision`, `changes`) and idempotency response snapshots.
+
+### Applying Migrations
+
+Execute all migration scripts using standard `psql` (or YSQL CLI) ensuring `ON_ERROR_STOP=1`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Applying migrations to: ${DATABASE_URL}"
+for file in $(ls migrations/*.sql | sort -V); do
+  echo "Executing ${file}..."
+  psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -f "${file}"
+done
+echo "All migrations applied successfully."
+```
+
+### Rollback Strategy
+
+Refer to [migrations/ROLLBACK.md](migrations/ROLLBACK.md) for incident recovery procedures. Because all migrations (`001` through `006`) are additive:
+- **Application Rollbacks:** Reverting application binaries to a prior compatible image digest is schema-safe. Pre-006 binaries continue operating correctly against the hardened schema.
+- **Never Drop Tables or Columns During Incidents:** Dropping columns or triggers destroys compliance evidence and can cause lease errors. Forward corrective migrations must be used if schema alterations are required.

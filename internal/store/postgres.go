@@ -161,7 +161,20 @@ func advanceGenerationTx(ctx context.Context, tx pgx.Tx, c domain.Consent, at ti
 }
 
 func appendAuditTx(ctx context.Context, tx pgx.Tx, event domain.AuditEvent) error {
-	_, err := tx.Exec(ctx, `INSERT INTO consent_audit_events(id,tenant_id,actor_id,action,consent_id,occurred_at) VALUES($1,$2,$3,$4,$5,$6)`, event.ID, event.TenantID, event.ActorID, event.Action, event.ConsentID, event.OccurredAt)
+	resourceType := event.ResourceType
+	if resourceType == "" {
+		resourceType = "consent"
+	}
+	revision := event.Revision
+	if revision <= 0 {
+		revision = 1
+	}
+	changes := event.Changes
+	if changes == nil {
+		changes = map[string]any{}
+	}
+	changesJSON, _ := json.Marshal(changes)
+	_, err := tx.Exec(ctx, `INSERT INTO consent_audit_events(id,tenant_id,actor_id,action,consent_id,occurred_at,resource_type,revision,changes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, event.ID, event.TenantID, event.ActorID, event.Action, event.ConsentID, event.OccurredAt, resourceType, revision, changesJSON)
 	return classify(err)
 }
 
@@ -204,33 +217,6 @@ func appendEffectsTx(ctx context.Context, tx pgx.Tx, audit domain.AuditEvent, ou
 	return appendOutboxTx(ctx, tx, outbox)
 }
 
-// Upsert is the legacy ungoverned write path. It still expresses intent, so it
-// advances the preference generation in the same transaction.
-func (p *Postgres) Upsert(ctx context.Context, consent domain.Consent) (domain.Consent, error) {
-	err := p.inTx(ctx, func(tx pgx.Tx) error {
-		generation, err := advanceGenerationTx(ctx, tx, consent, consent.UpdatedAt)
-		if err != nil {
-			return err
-		}
-		consent.PreferenceGeneration = generation
-		scope, _ := json.Marshal(consent.Scope)
-		evidence, _ := json.Marshal(consent.Evidence)
-		_, err = tx.Exec(ctx, `INSERT INTO consents(`+consentColumns+`)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
-		ON CONFLICT(id) DO UPDATE SET status=excluded.status,receipt_id=excluded.receipt_id,evidence=excluded.evidence,version=excluded.version,granted_at=excluded.granted_at,denied_at=excluded.denied_at,withdrawn_at=excluded.withdrawn_at,expires_at=excluded.expires_at,confirmation_token_hash=excluded.confirmation_token_hash,confirmation_expires_at=excluded.confirmation_expires_at,confirmed_at=excluded.confirmed_at,updated_at=excluded.updated_at,preference_generation=excluded.preference_generation WHERE consents.tenant_id=excluded.tenant_id`,
-			consent.ID, consent.TenantID, consent.SubjectID, consent.Purpose, consent.Channel, consent.LegalBasis,
-			string(consent.Status), consent.Source, scope, consent.Jurisdiction, consent.NoticeVersion, consent.ReceiptID,
-			evidence, consent.Version, consent.GrantedAt, consent.DeniedAt, consent.WithdrawnAt, consent.ExpiresAt,
-			consent.ConfirmationTokenHash, consent.ConfirmationExpiresAt, consent.ConfirmedAt, consent.CreatedAt, consent.UpdatedAt,
-			consent.PreferenceGeneration)
-		return classify(err)
-	})
-	if err != nil {
-		return domain.Consent{}, err
-	}
-	return consent, nil
-}
-
 func (p *Postgres) Get(ctx context.Context, tenantID, id string) (domain.Consent, error) {
 	return scanConsent(p.pool.QueryRow(ctx, `SELECT `+consentColumns+` FROM consents WHERE tenant_id=$1 AND id=$2`, tenantID, id))
 }
@@ -245,11 +231,26 @@ func (p *Postgres) FindEffective(ctx context.Context, tenantID, subjectID, purpo
 func (p *Postgres) PutPurpose(ctx context.Context, purpose domain.Purpose, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Purpose, error) {
 	channels, _ := json.Marshal(purpose.AllowedChannels)
 	err := p.inTx(ctx, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `INSERT INTO consent_purposes(tenant_id,code,category,allowed_channels,requires_affirmative_consent,requires_double_opt_in,active,version,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8)
+		var before any
+		prev, err := getPurpose(ctx, tx, purpose.TenantID, purpose.Code, " FOR UPDATE")
+		if err == nil {
+			before = prev
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		err = tx.QueryRow(ctx, `INSERT INTO consent_purposes(tenant_id,code,category,allowed_channels,requires_affirmative_consent,requires_double_opt_in,active,version,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8)
 		ON CONFLICT(tenant_id,code) DO UPDATE SET category=excluded.category,allowed_channels=excluded.allowed_channels,requires_affirmative_consent=excluded.requires_affirmative_consent,requires_double_opt_in=excluded.requires_double_opt_in,active=excluded.active,version=consent_purposes.version+1,updated_at=excluded.updated_at RETURNING version`, purpose.TenantID, purpose.Code, purpose.Category, channels, purpose.RequiresAffirmativeConsent, purpose.RequiresDoubleOptIn, purpose.Active, purpose.UpdatedAt).Scan(&purpose.Version)
 		if err != nil {
 			return classify(err)
 		}
+		if audit.ResourceType == "" {
+			audit.ResourceType = "purpose"
+		}
+		if audit.ConsentID == "" {
+			audit.ConsentID = purpose.Code
+		}
+		audit.Revision = purpose.Version
+		audit.Changes = map[string]any{"before": before, "after": purpose}
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
 	if err != nil {
@@ -299,11 +300,26 @@ func (p *Postgres) GetPurpose(ctx context.Context, tenantID, code string) (domai
 func (p *Postgres) PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.LawfulBasis, error) {
 	categories, _ := json.Marshal(basis.AllowedCategories)
 	err := p.inTx(ctx, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `INSERT INTO consent_lawful_bases(tenant_id,code,allowed_categories,requires_evidence,active,version,updated_at) VALUES($1,$2,$3,$4,$5,1,$6)
+		var before any
+		prev, err := getLawfulBasis(ctx, tx, basis.TenantID, basis.Code, " FOR UPDATE")
+		if err == nil {
+			before = prev
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		err = tx.QueryRow(ctx, `INSERT INTO consent_lawful_bases(tenant_id,code,allowed_categories,requires_evidence,active,version,updated_at) VALUES($1,$2,$3,$4,$5,1,$6)
 		ON CONFLICT(tenant_id,code) DO UPDATE SET allowed_categories=excluded.allowed_categories,requires_evidence=excluded.requires_evidence,active=excluded.active,version=consent_lawful_bases.version+1,updated_at=excluded.updated_at RETURNING version`, basis.TenantID, basis.Code, categories, basis.RequiresEvidence, basis.Active, basis.UpdatedAt).Scan(&basis.Version)
 		if err != nil {
 			return classify(err)
 		}
+		if audit.ResourceType == "" {
+			audit.ResourceType = "lawful_basis"
+		}
+		if audit.ConsentID == "" {
+			audit.ConsentID = basis.Code
+		}
+		audit.Revision = basis.Version
+		audit.Changes = map[string]any{"before": before, "after": basis}
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
 	if err != nil {
@@ -321,6 +337,16 @@ func (p *Postgres) PutNotice(ctx context.Context, notice domain.PrivacyNotice, a
 		if _, err := tx.Exec(ctx, `INSERT INTO consent_privacy_notices(tenant_id,jurisdiction,version,published_at,active) VALUES($1,$2,$3,$4,$5)`, notice.TenantID, notice.Jurisdiction, notice.Version, notice.PublishedAt, notice.Active); err != nil {
 			return classify(err)
 		}
+		if audit.ResourceType == "" {
+			audit.ResourceType = "privacy_notice"
+		}
+		if audit.ConsentID == "" {
+			audit.ConsentID = notice.Jurisdiction + "/" + notice.Version
+		}
+		if audit.Revision <= 0 {
+			audit.Revision = 1
+		}
+		audit.Changes = map[string]any{"before": nil, "after": notice}
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
 	if err != nil {
@@ -364,6 +390,15 @@ func recordGovernedTx(ctx context.Context, tx pgx.Tx, consent domain.Consent, re
 		if err := insertReceipt(ctx, tx, receipt); err != nil {
 			return domain.Consent{}, err
 		}
+	}
+	if audit.ResourceType == "" {
+		audit.ResourceType = "consent"
+	}
+	if audit.Revision <= 0 {
+		audit.Revision = 1
+	}
+	if audit.Changes == nil {
+		audit.Changes = map[string]any{"before": nil, "after": consent}
 	}
 	if err := appendEffectsTx(ctx, tx, audit, outbox); err != nil {
 		return domain.Consent{}, err
@@ -415,6 +450,12 @@ func (p *Postgres) Withdraw(ctx context.Context, consent domain.Consent, audit d
 		if _, err := tx.Exec(ctx, `UPDATE consents SET status='withdrawn',withdrawn_at=$3,version=$4,updated_at=$5,confirmation_token_hash='',preference_generation=$6 WHERE tenant_id=$1 AND id=$2`, updated.TenantID, updated.ID, updated.WithdrawnAt, updated.Version, updated.UpdatedAt, generation); err != nil {
 			return classify(err)
 		}
+		if audit.ResourceType == "" {
+			audit.ResourceType = "consent"
+		}
+		audit.ConsentID = updated.ID
+		audit.Revision = updated.Version
+		audit.Changes = map[string]any{"before": current, "after": updated}
 		if err := appendEffectsTx(ctx, tx, audit, outbox); err != nil {
 			return err
 		}
@@ -444,14 +485,30 @@ func (p *Postgres) GetReceipt(ctx context.Context, tenantID, id string) (domain.
 func (p *Postgres) SetSuppression(ctx context.Context, suppression domain.Suppression, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Suppression, error) {
 	var stored domain.Suppression
 	err := p.inTx(ctx, func(tx pgx.Tx) error {
+		var before any
+		var prev domain.Suppression
+		var prevScope string
+		err := tx.QueryRow(ctx, `SELECT id,tenant_id,subject_id,scope,purpose,channel,reason,active,version,updated_at FROM consent_suppressions WHERE tenant_id=$1 AND subject_id=$2 AND scope=$3 AND purpose=$4 AND channel=$5 FOR UPDATE`, suppression.TenantID, suppression.SubjectID, string(suppression.Scope), suppression.Purpose, suppression.Channel).Scan(&prev.ID, &prev.TenantID, &prev.SubjectID, &prevScope, &prev.Purpose, &prev.Channel, &prev.Reason, &prev.Active, &prev.Version, &prev.UpdatedAt)
+		if err == nil {
+			prev.Scope = domain.SuppressionScope(prevScope)
+			before = prev
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return classify(err)
+		}
+
 		stored = suppression
-		err := tx.QueryRow(ctx, `INSERT INTO consent_suppressions(id,tenant_id,subject_id,scope,purpose,channel,reason,active,version,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,1,$9)
+		err = tx.QueryRow(ctx, `INSERT INTO consent_suppressions(id,tenant_id,subject_id,scope,purpose,channel,reason,active,version,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,1,$9)
 		ON CONFLICT(tenant_id,subject_id,scope,purpose,channel) DO UPDATE SET reason=excluded.reason,active=excluded.active,version=consent_suppressions.version+1,updated_at=excluded.updated_at RETURNING id,version`, suppression.ID, suppression.TenantID, suppression.SubjectID, string(suppression.Scope), suppression.Purpose, suppression.Channel, suppression.Reason, suppression.Active, suppression.UpdatedAt).Scan(&stored.ID, &stored.Version)
 		if err != nil {
 			return classify(err)
 		}
 		audit, outbox := audit, outbox
+		if audit.ResourceType == "" {
+			audit.ResourceType = "suppression"
+		}
 		audit.ConsentID = stored.ID
+		audit.Revision = stored.Version
+		audit.Changes = map[string]any{"before": before, "after": stored}
 		outbox.AggregateID = stored.ID
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
@@ -543,6 +600,7 @@ func (p *Postgres) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash s
 		if tag.RowsAffected() != 1 {
 			return ErrStaleGeneration
 		}
+		before := consent
 		consent.Status = domain.StatusGranted
 		consent.GrantedAt = &at
 		consent.ConfirmedAt = &at
@@ -553,6 +611,12 @@ func (p *Postgres) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash s
 		if err := insertReceipt(ctx, tx, receipt); err != nil {
 			return err
 		}
+		if audit.ResourceType == "" {
+			audit.ResourceType = "consent"
+		}
+		audit.ConsentID = consent.ID
+		audit.Revision = consent.Version
+		audit.Changes = map[string]any{"before": before, "after": consent}
 		if err := appendEffectsTx(ctx, tx, audit, outbox); err != nil {
 			return err
 		}
@@ -566,7 +630,20 @@ func (p *Postgres) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash s
 }
 
 func (p *Postgres) AppendAudit(ctx context.Context, event domain.AuditEvent) error {
-	_, err := p.pool.Exec(ctx, `INSERT INTO consent_audit_events(id,tenant_id,actor_id,action,consent_id,occurred_at) VALUES($1,$2,$3,$4,$5,$6)`, event.ID, event.TenantID, event.ActorID, event.Action, event.ConsentID, event.OccurredAt)
+	resourceType := event.ResourceType
+	if resourceType == "" {
+		resourceType = "consent"
+	}
+	revision := event.Revision
+	if revision <= 0 {
+		revision = 1
+	}
+	changes := event.Changes
+	if changes == nil {
+		changes = map[string]any{}
+	}
+	changesJSON, _ := json.Marshal(changes)
+	_, err := p.pool.Exec(ctx, `INSERT INTO consent_audit_events(id,tenant_id,actor_id,action,consent_id,occurred_at,resource_type,revision,changes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, event.ID, event.TenantID, event.ActorID, event.Action, event.ConsentID, event.OccurredAt, resourceType, revision, changesJSON)
 	return classify(err)
 }
 

@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,7 +18,7 @@ import (
 )
 
 func newTestAPI(svc *service.Service, logBuf *bytes.Buffer) http.Handler {
-	logger := log.New(logBuf, "", 0)
+	logger := slog.New(slog.NewJSONHandler(logBuf, nil))
 	return newHandler(svc, 5*time.Second, logger)
 }
 

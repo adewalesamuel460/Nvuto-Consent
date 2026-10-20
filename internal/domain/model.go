@@ -149,16 +149,19 @@ type EvaluationRequest struct {
 
 type DoubleOptInChallenge struct {
 	Consent           Consent `json:"consent"`
-	ConfirmationToken string  `json:"confirmation_token"`
+	ConfirmationToken string  `json:"-"`
 }
 
 type AuditEvent struct {
-	ID         string    `json:"id"`
-	TenantID   string    `json:"tenant_id"`
-	ActorID    string    `json:"actor_id"`
-	Action     string    `json:"action"`
-	ConsentID  string    `json:"consent_id"`
-	OccurredAt time.Time `json:"occurred_at"`
+	ID           string         `json:"id"`
+	TenantID     string         `json:"tenant_id"`
+	ActorID      string         `json:"actor_id"`
+	Action       string         `json:"action"`
+	ConsentID    string         `json:"consent_id"`
+	ResourceType string         `json:"resource_type,omitempty"`
+	Revision     int64          `json:"revision,omitempty"`
+	Changes      map[string]any `json:"changes,omitempty"`
+	OccurredAt   time.Time      `json:"occurred_at"`
 }
 
 type OutboxEvent struct {

@@ -16,6 +16,9 @@ import (
 // cannot provide governed idempotency. It is reported as an internal error.
 var ErrIdempotencyUnsupported = domain.ErrInternal.Derive("idempotency_unsupported", "governed consent idempotency is not supported by repository")
 
+// ErrSubjectForbidden indicates the caller lacks authority for the requested customer subject.
+var ErrSubjectForbidden = domain.ErrForbidden.Derive("subject_not_authorized", "subject not authorized")
+
 type governedFingerprint struct {
 	TenantID      string            `json:"tenant_id"`
 	ActorID       string            `json:"actor_id"`
@@ -42,7 +45,12 @@ func fingerprintGoverned(input governedFingerprint) string {
 // idempotency key. The request is validated and admitted exactly like
 // RecordGoverned; the fingerprint is computed over the normalized request so
 // cosmetic differences (case, whitespace) replay instead of conflicting.
-func (s *Service) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, tenantID, actorID, subjectID, purposeCode, channel, legalBasis, status, source string, scope map[string]string, expiresAt *time.Time, jurisdiction, noticeVersion string, evidence domain.Evidence) (domain.Consent, error) {
+//
+// A replay of an already recorded idempotency key returns the exact original
+// 201 response snapshot, even if the policy was subsequently updated or the
+// consent was subsequently withdrawn (T-025). The caller's subject authorization
+// is re-evaluated before returning the snapshot.
+func (s *Service) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, tenantID, actorID, subjectID, purposeCode, channel, legalBasis, status, source string, scope map[string]string, expiresAt *time.Time, jurisdiction, noticeVersion string, evidence domain.Evidence, subjectScopes ...SubjectScope) (domain.Consent, error) {
 	checkedAt := time.Now().UTC()
 	in, err := normalizeGoverned(tenantID, actorID, subjectID, purposeCode, channel, legalBasis, status, source, scope, expiresAt, jurisdiction, noticeVersion, evidence, checkedAt)
 	if err != nil {
@@ -52,13 +60,19 @@ func (s *Service) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, 
 	if err := checkText("idempotency_key", idempotencyKey, maxIdempotencyKey); err != nil {
 		return domain.Consent{}, err
 	}
+	subScope := TenantWide()
+	if len(subjectScopes) > 0 {
+		subScope = subjectScopes[0]
+	}
+	if !subScope.Permits(in.SubjectID) {
+		return domain.Consent{}, ErrSubjectForbidden
+	}
+
 	repo, ok := s.repo.(store.GovernedIdempotencyRepository)
 	if !ok {
 		return domain.Consent{}, ErrIdempotencyUnsupported
 	}
-	if err := s.admitGoverned(ctx, in, checkedAt); err != nil {
-		return domain.Consent{}, err
-	}
+
 	// Same field normalization as before T-027, so fingerprints of keys
 	// stored by earlier releases still replay.
 	requestHash := fingerprintGoverned(governedFingerprint{
@@ -66,9 +80,35 @@ func (s *Service) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, 
 		LegalBasis: in.LegalBasis, Status: in.Status, Source: in.Source, Scope: in.Scope, ExpiresAt: in.ExpiresAt,
 		Jurisdiction: in.Jurisdiction, NoticeVersion: in.NoticeVersion, Evidence: in.Evidence,
 	})
+
+	// Probe if this idempotency key already exists. A completed key returns
+	// the stored response snapshot without re-running policy checks, ensuring
+	// replay semantics do not drift when policy updates or consent is withdrawn (T-025).
+	if snapshot, storedHash, found, err := repo.FindIdempotencySnapshot(ctx, in.TenantID, idempotencyKey); err != nil {
+		return domain.Consent{}, err
+	} else if found {
+		if storedHash != requestHash {
+			return domain.Consent{}, store.ErrConflict
+		}
+		if !subScope.Permits(snapshot.SubjectID) {
+			return domain.Consent{}, ErrSubjectForbidden
+		}
+		return snapshot, nil
+	}
+
+	if err := s.admitGoverned(ctx, in, checkedAt); err != nil {
+		return domain.Consent{}, err
+	}
 	consent, receipt, audit, outbox, err := governedRecords(in, normalizeReceiptTime(time.Now()))
 	if err != nil {
 		return domain.Consent{}, err
 	}
-	return repo.RecordGovernedIdempotent(ctx, idempotencyKey, requestHash, consent, receipt, audit, outbox)
+	result, err := repo.RecordGovernedIdempotent(ctx, idempotencyKey, requestHash, consent, receipt, audit, outbox)
+	if err != nil {
+		return domain.Consent{}, err
+	}
+	if !subScope.Permits(result.SubjectID) {
+		return domain.Consent{}, ErrSubjectForbidden
+	}
+	return result, nil
 }

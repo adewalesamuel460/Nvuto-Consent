@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -12,21 +13,44 @@ import (
 
 type GovernedIdempotencyRepository interface {
 	RecordGovernedIdempotent(ctx context.Context, idempotencyKey, requestHash string, consent domain.Consent, receipt domain.ConsentReceipt, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error)
+	FindIdempotencySnapshot(ctx context.Context, tenantID, idempotencyKey string) (domain.Consent, string, bool, error)
+}
+
+type idempotencyKey struct {
+	tenantID       string
+	idempotencyKey string
 }
 
 type memoryIdempotencyEntry struct {
-	RequestHash string
-	ConsentID   string
+	RequestHash      string
+	ConsentID        string
+	ResponseSnapshot domain.Consent
 }
 
-var memoryIdempotency sync.Map // map[*Memory]map[string]memoryIdempotencyEntry; guarded by Memory.mu
+var memoryIdempotency sync.Map // map[*Memory]map[idempotencyKey]memoryIdempotencyEntry; guarded by Memory.mu
 
-func memoryLedger(m *Memory) map[string]memoryIdempotencyEntry {
-	ledger, _ := memoryIdempotency.LoadOrStore(m, map[string]memoryIdempotencyEntry{})
-	return ledger.(map[string]memoryIdempotencyEntry)
+func memoryLedger(m *Memory) map[idempotencyKey]memoryIdempotencyEntry {
+	ledger, _ := memoryIdempotency.LoadOrStore(m, map[idempotencyKey]memoryIdempotencyEntry{})
+	return ledger.(map[idempotencyKey]memoryIdempotencyEntry)
 }
 
-func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, requestHash string, consent domain.Consent, receipt domain.ConsentReceipt, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error) {
+func (m *Memory) FindIdempotencySnapshot(ctx context.Context, tenantID, idempKey string) (domain.Consent, string, bool, error) {
+	if err := live(ctx); err != nil {
+		return domain.Consent{}, "", false, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	ledger := memoryLedger(m)
+	lKey := idempotencyKey{tenantID: tenantID, idempotencyKey: idempKey}
+	entry, ok := ledger[lKey]
+	if !ok {
+		return domain.Consent{}, "", false, nil
+	}
+	return entry.ResponseSnapshot, entry.RequestHash, true, nil
+}
+
+func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempKey, requestHash string, consent domain.Consent, receipt domain.ConsentReceipt, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error) {
 	if err := live(ctx); err != nil {
 		return domain.Consent{}, err
 	}
@@ -34,65 +58,134 @@ func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, r
 	defer m.mu.Unlock()
 
 	ledger := memoryLedger(m)
-	ledgerKey := key(consent.TenantID, idempotencyKey)
-	if existing, ok := ledger[ledgerKey]; ok {
+	lKey := idempotencyKey{tenantID: consent.TenantID, idempotencyKey: idempKey}
+	if existing, ok := ledger[lKey]; ok {
 		if existing.RequestHash != requestHash {
 			return domain.Consent{}, ErrConflict
 		}
-		stored, ok := m.consents[key(consent.TenantID, existing.ConsentID)]
-		if !ok {
-			return domain.Consent{}, ErrConflict
-		}
-		return stored, nil
+		return existing.ResponseSnapshot, nil
 	}
-	if _, exists := m.consents[key(consent.TenantID, consent.ID)]; exists {
+	cKey := consentKey{tenantID: consent.TenantID, consentID: consent.ID}
+	if _, exists := m.consents[cKey]; exists {
 		return domain.Consent{}, ErrConflict
 	}
 	if receipt.ID != "" {
-		if _, exists := m.receipts[key(receipt.TenantID, receipt.ID)]; exists {
+		rKey := receiptKey{tenantID: receipt.TenantID, receiptID: receipt.ID}
+		if _, exists := m.receipts[rKey]; exists {
 			return domain.Consent{}, ErrConflict
 		}
 	}
 	consent.PreferenceGeneration = m.advanceGenerationLocked(consent)
 	if receipt.ID != "" {
-		m.receipts[key(receipt.TenantID, receipt.ID)] = receipt
+		m.receipts[receiptKey{tenantID: receipt.TenantID, receiptID: receipt.ID}] = receipt
 	}
-	m.consents[key(consent.TenantID, consent.ID)] = consent
+	m.consents[cKey] = consent
 	m.audit = append(m.audit, audit)
 	m.outbox = append(m.outbox, outbox)
-	ledger[ledgerKey] = memoryIdempotencyEntry{RequestHash: requestHash, ConsentID: consent.ID}
+	ledger[lKey] = memoryIdempotencyEntry{
+		RequestHash:      requestHash,
+		ConsentID:        consent.ID,
+		ResponseSnapshot: consent,
+	}
 	return consent, nil
+}
+
+func (p *Postgres) FindIdempotencySnapshot(ctx context.Context, tenantID, idempKey string) (domain.Consent, string, bool, error) {
+	var storedHash, storedConsentID string
+	var snapshotBytes []byte
+	err := p.pool.QueryRow(ctx, `SELECT request_hash, consent_id, response_snapshot FROM consent_idempotency WHERE tenant_id=$1 AND idempotency_key=$2`, tenantID, idempKey).Scan(&storedHash, &storedConsentID, &snapshotBytes)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Consent{}, "", false, nil
+		}
+		return domain.Consent{}, "", false, classify(err)
+	}
+	var snapshot domain.Consent
+	if len(snapshotBytes) > 0 && string(snapshotBytes) != "{}" {
+		if err := json.Unmarshal(snapshotBytes, &snapshot); err != nil {
+			return domain.Consent{}, "", false, classify(err)
+		}
+	}
+	if snapshot.ID == "" && storedConsentID != "" {
+		existing, err := scanConsent(p.pool.QueryRow(ctx, `SELECT `+consentColumns+` FROM consents WHERE tenant_id=$1 AND id=$2`, tenantID, storedConsentID))
+		if err != nil {
+			return domain.Consent{}, "", false, err
+		}
+		snapshot = existing
+	}
+	return snapshot, storedHash, true, nil
 }
 
 // RecordGovernedIdempotent claims the idempotency key and records the consent
 // in one transaction. A transient abort re-runs the whole transaction, so the
 // key claim and the consent/receipt/audit/outbox rows commit together or not
-// at all; a replay of an already committed key returns the stored consent and
-// rolls back without writing.
+// at all; a replay of an already committed key returns the stored response snapshot
+// and rolls back without writing.
 func (p *Postgres) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, requestHash string, consent domain.Consent, receipt domain.ConsentReceipt, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error) {
 	var result domain.Consent
 	err := p.inTx(ctx, func(tx pgx.Tx) error {
 		var storedHash, storedConsentID string
-		err := tx.QueryRow(ctx, `INSERT INTO consent_idempotency(tenant_id,idempotency_key,request_hash,consent_id,created_at)
-		VALUES($1,$2,$3,$4,$5)
+		var snapshotBytes []byte
+		err := tx.QueryRow(ctx, `SELECT request_hash, consent_id, response_snapshot FROM consent_idempotency WHERE tenant_id=$1 AND idempotency_key=$2 FOR UPDATE`, consent.TenantID, idempotencyKey).Scan(&storedHash, &storedConsentID, &snapshotBytes)
+		if err == nil {
+			if storedHash != requestHash {
+				return ErrConflict
+			}
+			var snapshot domain.Consent
+			if len(snapshotBytes) > 0 && string(snapshotBytes) != "{}" {
+				if err := json.Unmarshal(snapshotBytes, &snapshot); err != nil {
+					return classify(err)
+				}
+			}
+			if snapshot.ID == "" && storedConsentID != "" {
+				existing, err := scanConsent(tx.QueryRow(ctx, `SELECT `+consentColumns+` FROM consents WHERE tenant_id=$1 AND id=$2`, consent.TenantID, storedConsentID))
+				if err != nil {
+					return err
+				}
+				snapshot = existing
+			}
+			result = snapshot
+			return errNoChange
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return classify(err)
+		}
+
+		result, err = recordGovernedTx(ctx, tx, consent, receipt, audit, outbox)
+		if err != nil {
+			return err
+		}
+		snapJSON, err := json.Marshal(result)
+		if err != nil {
+			return domain.ErrInternal.Wrap(err)
+		}
+		err = tx.QueryRow(ctx, `INSERT INTO consent_idempotency(tenant_id,idempotency_key,request_hash,consent_id,response_snapshot,created_at)
+		VALUES($1,$2,$3,$4,$5,$6)
 		ON CONFLICT(tenant_id,idempotency_key) DO UPDATE SET idempotency_key=excluded.idempotency_key
-		RETURNING request_hash,consent_id`, consent.TenantID, idempotencyKey, requestHash, consent.ID, time.Now().UTC()).Scan(&storedHash, &storedConsentID)
+		RETURNING request_hash,consent_id,response_snapshot`, consent.TenantID, idempotencyKey, requestHash, result.ID, snapJSON, time.Now().UTC()).Scan(&storedHash, &storedConsentID, &snapshotBytes)
 		if err != nil {
 			return classify(err)
 		}
 		if storedHash != requestHash {
 			return ErrConflict
 		}
-		if storedConsentID != consent.ID {
-			existing, err := scanConsent(tx.QueryRow(ctx, `SELECT `+consentColumns+` FROM consents WHERE tenant_id=$1 AND id=$2`, consent.TenantID, storedConsentID))
-			if err != nil {
-				return err
+		if storedConsentID != result.ID {
+			var snapshot domain.Consent
+			if len(snapshotBytes) > 0 && string(snapshotBytes) != "{}" {
+				if err := json.Unmarshal(snapshotBytes, &snapshot); err != nil {
+					return classify(err)
+				}
 			}
-			result = existing
+			if snapshot.ID == "" && storedConsentID != "" {
+				existing, err := scanConsent(tx.QueryRow(ctx, `SELECT `+consentColumns+` FROM consents WHERE tenant_id=$1 AND id=$2`, consent.TenantID, storedConsentID))
+				if err != nil {
+					return err
+				}
+				snapshot = existing
+			}
+			result = snapshot
 			return errNoChange
 		}
-		result, err = recordGovernedTx(ctx, tx, consent, receipt, audit, outbox)
-		return err
+		return nil
 	})
 	if err != nil && !errors.Is(err, errNoChange) {
 		return domain.Consent{}, err

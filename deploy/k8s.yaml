@@ -38,7 +38,7 @@ spec:
               app: consent-api
       containers:
         - name: api
-          image: ghcr.io/atlasfsp/nvuto-consent:latest
+          image: ghcr.io/atlasfsp/nvuto-consent@sha256:baae473c914d7cfec25e5cfad7e1e6951feef869151523ea397a6598c1ea993f # Must use immutable image digest in production (T-018)
           ports:
             - containerPort: 8080
           env:

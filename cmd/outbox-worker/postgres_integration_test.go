@@ -219,3 +219,44 @@ func TestPostgresJetStreamOutboxConcurrency(t *testing.T) {
 	}
 	_ = replayed[0].Ack()
 }
+
+func TestPostgresJetStreamEnsureStreamDriftDetection(t *testing.T) {
+	env := requireEnv(t, "TEST_NATS_URL")
+	connection, err := nats.Connect(env[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	js, err := connection.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	stream := "NVUTO_CONSENT_DRIFT_" + suffix
+	prefix := "nvuto.consent.drift" + suffix
+
+	// Initial creation should succeed.
+	if err := ensureStream(js, stream, prefix, 1); err != nil {
+		t.Fatalf("initial ensureStream failed: %v", err)
+	}
+	defer js.DeleteStream(stream)
+
+	// Idempotent re-check with identical config should succeed.
+	if err := ensureStream(js, stream, prefix, 1); err != nil {
+		t.Fatalf("idempotent ensureStream failed: %v", err)
+	}
+
+	// Mismatched replica count must be detected and return an error.
+	if err := ensureStream(js, stream, prefix, 3); err == nil {
+		t.Fatal("ensureStream must return error when replica count drifts")
+	} else if !strings.Contains(err.Error(), "replica count mismatch") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// Mismatched subject prefix must be detected and return an error.
+	if err := ensureStream(js, stream, "other.prefix", 1); err == nil {
+		t.Fatal("ensureStream must return error when subjects drift")
+	} else if !strings.Contains(err.Error(), "subjects mismatch") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}

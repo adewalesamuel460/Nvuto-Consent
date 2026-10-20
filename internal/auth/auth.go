@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -368,4 +369,49 @@ func HasAnyRole(principal Principal, roles ...string) bool {
 		}
 	}
 	return false
+}
+
+// ValidateConfig checks that at least one supported authentication mode is
+// properly configured and usable (T-015). Supported modes are:
+//  1. JWKS: JWT_JWKS_URL (valid http/https URL), JWT_ISSUER, and JWT_AUDIENCE.
+//  2. HMAC: ALLOW_HMAC_AUTH=true and non-empty JWT_HMAC_SECRET.
+//  3. Dev:  ALLOW_DEV_HEADERS=true (explicitly allowed dev headers mode).
+//
+// If none of these modes are enabled or if an enabled mode has invalid settings,
+// ValidateConfig returns an error explaining the configuration failure.
+func ValidateConfig() error {
+	jwksURL := strings.TrimSpace(os.Getenv("JWT_JWKS_URL"))
+	hmacAllowed := strings.EqualFold(os.Getenv("ALLOW_HMAC_AUTH"), "true")
+	devAllowed := strings.EqualFold(os.Getenv("ALLOW_DEV_HEADERS"), "true")
+	secret := strings.TrimSpace(os.Getenv("JWT_HMAC_SECRET"))
+
+	if jwksURL != "" {
+		issuer := strings.TrimSpace(os.Getenv("JWT_ISSUER"))
+		audience := strings.TrimSpace(os.Getenv("JWT_AUDIENCE"))
+		if issuer == "" || audience == "" {
+			return errors.New("JWKS authentication requires JWT_ISSUER and JWT_AUDIENCE")
+		}
+		parsed, err := url.ParseRequestURI(jwksURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return errors.New("JWT_JWKS_URL must be a valid HTTP or HTTPS URL")
+		}
+		return nil
+	}
+
+	if hmacAllowed {
+		if secret == "" {
+			return errors.New("ALLOW_HMAC_AUTH=true requires non-empty JWT_HMAC_SECRET")
+		}
+		return nil
+	}
+
+	if devAllowed {
+		return nil
+	}
+
+	if secret != "" {
+		return errors.New("JWT_HMAC_SECRET is set but ALLOW_HMAC_AUTH is not true; HMAC authentication is disabled")
+	}
+
+	return errors.New("authentication is not configured: must configure JWKS (JWT_JWKS_URL, JWT_ISSUER, JWT_AUDIENCE), HMAC (JWT_HMAC_SECRET with ALLOW_HMAC_AUTH=true), or ALLOW_DEV_HEADERS=true")
 }

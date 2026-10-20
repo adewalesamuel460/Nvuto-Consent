@@ -82,7 +82,39 @@ func TestPostgresGovernedIdempotencyConcurrentReplay(t *testing.T) {
 	if err != nil || stored.ID != winner {
 		t.Fatalf("late exact replay must return the original record: stored=%+v err=%v", stored, err)
 	}
+	if stored.Status != domain.StatusGranted {
+		t.Fatalf("snapshot status must be granted, got %v", stored.Status)
+	}
 	assertTenantRowCounts(t, repo, tenant, 1)
+
+	// Verify FindIdempotencySnapshot returns the stored snapshot
+	snap, snapHash, found, err := repo.FindIdempotencySnapshot(context.Background(), tenant, "customer360:local-1")
+	if err != nil || !found || snapHash != "request-hash-a" || snap.ID != winner {
+		t.Fatalf("FindIdempotencySnapshot failed: snap=%+v hash=%s found=%v err=%v", snap, snapHash, found, err)
+	}
+	if snap.Status != domain.StatusGranted {
+		t.Fatalf("FindIdempotencySnapshot status must be granted, got %v", snap.Status)
+	}
+
+	// Withdraw the consent in storage
+	withdrawnCandidate := stored
+	withdrawnCandidate.Status = domain.StatusWithdrawn
+	withdrawnCandidate.WithdrawnAt = &now
+	withdrawnCandidate.UpdatedAt = now
+	withdrawAudit := domain.AuditEvent{ID: "aud-withdraw-" + run, TenantID: tenant, ActorID: "svc", Action: "consent.withdrawn", ConsentID: winner, OccurredAt: now}
+	withdrawOutbox := domain.OutboxEvent{ID: "evt-withdraw-" + run, TenantID: tenant, EventType: "consent.withdrawn", AggregateID: winner, Payload: map[string]any{}, OccurredAt: now}
+	if _, err := repo.Withdraw(context.Background(), withdrawnCandidate, withdrawAudit, withdrawOutbox); err != nil {
+		t.Fatalf("Withdraw failed: %v", err)
+	}
+
+	// Idempotent replay must STILL return the exact original snapshot with StatusGranted (T-025)
+	replayedAfterWithdraw, err := repo.RecordGovernedIdempotent(context.Background(), "customer360:local-1", "request-hash-a", replay, receipt, audit, outbox)
+	if err != nil {
+		t.Fatalf("replay after withdrawal failed: %v", err)
+	}
+	if replayedAfterWithdraw.Status != domain.StatusGranted {
+		t.Fatalf("replay after withdrawal must return original snapshot with granted status, got %v", replayedAfterWithdraw.Status)
+	}
 }
 
 // assertTenantRowCounts proves rejected or replayed writes left no hidden

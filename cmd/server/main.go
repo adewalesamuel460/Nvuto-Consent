@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -46,7 +46,7 @@ const (
 
 type api struct {
 	svc *service.Service
-	log *log.Logger
+	log *slog.Logger
 }
 
 // Public request contracts (T-027). Every policy boolean is a *bool so an
@@ -279,12 +279,28 @@ func (a api) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	status := httpStatus(kind)
 	cid := correlationID(r.Context())
-	level := "info"
+	cause := sanitizeCause(err)
 	if status >= 500 && status != statusClientClosedRequest {
-		level = "error"
+		a.log.ErrorContext(r.Context(), "request_failed",
+			slog.String("correlation_id", cid),
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", status),
+			slog.String("kind", kind.String()),
+			slog.String("code", public.Code()),
+			slog.String("cause", cause),
+		)
+	} else {
+		a.log.InfoContext(r.Context(), "request_failed",
+			slog.String("correlation_id", cid),
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", status),
+			slog.String("kind", kind.String()),
+			slog.String("code", public.Code()),
+			slog.String("cause", cause),
+		)
 	}
-	a.log.Printf("level=%s msg=request_failed correlation_id=%s method=%s path=%q status=%d kind=%s code=%s cause=%q",
-		level, cid, r.Method, r.URL.Path, status, kind, public.Code(), sanitizeCause(err))
 	if status == http.StatusServiceUnavailable {
 		w.Header().Set("Retry-After", "1")
 	}
@@ -628,7 +644,8 @@ func (a api) consents(w http.ResponseWriter, r *http.Request) {
 	if !a.decode(w, r, &input) {
 		return
 	}
-	if !subjectAuthorized(p, actionWrite, input.SubjectID) {
+	scope, ok := subjectScope(p, actionWrite)
+	if !ok || !scope.Permits(input.SubjectID) {
 		a.writeError(w, r, errSubjectForbidden)
 		return
 	}
@@ -638,7 +655,7 @@ func (a api) consents(w http.ResponseWriter, r *http.Request) {
 	if idempotencyKey == "" {
 		output, err = a.svc.RecordGoverned(r.Context(), p.TenantID, p.ActorID, input.SubjectID, input.Purpose, input.Channel, input.LegalBasis, input.Status, input.Source, input.Scope, input.ExpiresAt, input.Jurisdiction, input.NoticeVersion, input.Evidence)
 	} else {
-		output, err = a.svc.RecordGovernedIdempotent(r.Context(), idempotencyKey, p.TenantID, p.ActorID, input.SubjectID, input.Purpose, input.Channel, input.LegalBasis, input.Status, input.Source, input.Scope, input.ExpiresAt, input.Jurisdiction, input.NoticeVersion, input.Evidence)
+		output, err = a.svc.RecordGovernedIdempotent(r.Context(), idempotencyKey, p.TenantID, p.ActorID, input.SubjectID, input.Purpose, input.Channel, input.LegalBasis, input.Status, input.Source, input.Scope, input.ExpiresAt, input.Jurisdiction, input.NoticeVersion, input.Evidence, scope)
 	}
 	if err != nil {
 		a.writeError(w, r, err)
@@ -781,7 +798,11 @@ func (a api) startDoubleOptIn(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, r, err)
 		return
 	}
-	write(w, http.StatusCreated, output)
+	write(w, http.StatusCreated, map[string]any{
+		"challenge_id": output.Consent.ID,
+		"status":       output.Consent.Status,
+		"consent":      output.Consent,
+	})
 }
 
 func (a api) confirmDoubleOptIn(w http.ResponseWriter, r *http.Request) {
@@ -832,9 +853,26 @@ func (a api) receipt(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, output)
 }
 
+// ValidateAuthConfig exposes the authentication configuration validation check (T-015).
+func ValidateAuthConfig() error {
+	return auth.ValidateConfig()
+}
+
 func (a api) ready(w http.ResponseWriter, r *http.Request) {
 	if err := a.svc.Ready(r.Context()); err != nil {
-		a.log.Printf("level=warn msg=readiness_failed correlation_id=%s kind=%s cause=%q", correlationID(r.Context()), domain.KindOf(err), sanitizeCause(err))
+		a.log.WarnContext(r.Context(), "readiness_failed",
+			slog.String("correlation_id", correlationID(r.Context())),
+			slog.String("kind", domain.KindOf(err).String()),
+			slog.String("cause", sanitizeCause(err)),
+		)
+		write(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+		return
+	}
+	if err := auth.ValidateConfig(); err != nil {
+		a.log.WarnContext(r.Context(), "readiness_auth_unconfigured",
+			slog.String("correlation_id", correlationID(r.Context())),
+			slog.String("cause", sanitizeCause(err)),
+		)
 		write(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
 		return
 	}
@@ -862,20 +900,29 @@ func (a api) withRequestContext(next http.Handler, timeout time.Duration) http.H
 				if recovered == http.ErrAbortHandler {
 					panic(recovered)
 				}
-				a.writeError(w, r, domain.ErrInternal.Wrap(fmt.Errorf("panic: %v", recovered)))
+				recoveredErr := fmt.Errorf("panic: %v", recovered)
+				a.log.ErrorContext(r.Context(), "request_panic",
+					slog.String("correlation_id", cid),
+					slog.String("cause", sanitizeCause(recoveredErr)),
+				)
+				a.writeError(w, r, domain.ErrInternal.Wrap(recoveredErr))
 			}
 		}()
 		next.ServeHTTP(w, r)
 	})
 }
 
-func newMux(svc *service.Service) http.Handler {
-	return newHandler(svc, defaultRequestTimeout, log.Default())
+func newJSONLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
 
-func newHandler(svc *service.Service, timeout time.Duration, logger *log.Logger) http.Handler {
+func newMux(svc *service.Service) http.Handler {
+	return newHandler(svc, defaultRequestTimeout, newJSONLogger())
+}
+
+func newHandler(svc *service.Service, timeout time.Duration, logger *slog.Logger) http.Handler {
 	if logger == nil {
-		logger = log.Default()
+		logger = newJSONLogger()
 	}
 	a := api{svc: svc, log: logger}
 	mux := http.NewServeMux()
@@ -899,20 +946,28 @@ func newHandler(svc *service.Service, timeout time.Duration, logger *log.Logger)
 
 // requestTimeout reads REQUEST_TIMEOUT (a Go duration). Invalid or
 // non-positive values fall back to the default.
-func requestTimeout() time.Duration {
+func requestTimeout(logger *slog.Logger) time.Duration {
 	raw := strings.TrimSpace(os.Getenv("REQUEST_TIMEOUT"))
 	if raw == "" {
 		return defaultRequestTimeout
 	}
 	value, err := time.ParseDuration(raw)
 	if err != nil || value <= 0 {
-		log.Printf("invalid REQUEST_TIMEOUT %q; using %s", raw, defaultRequestTimeout)
+		if logger != nil {
+			logger.Warn("invalid_request_timeout", slog.String("raw", raw), slog.Duration("default", defaultRequestTimeout))
+		}
 		return defaultRequestTimeout
 	}
 	return value
 }
 
 func main() {
+	logger := newJSONLogger()
+	if err := auth.ValidateConfig(); err != nil {
+		logger.Error("auth_configuration_invalid", slog.String("cause", sanitizeCause(err)))
+		os.Exit(1)
+	}
+
 	var repo store.Repository
 	closeStore := func() {}
 	if databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL")); databaseURL != "" {
@@ -920,26 +975,35 @@ func main() {
 		postgres, err := store.NewPostgres(startupCtx, databaseURL)
 		cancelStartup()
 		if err != nil {
-			log.Fatalf("postgres unavailable: %s", sanitizeCause(err))
+			logger.Error("postgres_unavailable", slog.String("cause", sanitizeCause(err)))
+			os.Exit(1)
 		}
 		repo = postgres
 		closeStore = postgres.Close
-		log.Printf("using PostgreSQL storage")
+		logger.Info("using_postgresql_storage")
 	} else {
 		if !strings.EqualFold(os.Getenv("ALLOW_MEMORY_STORE"), "true") {
-			log.Fatal("DATABASE_URL is required unless ALLOW_MEMORY_STORE=true")
+			logger.Error("database_url_required", slog.String("message", "DATABASE_URL is required unless ALLOW_MEMORY_STORE=true"))
+			os.Exit(1)
 		}
 		repo = store.NewMemory()
-		log.Printf("WARNING: using non-durable memory storage")
+		logger.Warn("using_non_durable_memory_storage")
 	}
 	defer closeStore()
 
 	svc := service.New(repo)
-	timeout := requestTimeout()
-	server := &http.Server{Addr: ":8080", Handler: newHandler(svc, timeout, log.Default()), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: timeout + 5*time.Second, IdleTimeout: 60 * time.Second}
+	timeout := requestTimeout(logger)
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           newHandler(svc, timeout, logger),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      timeout + 5*time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("Nvuto Consent listening on %s (request timeout %s)", server.Addr, timeout)
+		logger.Info("server_listening", slog.String("addr", server.Addr), slog.Duration("request_timeout", timeout))
 		errCh <- server.ListenAndServe()
 	}()
 
@@ -947,15 +1011,15 @@ func main() {
 	signal.Notify(signalChannel, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case <-signalChannel:
-		log.Printf("shutdown requested")
+		logger.Info("shutdown_requested")
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("server failed: %v", err)
+			logger.Error("server_failed", slog.String("error", err.Error()))
 		}
 	}
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownContext); err != nil {
-		log.Printf("graceful shutdown failed: %v", err)
+		logger.Error("graceful_shutdown_failed", slog.String("error", err.Error()))
 	}
 }
