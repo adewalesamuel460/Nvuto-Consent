@@ -88,6 +88,7 @@ type Repository interface {
 	FindPendingByToken(ctx context.Context, tenantID, tokenHash string) (domain.Consent, error)
 	ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash string, at time.Time, finalize ConfirmFinalizer) (domain.Consent, error)
 	AppendAudit(ctx context.Context, event domain.AuditEvent) error
+	ListAuditEvents(ctx context.Context, tenantID, resourceType, resourceID string, limit, offset int) ([]domain.AuditEvent, int, error)
 	AppendOutbox(ctx context.Context, event domain.OutboxEvent) error
 	Ping(ctx context.Context) error
 	VerifySchema(ctx context.Context) error

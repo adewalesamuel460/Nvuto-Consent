@@ -63,6 +63,7 @@ type memoryIdempotencyEntry struct {
 	RequestHash      string
 	ConsentID        string
 	ResponseSnapshot domain.Consent
+	OriginalResponse domain.Consent
 }
 
 func cloneConsent(c domain.Consent) domain.Consent {
@@ -126,6 +127,12 @@ func cloneAuditEvent(e domain.AuditEvent) domain.AuditEvent {
 	cp := e
 	if e.Changes != nil {
 		cp.Changes = cloneMapAny(e.Changes)
+	}
+	if e.BeforeState != nil {
+		cp.BeforeState = cloneMapAny(e.BeforeState)
+	}
+	if e.AfterState != nil {
+		cp.AfterState = cloneMapAny(e.AfterState)
 	}
 	return cp
 }
@@ -329,7 +336,19 @@ func (m *Memory) PutPurpose(ctx context.Context, purpose domain.Purpose, audit d
 	if audit.ConsentID == "" {
 		audit.ConsentID = purpose.Code
 	}
+	if audit.ResourceID == "" {
+		audit.ResourceID = audit.ConsentID
+	}
 	audit.Revision = purpose.Version
+	if audit.CorrelationID == "" {
+		audit.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if audit.BeforeState == nil && before != nil {
+		audit.BeforeState = toMap(before)
+	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(clonedPurpose)
+	}
 	audit.Changes = map[string]any{"before": before, "after": clonedPurpose}
 	m.audit = append(m.audit, cloneAuditEvent(audit))
 	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
@@ -405,7 +424,19 @@ func (m *Memory) PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis, a
 	if audit.ConsentID == "" {
 		audit.ConsentID = basis.Code
 	}
+	if audit.ResourceID == "" {
+		audit.ResourceID = audit.ConsentID
+	}
 	audit.Revision = basis.Version
+	if audit.CorrelationID == "" {
+		audit.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if audit.BeforeState == nil && before != nil {
+		audit.BeforeState = toMap(before)
+	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(clonedBasis)
+	}
 	audit.Changes = map[string]any{"before": before, "after": clonedBasis}
 	m.audit = append(m.audit, cloneAuditEvent(audit))
 	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
@@ -476,8 +507,17 @@ func (m *Memory) PutNotice(ctx context.Context, notice domain.PrivacyNotice, aud
 	if audit.ConsentID == "" {
 		audit.ConsentID = notice.Jurisdiction + "/" + notice.Version
 	}
+	if audit.ResourceID == "" {
+		audit.ResourceID = audit.ConsentID
+	}
 	if audit.Revision <= 0 {
 		audit.Revision = 1
+	}
+	if audit.CorrelationID == "" {
+		audit.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(notice)
 	}
 	audit.Changes = map[string]any{"before": nil, "after": notice}
 	m.audit = append(m.audit, cloneAuditEvent(audit))
@@ -559,8 +599,20 @@ func (m *Memory) RetireNotice(ctx context.Context, tenantID, jurisdiction, versi
 	if audit.ConsentID == "" {
 		audit.ConsentID = current.Jurisdiction + "/" + current.Version
 	}
+	if audit.ResourceID == "" {
+		audit.ResourceID = audit.ConsentID
+	}
 	if audit.Revision <= 0 {
 		audit.Revision = 2
+	}
+	if audit.CorrelationID == "" {
+		audit.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if audit.BeforeState == nil {
+		audit.BeforeState = toMap(before)
+	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(current)
 	}
 	audit.Changes = map[string]any{"before": before, "after": current}
 	m.audit = append(m.audit, cloneAuditEvent(audit))
@@ -611,8 +663,17 @@ func (m *Memory) RecordGoverned(ctx context.Context, consent domain.Consent, rec
 	if audit.ResourceType == "" {
 		audit.ResourceType = "consent"
 	}
+	if audit.ResourceID == "" {
+		audit.ResourceID = consent.ID
+	}
 	if audit.Revision <= 0 {
 		audit.Revision = 1
+	}
+	if audit.CorrelationID == "" {
+		audit.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(clonedConsent)
 	}
 	if audit.Changes == nil {
 		audit.Changes = map[string]any{"before": nil, "after": clonedConsent}
@@ -620,7 +681,9 @@ func (m *Memory) RecordGoverned(ctx context.Context, consent domain.Consent, rec
 	if outbox.Payload != nil {
 		outbox.Payload["generation"] = consent.PreferenceGeneration
 		outbox.Payload["preference_generation"] = consent.PreferenceGeneration
+		outbox.Payload["aggregate_revision"] = consent.PreferenceGeneration
 	}
+	outbox.AggregateRevision = consent.PreferenceGeneration
 	m.audit = append(m.audit, cloneAuditEvent(audit))
 	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
 	return cloneConsent(consent), nil
@@ -655,8 +718,28 @@ func (m *Memory) Withdraw(ctx context.Context, consent domain.Consent, audit dom
 		audit.ResourceType = "consent"
 	}
 	audit.ConsentID = consent.ID
+	audit.ResourceID = consent.ID
 	audit.Revision = consent.Version
+	if audit.CorrelationID == "" {
+		audit.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if audit.BeforeState == nil {
+		audit.BeforeState = toMap(before)
+	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(clonedConsent)
+	}
 	audit.Changes = map[string]any{"before": before, "after": clonedConsent}
+	if outbox.Payload != nil {
+		outbox.Payload["generation"] = generation
+		outbox.Payload["preference_generation"] = generation
+		outbox.Payload["aggregate_revision"] = generation
+		outbox.Payload["schema_version"] = 1
+		outbox.Payload["aggregate_type"] = "consent.preference"
+		outbox.Payload["tenant_id"] = consent.TenantID
+	}
+	outbox.AggregateType = "consent.preference"
+	outbox.AggregateRevision = generation
 	m.audit = append(m.audit, cloneAuditEvent(audit))
 	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
 	return cloneConsent(consent), nil
@@ -710,15 +793,36 @@ func (m *Memory) SetSuppression(ctx context.Context, suppression domain.Suppress
 		audit.ResourceType = "suppression"
 	}
 	audit.ConsentID = suppression.ID
+	audit.ResourceID = suppression.ID
 	audit.Revision = suppression.Version
+	if audit.Reason == "" {
+		audit.Reason = suppression.Reason
+	}
+	if audit.CorrelationID == "" {
+		audit.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if audit.BeforeState == nil && before != nil {
+		audit.BeforeState = toMap(before)
+	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(clonedSuppression)
+	}
 	audit.Changes = map[string]any{"before": before, "after": clonedSuppression}
 	// T-026: Ensure outbox AggregateID references the preserved suppression ID.
 	outbox.AggregateID = suppression.ID
+	outbox.AggregateType = "consent.suppression"
+	outbox.AggregateRevision = suppression.Version
 	if outbox.Payload != nil {
 		clonedPayload := cloneMapAny(outbox.Payload)
 		if _, hasRole := clonedPayload["created_by_role"]; hasRole {
 			clonedPayload["created_by_role"] = suppression.CreatedByRole
 		}
+		clonedPayload["schema_version"] = 1
+		clonedPayload["aggregate_type"] = "consent.suppression"
+		clonedPayload["aggregate_revision"] = suppression.Version
+		clonedPayload["tenant_id"] = suppression.TenantID
+		clonedPayload["subject_id"] = suppression.SubjectID
+		clonedPayload["version"] = suppression.Version
 		outbox.Payload = clonedPayload
 	}
 	m.audit = append(m.audit, cloneAuditEvent(audit))
@@ -894,8 +998,28 @@ func (m *Memory) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash str
 		audit.ResourceType = "consent"
 	}
 	audit.ConsentID = consent.ID
+	audit.ResourceID = consent.ID
 	audit.Revision = consent.Version
+	if audit.CorrelationID == "" {
+		audit.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if audit.BeforeState == nil {
+		audit.BeforeState = toMap(before)
+	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(clonedConsent)
+	}
 	audit.Changes = map[string]any{"before": before, "after": clonedConsent}
+	if outbox.Payload != nil {
+		outbox.Payload["generation"] = consent.PreferenceGeneration
+		outbox.Payload["preference_generation"] = consent.PreferenceGeneration
+		outbox.Payload["aggregate_revision"] = consent.PreferenceGeneration
+		outbox.Payload["schema_version"] = 1
+		outbox.Payload["aggregate_type"] = "consent.preference"
+		outbox.Payload["tenant_id"] = consent.TenantID
+	}
+	outbox.AggregateType = "consent.preference"
+	outbox.AggregateRevision = consent.PreferenceGeneration
 	m.audit = append(m.audit, cloneAuditEvent(audit))
 	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
 	return cloneConsent(consent), nil
@@ -910,14 +1034,70 @@ func (m *Memory) AppendAudit(ctx context.Context, e domain.AuditEvent) error {
 	if e.ResourceType == "" {
 		e.ResourceType = "consent"
 	}
+	if e.ResourceID == "" {
+		e.ResourceID = e.ConsentID
+	}
 	if e.Revision <= 0 {
 		e.Revision = 1
 	}
+	if e.CorrelationID == "" {
+		e.CorrelationID = domain.CorrelationID(ctx)
+	}
+	if e.BeforeState == nil {
+		e.BeforeState = map[string]any{}
+	}
+	if e.AfterState == nil {
+		e.AfterState = map[string]any{}
+	}
 	if e.Changes == nil {
-		e.Changes = map[string]any{}
+		e.Changes = map[string]any{"before": e.BeforeState, "after": e.AfterState}
 	}
 	m.audit = append(m.audit, cloneAuditEvent(e))
 	return nil
+}
+
+func (m *Memory) ListAuditEvents(ctx context.Context, tenantID, resourceType, resourceID string, limit, offset int) ([]domain.AuditEvent, int, error) {
+	if err := live(ctx); err != nil {
+		return nil, 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var matched []domain.AuditEvent
+	for _, a := range m.audit {
+		if a.TenantID != tenantID {
+			continue
+		}
+		if resourceType != "" && a.ResourceType != resourceType {
+			continue
+		}
+		if resourceID != "" {
+			targetID := a.ResourceID
+			if targetID == "" {
+				targetID = a.ConsentID
+			}
+			if targetID != resourceID && a.ConsentID != resourceID {
+				continue
+			}
+		}
+		matched = append(matched, cloneAuditEvent(a))
+	}
+
+	total := len(matched)
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset >= total {
+		return []domain.AuditEvent{}, total, nil
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return matched[offset:end], total, nil
 }
 
 func (m *Memory) AppendOutbox(ctx context.Context, e domain.OutboxEvent) error {
@@ -957,12 +1137,15 @@ func (m *Memory) Outbox() []domain.OutboxEvent {
 // OutboxLeaseState is the lease/publication state the memory store tracks
 // per outbox event, mirroring the consent_outbox_events lease columns.
 type OutboxLeaseState struct {
-	PublishedAt   *time.Time
-	Attempts      int
-	NextAttemptAt time.Time
-	LockedAt      *time.Time
-	LockedBy      string
-	ClaimToken    string
+	PublishedAt      *time.Time
+	Attempts         int
+	NextAttemptAt    time.Time
+	LockedAt         *time.Time
+	LockedBy         string
+	ClaimToken       string
+	Quarantined      bool
+	QuarantinedAt    *time.Time
+	QuarantineReason string
 }
 
 // SetClock replaces the store clock used for outbox lease timing (tests).
@@ -1019,7 +1202,7 @@ func (m *Memory) ClaimOutbox(ctx context.Context, workerID string, limit int, te
 			continue
 		}
 		state := m.outboxLeases[event.ID]
-		if state != nil && (state.PublishedAt != nil || state.NextAttemptAt.After(now) ||
+		if state != nil && (state.PublishedAt != nil || state.Quarantined || state.NextAttemptAt.After(now) ||
 			(state.LockedAt != nil && !state.LockedAt.Before(now.Add(-OutboxLeaseDuration)))) {
 			continue
 		}
@@ -1038,10 +1221,22 @@ func (m *Memory) ClaimOutbox(ctx context.Context, workerID string, limit int, te
 		event = normalizeOutbox(event)
 		payload, _ := json.Marshal(event.Payload)
 		state := m.outboxLeaseLocked(event.ID)
+		rev := event.AggregateRevision
+		if rev <= 0 && event.Payload != nil {
+			if r, ok := event.Payload["aggregate_revision"].(int64); ok && r > 0 {
+				rev = r
+			} else if r, ok := event.Payload["preference_generation"].(int64); ok && r > 0 {
+				rev = r
+			}
+		}
+		if rev <= 0 {
+			rev = 1
+		}
 		claim.Events = append(claim.Events, OutboxRecord{
 			ID: event.ID, SchemaVersion: event.SchemaVersion, Source: event.Source, TenantID: event.TenantID,
 			EventType: event.EventType, AggregateType: event.AggregateType, AggregateID: event.AggregateID,
-			Payload: payload, OccurredAt: event.OccurredAt, Attempts: state.Attempts,
+			AggregateRevision: rev, Payload: payload, OccurredAt: event.OccurredAt, Attempts: state.Attempts,
+			Quarantined: state.Quarantined, QuarantinedAt: state.QuarantinedAt, QuarantineReason: state.QuarantineReason,
 		})
 		lockedAt := now
 		state.LockedAt, state.LockedBy, state.ClaimToken = &lockedAt, workerID, token
@@ -1122,4 +1317,106 @@ func (m *Memory) ReleaseOutboxBatch(ctx context.Context, workerID string, events
 		}
 	}
 	return nil
+}
+
+func (m *Memory) QuarantineOutbox(ctx context.Context, id, token string, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, err := m.fencedOutboxStateLocked(id, token)
+	if err != nil {
+		return err
+	}
+	now := m.clock()
+	state.Quarantined = true
+	state.QuarantinedAt = &now
+	state.QuarantineReason = reason
+	state.LockedAt, state.LockedBy, state.ClaimToken = nil, "", ""
+	return nil
+}
+
+func (m *Memory) ReplayOutbox(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.outboxLeases[id]
+	if !ok {
+		found := false
+		for _, e := range m.outbox {
+			if e.ID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ErrNotFound
+		}
+		return nil
+	}
+	if !state.Quarantined {
+		return nil
+	}
+	now := m.clock()
+	state.Quarantined = false
+	state.QuarantinedAt = nil
+	state.QuarantineReason = ""
+	state.Attempts = 0
+	state.NextAttemptAt = now
+	state.LockedAt = nil
+	state.LockedBy = ""
+	state.ClaimToken = ""
+	return nil
+}
+
+func (m *Memory) OutboxLag(ctx context.Context, tenantFilter string) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	now := m.clock()
+	var oldest time.Time
+	for _, event := range m.outbox {
+		if tenantFilter != "" && event.TenantID != tenantFilter {
+			continue
+		}
+		state := m.outboxLeases[event.ID]
+		if state != nil && (state.PublishedAt != nil || state.Quarantined) {
+			continue
+		}
+		if oldest.IsZero() || event.OccurredAt.Before(oldest) {
+			oldest = event.OccurredAt
+		}
+	}
+	if oldest.IsZero() {
+		return 0, nil
+	}
+	lag := now.Sub(oldest)
+	if lag < 0 {
+		return 0, nil
+	}
+	return lag, nil
+}
+
+func (m *Memory) QuarantinedOutboxCount(ctx context.Context, tenantFilter string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var count int64
+	for _, event := range m.outbox {
+		if tenantFilter != "" && event.TenantID != tenantFilter {
+			continue
+		}
+		state := m.outboxLeases[event.ID]
+		if state != nil && state.Quarantined {
+			count++
+		}
+	}
+	return count, nil
 }

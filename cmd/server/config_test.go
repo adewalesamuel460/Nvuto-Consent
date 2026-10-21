@@ -83,7 +83,7 @@ func TestValidateStorageConfig(t *testing.T) {
 		{
 			name: "valid database url without memory store is accepted",
 			env: map[string]string{
-				"DATABASE_URL":       "postgresql://user:pass@localhost:5433/db",
+				"DATABASE_URL":       "postgresql://user:pass@localhost:5433/db?sslmode=require",
 				"ALLOW_MEMORY_STORE": "false",
 				"ALLOW_DEV_HEADERS":  "false",
 				"ENVIRONMENT":        "production",
@@ -93,13 +93,51 @@ func TestValidateStorageConfig(t *testing.T) {
 		{
 			name: "database url set but memory store true in production is rejected",
 			env: map[string]string{
-				"DATABASE_URL":       "postgresql://user:pass@localhost:5433/db",
+				"DATABASE_URL":       "postgresql://user:pass@localhost:5433/db?sslmode=require",
 				"ALLOW_MEMORY_STORE": "true",
 				"ALLOW_DEV_HEADERS":  "false",
 				"ENVIRONMENT":        "production",
 			},
 			wantErr:      true,
 			errSubstring: "ALLOW_MEMORY_STORE=true is prohibited in production configuration",
+		},
+		{
+			name: "sslmode=disable rejected when dev headers false",
+			env: map[string]string{
+				"DATABASE_URL":      "postgresql://user:pass@localhost:5433/db?sslmode=disable",
+				"ALLOW_DEV_HEADERS": "false",
+				"ENVIRONMENT":       "development",
+			},
+			wantErr:      true,
+			errSubstring: "sslmode=disable is prohibited in production configuration (requires ALLOW_DEV_HEADERS=true)",
+		},
+		{
+			name: "sslmode=disable accepted when dev headers true in non-production",
+			env: map[string]string{
+				"DATABASE_URL":      "postgresql://user:pass@localhost:5433/db?sslmode=disable",
+				"ALLOW_DEV_HEADERS": "true",
+				"ENVIRONMENT":       "development",
+			},
+			wantErr: false,
+		},
+		{
+			name: "sslmode=verify-full accepted in production",
+			env: map[string]string{
+				"DATABASE_URL":      "postgresql://user:pass@localhost:5433/db?sslmode=verify-full",
+				"ALLOW_DEV_HEADERS": "false",
+				"ENVIRONMENT":       "production",
+			},
+			wantErr: false,
+		},
+		{
+			name: "missing sslmode in production is rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgresql://user:pass@localhost:5433/db",
+				"ALLOW_DEV_HEADERS": "false",
+				"ENVIRONMENT":       "production",
+			},
+			wantErr:      true,
+			errSubstring: "DATABASE_URL requires sslmode=verify-full or sslmode=require in production",
 		},
 	}
 

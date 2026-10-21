@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Atlasfsp/Nvuto-Consent/internal/observability"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/sync/singleflight"
 )
@@ -42,6 +43,7 @@ const (
 	RoleConsentReader = "consent_reader"
 	RoleService       = "service"
 	RoleDeveloper     = "developer"
+	RoleAuditor       = "auditor"
 )
 
 // DevHeadersAllowed reports whether development mode is explicitly enabled.
@@ -242,6 +244,7 @@ func (p *jwksProvider) refresh(ctx context.Context) error {
 	now := p.now()
 	if !p.inFlight && !p.lastAttempt.IsZero() && now.Sub(p.lastAttempt) < p.minRefreshInterval {
 		p.mu.Unlock()
+		observability.DefaultMetrics.RecordJWKSRefresh("throttled")
 		return errRefreshThrottled
 	}
 	if !p.inFlight {
@@ -257,6 +260,11 @@ func (p *jwksProvider) refresh(ctx context.Context) error {
 		fetchCtx, cancel := context.WithTimeout(context.Background(), p.fetchTimeout)
 		defer cancel()
 		keys, err := p.fetch(fetchCtx, p.url)
+		if err == nil {
+			observability.DefaultMetrics.RecordJWKSRefresh("success")
+		} else {
+			observability.DefaultMetrics.RecordJWKSRefresh("failure")
+		}
 		p.mu.Lock()
 		if err == nil {
 			p.keys = keys
@@ -327,6 +335,13 @@ func FromRequest(r *http.Request) (Principal, error) {
 	jwksURL := strings.TrimSpace(os.Getenv("JWT_JWKS_URL"))
 	secret := strings.TrimSpace(os.Getenv("JWT_HMAC_SECRET"))
 	if jwksURL != "" {
+		parsed, err := url.ParseRequestURI(jwksURL)
+		if err != nil || parsed.Host == "" {
+			return Principal{}, errors.New("JWT_JWKS_URL must be a valid URL")
+		}
+		if parsed.Scheme != "https" && !(parsed.Scheme == "http" && DevHeadersAllowed()) {
+			return Principal{}, errors.New("JWT_JWKS_URL must use https:// in production (http:// permitted only when ALLOW_DEV_HEADERS=true)")
+		}
 		issuer := strings.TrimSpace(os.Getenv("JWT_ISSUER"))
 		audience := strings.TrimSpace(os.Getenv("JWT_AUDIENCE"))
 		if issuer == "" || audience == "" {
@@ -411,8 +426,11 @@ func ValidateConfig() error {
 			return errors.New("JWKS authentication requires JWT_ISSUER and JWT_AUDIENCE")
 		}
 		parsed, err := url.ParseRequestURI(jwksURL)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			return errors.New("JWT_JWKS_URL must be a valid HTTP or HTTPS URL")
+		}
+		if parsed.Scheme != "https" && !devAllowed {
+			return errors.New("JWT_JWKS_URL must use the https:// scheme in production (http:// permitted only when ALLOW_DEV_HEADERS=true)")
 		}
 		return nil
 	}

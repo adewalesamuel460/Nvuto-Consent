@@ -349,6 +349,7 @@ func TestFromRequestUnknownKidFloodMakesOneOutboundRequest(t *testing.T) {
 	}))
 	defer server.Close()
 	const issuer, audience = "https://auth.nvuto.example/", "nvuto-consent"
+	t.Setenv("ALLOW_DEV_HEADERS", "true")
 	t.Setenv("JWT_JWKS_URL", server.URL)
 	t.Setenv("JWT_ISSUER", issuer)
 	t.Setenv("JWT_AUDIENCE", audience)
@@ -457,6 +458,7 @@ func TestAT014_Burst100UnknownKidsTriggersExactlyOneOutboundRequest(t *testing.T
 	defer server.Close()
 
 	const issuer, audience = "https://auth.nvuto.example/", "nvuto-consent"
+	t.Setenv("ALLOW_DEV_HEADERS", "true")
 	t.Setenv("JWT_JWKS_URL", server.URL)
 	t.Setenv("JWT_ISSUER", issuer)
 	t.Setenv("JWT_AUDIENCE", audience)

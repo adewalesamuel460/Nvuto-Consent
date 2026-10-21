@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"reflect"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/Atlasfsp/Nvuto-Consent/internal/auth"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
+	"github.com/Atlasfsp/Nvuto-Consent/internal/observability"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/service"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -276,7 +278,7 @@ func parsePagination(r *http.Request) (int, int, error) {
 	return limit, offset, nil
 }
 
-type correlationKey struct{}
+type correlationKey = domain.CorrelationKey
 
 func newCorrelationID() string {
 	b := make([]byte, 16)
@@ -300,8 +302,7 @@ func sanitizeCorrelationID(raw string) string {
 }
 
 func correlationID(ctx context.Context) string {
-	id, _ := ctx.Value(correlationKey{}).(string)
-	return id
+	return domain.CorrelationID(ctx)
 }
 
 // httpStatus is the single mapping from error kind to public status (T-013).
@@ -662,15 +663,18 @@ func (a api) principal(w http.ResponseWriter, r *http.Request, roles ...string) 
 	if err != nil {
 		// The reason is logged, not returned, so token problems cannot be
 		// probed through response text.
+		observability.DefaultMetrics.RecordAuthFailure("", "unauthenticated")
 		a.writeError(w, r, domain.ErrUnauthenticated.Wrap(err))
 		return auth.Principal{}, false
 	}
 	// T-030: Explicitly reject the developer role in production environments.
 	if auth.HasAnyRole(principal, auth.RoleDeveloper) && !auth.DevHeadersAllowed() {
+		observability.DefaultMetrics.RecordAuthFailure(principal.TenantID, "role_forbidden")
 		a.writeError(w, r, errRoleForbidden)
 		return auth.Principal{}, false
 	}
 	if len(roles) > 0 && !auth.HasAnyRole(principal, roles...) {
+		observability.DefaultMetrics.RecordAuthFailure(principal.TenantID, "role_forbidden")
 		a.writeError(w, r, errRoleForbidden)
 		return auth.Principal{}, false
 	}
@@ -686,6 +690,7 @@ func (a api) requireMethod(w http.ResponseWriter, r *http.Request, method string
 }
 
 var adminRoles = []string{"privacy_admin", "consent_admin", "developer"}
+var auditExportRoles = []string{auth.RolePrivacyAdmin, auth.RoleConsentAdmin, auth.RoleAuditor, auth.RoleDeveloper}
 var writerRoles = []string{"privacy_admin", "consent_admin", "consent_writer", auth.RoleSelfService, "developer"}
 var readerRoles = []string{"privacy_admin", "consent_admin", "consent_writer", "consent_reader", "service", auth.RoleSelfService, "developer"}
 
@@ -1003,6 +1008,7 @@ func (a api) consent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !subjectAuthorized(p, actionWrite, consent.SubjectID) {
+		observability.DefaultMetrics.RecordAuthFailure(p.TenantID, "subject_forbidden")
 		a.writeError(w, r, errSubjectForbidden)
 		return
 	}
@@ -1011,6 +1017,7 @@ func (a api) consent(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, r, err)
 		return
 	}
+	observability.DefaultMetrics.RecordEvaluationDecision(p.TenantID, output.Purpose, output.Channel, false, "withdrawn")
 	write(w, http.StatusOK, output)
 }
 
@@ -1036,6 +1043,7 @@ func (a api) listSuppressions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !subjectAuthorized(p, actionRead, subjectID) {
+		observability.DefaultMetrics.RecordAuthFailure(p.TenantID, "subject_forbidden")
 		a.writeError(w, r, errSubjectForbidden)
 		return
 	}
@@ -1067,6 +1075,7 @@ func (a api) createSuppression(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !subjectAuthorized(p, actionWrite, input.SubjectID) {
+		observability.DefaultMetrics.RecordAuthFailure(p.TenantID, "subject_forbidden")
 		a.writeError(w, r, errSubjectForbidden)
 		return
 	}
@@ -1096,6 +1105,7 @@ func (a api) evaluate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !subjectAuthorized(p, actionRead, input.SubjectID) {
+		observability.DefaultMetrics.RecordAuthFailure(p.TenantID, "subject_forbidden")
 		a.writeError(w, r, errSubjectForbidden)
 		return
 	}
@@ -1108,6 +1118,7 @@ func (a api) evaluate(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, r, err)
 		return
 	}
+	observability.DefaultMetrics.RecordEvaluationDecision(p.TenantID, input.Purpose, input.Channel, output.Allowed, output.Reason)
 	write(w, http.StatusOK, output)
 }
 
@@ -1125,6 +1136,7 @@ func (a api) batchEvaluate(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, request := range input.Requests {
 		if !subjectAuthorized(p, actionRead, request.SubjectID) {
+			observability.DefaultMetrics.RecordAuthFailure(p.TenantID, "subject_forbidden")
 			a.writeError(w, r, errSubjectForbidden)
 			return
 		}
@@ -1133,6 +1145,11 @@ func (a api) batchEvaluate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.writeError(w, r, err)
 		return
+	}
+	for i, req := range input.Requests {
+		if i < len(output) {
+			observability.DefaultMetrics.RecordEvaluationDecision(p.TenantID, req.Purpose, req.Channel, output[i].Allowed, output[i].Reason)
+		}
 	}
 	write(w, http.StatusOK, map[string]any{"decisions": output})
 }
@@ -1209,6 +1226,39 @@ func (a api) receipt(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, output)
 }
 
+func (a api) auditExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeMethodNotAllowed(w, r, http.MethodGet)
+		return
+	}
+	p, ok := a.principal(w, r, auditExportRoles...)
+	if !ok {
+		return
+	}
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	resourceType := strings.TrimSpace(r.URL.Query().Get("resource_type"))
+	resourceID := strings.TrimSpace(r.URL.Query().Get("resource_id"))
+
+	items, total, err := a.svc.ListAuditEvents(r.Context(), p.TenantID, resourceType, resourceID, limit, offset)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	if items == nil {
+		items = []domain.AuditEvent{}
+	}
+	write(w, http.StatusOK, listResponse[domain.AuditEvent]{
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
+}
+
 // ValidateAuthConfig exposes the authentication configuration validation check (T-015).
 func ValidateAuthConfig() error {
 	return auth.ValidateConfig()
@@ -1277,7 +1327,7 @@ func (a api) withRequestContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cid := sanitizeCorrelationID(r.Header.Get(correlationHeader))
 		w.Header().Set(correlationHeader, cid)
-		ctx := context.WithValue(r.Context(), correlationKey{}, cid)
+		ctx := domain.WithCorrelationID(r.Context(), cid)
 		r = r.WithContext(ctx)
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -1312,6 +1362,7 @@ func newHandler(svc *service.Service, timeout time.Duration, logger *slog.Logger
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.healthz)
 	mux.HandleFunc("/readyz", a.ready)
+	mux.Handle("/metrics", observability.Handler())
 	mux.HandleFunc("/v1/purposes", a.purposes)
 	mux.HandleFunc("/v1/lawful-bases", a.lawfulBases)
 	mux.HandleFunc("/v1/notices", a.notices)
@@ -1324,6 +1375,7 @@ func newHandler(svc *service.Service, timeout time.Duration, logger *slog.Logger
 	mux.HandleFunc("/v1/double-opt-in", a.startDoubleOptIn)
 	mux.HandleFunc("/v1/double-opt-in/confirm", a.confirmDoubleOptIn)
 	mux.HandleFunc("/v1/receipts/", a.receipt)
+	mux.HandleFunc("/v1/audit", a.auditExport)
 
 	var h http.Handler = mux
 	if timeout > 0 {
@@ -1337,7 +1389,7 @@ func newHandler(svc *service.Service, timeout time.Duration, logger *slog.Logger
 			th.ServeHTTP(&timeoutHeaderWriter{ResponseWriter: w}, r)
 		})
 	}
-	return a.withRequestContext(h)
+	return a.withRequestContext(observability.DefaultMetrics.HTTPMiddleware(h))
 }
 
 // requestTimeout reads REQUEST_TIMEOUT (a Go duration). Invalid or
@@ -1355,6 +1407,29 @@ func requestTimeout(logger *slog.Logger) time.Duration {
 		return defaultRequestTimeout
 	}
 	return value
+}
+
+func validateDatabaseTLS(databaseURL string, allowDev, isProduction bool) error {
+	u, err := url.Parse(databaseURL)
+	var sslmode string
+	if err == nil && u != nil {
+		sslmode = strings.ToLower(strings.TrimSpace(u.Query().Get("sslmode")))
+	}
+	if sslmode == "" {
+		for _, part := range strings.Fields(databaseURL) {
+			if strings.HasPrefix(strings.ToLower(part), "sslmode=") {
+				sslmode = strings.ToLower(strings.TrimPrefix(part, "sslmode="))
+				break
+			}
+		}
+	}
+	if sslmode == "disable" && !allowDev {
+		return errors.New("sslmode=disable is prohibited in production configuration (requires ALLOW_DEV_HEADERS=true)")
+	}
+	if isProduction && sslmode != "verify-full" && sslmode != "require" && sslmode != "verify-ca" {
+		return errors.New("DATABASE_URL requires sslmode=verify-full or sslmode=require in production")
+	}
+	return nil
 }
 
 // validateStorageConfig validates storage-related configuration. It strictly
@@ -1379,6 +1454,9 @@ func validateStorageConfig() error {
 		}
 		if allowMemory && (isProduction || !allowDev) {
 			return errors.New("ALLOW_MEMORY_STORE=true is prohibited in production configuration")
+		}
+		if err := validateDatabaseTLS(databaseURL, allowDev, isProduction); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -1422,6 +1500,27 @@ func main() {
 		repo = postgres
 		closeStore = postgres.Close
 		logger.Info("using_postgresql_storage")
+
+		// Periodically instrument DB pool saturation metrics
+		stopPoolMetrics := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopPoolMetrics:
+					return
+				case <-ticker.C:
+					stat := postgres.Pool().Stat()
+					observability.DefaultMetrics.UpdateDBPool(stat.AcquiredConns(), stat.IdleConns(), stat.TotalConns(), stat.MaxConns())
+				}
+			}
+		}()
+		prevClose := closeStore
+		closeStore = func() {
+			close(stopPoolMetrics)
+			prevClose()
+		}
 	} else {
 		repo = store.NewMemory()
 		logger.Warn("using_non_durable_memory_storage")

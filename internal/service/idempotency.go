@@ -19,6 +19,53 @@ var ErrIdempotencyUnsupported = domain.ErrInternal.Derive("idempotency_unsupport
 // ErrSubjectForbidden indicates the caller lacks authority for the requested customer subject.
 var ErrSubjectForbidden = domain.ErrForbidden.Derive("subject_not_authorized", "subject not authorized")
 
+// SemanticFingerprint represents the core semantic intent of a consent creation request,
+// deliberately ignoring transient fields like the specific actor ID (to allow replays after token
+// rotation) and exact wall-clock collection timestamps (T-025).
+type SemanticFingerprint struct {
+	TenantID       string            `json:"tenant_id"`
+	SubjectID      string            `json:"subject_id"`
+	Purpose        string            `json:"purpose"`
+	Channel        string            `json:"channel"`
+	LegalBasis     string            `json:"legal_basis"`
+	Status         domain.Status     `json:"status"`
+	Source         string            `json:"source"`
+	Scope          map[string]string `json:"scope,omitempty"`
+	ExpiresAt      *string           `json:"expires_at,omitempty"`
+	Jurisdiction   string            `json:"jurisdiction"`
+	NoticeVersion  string            `json:"notice_version"`
+	EvidenceMethod string            `json:"evidence_method,omitempty"`
+	ArtifactHash   string            `json:"artifact_hash,omitempty"`
+}
+
+// ComputeSemanticHash computes the canonical SHA-256 fingerprint representing the semantic
+// intent of the consent payload.
+func ComputeSemanticHash(tenantID, subjectID, purpose, channel, legalBasis string, status domain.Status, source string, scope map[string]string, expiresAt *time.Time, jurisdiction, noticeVersion string, evidence domain.Evidence) string {
+	var exp *string
+	if expiresAt != nil {
+		s := expiresAt.UTC().Format(time.RFC3339)
+		exp = &s
+	}
+	fp := SemanticFingerprint{
+		TenantID:       tenantID,
+		SubjectID:      subjectID,
+		Purpose:        purpose,
+		Channel:        channel,
+		LegalBasis:     legalBasis,
+		Status:         status,
+		Source:         source,
+		Scope:          scope,
+		ExpiresAt:      exp,
+		Jurisdiction:   jurisdiction,
+		NoticeVersion:  noticeVersion,
+		EvidenceMethod: evidence.Method,
+		ArtifactHash:   evidence.ArtifactHash,
+	}
+	encoded, _ := json.Marshal(fp)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
 type governedFingerprint struct {
 	TenantID      string            `json:"tenant_id"`
 	ActorID       string            `json:"actor_id"`
@@ -43,13 +90,13 @@ func fingerprintGoverned(input governedFingerprint) string {
 
 // RecordGovernedIdempotent records a governed consent at most once per
 // idempotency key. The request is validated and admitted exactly like
-// RecordGoverned; the fingerprint is computed over the normalized request so
-// cosmetic differences (case, whitespace) replay instead of conflicting.
+// RecordGoverned; the semantic fingerprint is computed over the normalized request so
+// cosmetic differences (case, whitespace, actor rotation) replay instead of conflicting.
 //
 // A replay of an already recorded idempotency key returns the exact original
 // 201 response snapshot, even if the policy was subsequently updated or the
 // consent was subsequently withdrawn (T-025). The caller's subject authorization
-// is re-evaluated before returning the snapshot.
+// is strictly re-evaluated before returning the snapshot.
 func (s *Service) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, tenantID, actorID, subjectID, purposeCode, channel, legalBasis, status, source string, scope map[string]string, expiresAt *time.Time, jurisdiction, noticeVersion string, evidence domain.Evidence, subjectScopes ...SubjectScope) (domain.Consent, error) {
 	checkedAt := time.Now().UTC()
 	in, err := normalizeGoverned(tenantID, actorID, subjectID, purposeCode, channel, legalBasis, status, source, scope, expiresAt, jurisdiction, noticeVersion, evidence, checkedAt)
@@ -73,9 +120,11 @@ func (s *Service) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, 
 		return domain.Consent{}, ErrIdempotencyUnsupported
 	}
 
-	// Same field normalization as before T-027, so fingerprints of keys
-	// stored by earlier releases still replay.
-	requestHash := fingerprintGoverned(governedFingerprint{
+	// Compute semantic hash ignoring transient actor and exact wall-clock times (T-025).
+	requestHash := ComputeSemanticHash(in.TenantID, in.SubjectID, in.Purpose, in.Channel, in.LegalBasis, in.Status, in.Source, in.Scope, in.ExpiresAt, in.Jurisdiction, in.NoticeVersion, in.Evidence)
+
+	// Legacy fallback hash for pre-T-025 stored records.
+	legacyRequestHash := fingerprintGoverned(governedFingerprint{
 		TenantID: in.TenantID, ActorID: in.ActorID, SubjectID: in.SubjectID, Purpose: in.Purpose, Channel: in.Channel,
 		LegalBasis: in.LegalBasis, Status: in.Status, Source: in.Source, Scope: in.Scope, ExpiresAt: in.ExpiresAt,
 		Jurisdiction: in.Jurisdiction, NoticeVersion: in.NoticeVersion, Evidence: in.Evidence,
@@ -87,7 +136,7 @@ func (s *Service) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, 
 	if snapshot, storedHash, found, err := repo.FindIdempotencySnapshot(ctx, in.TenantID, idempotencyKey); err != nil {
 		return domain.Consent{}, err
 	} else if found {
-		if storedHash != requestHash {
+		if storedHash != requestHash && storedHash != legacyRequestHash {
 			return domain.Consent{}, store.ErrConflict
 		}
 		if !subScope.Permits(snapshot.SubjectID) {

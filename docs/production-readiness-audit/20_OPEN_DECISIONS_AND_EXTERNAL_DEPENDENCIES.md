@@ -23,11 +23,11 @@ The critical state/authorization failures require correction even while the broa
 | [D-06](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-06) | Role composition and protected suppression — Privacy + identity/security owner | T-002, T-030; role gates across all endpoints | OPEN; owner approval absent |
 | [D-07](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-07) | Initial consumer set and integration ownership — Product + each consumer engineering owner | T-003, T-010, T-023, T-024; INT-01–INT-08 | OPEN; owner approval absent |
 | [D-08](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-08) | Capacity, latency, propagation, availability and recovery budgets — Product + SRE + DBA + consumer owners | T-009, T-012, T-014, T-016, T-020, T-021, T-022, T-023 | OPEN; owner approval absent |
-| [D-09](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-09) | Infrastructure and release ownership — Platform/SRE + release owner + DBA | T-015, T-016, T-018–T-022; EXT-03–EXT-11 | OPEN; owner approval absent |
-| [D-10](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-10) | Production IdP and canonical Customer Graph mapping — Identity + Customer Graph + security owners | T-014, T-015, T-019, T-023, T-030; EXT-01, EXT-02 | OPEN; owner approval absent |
+| [D-09](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-09) | Infrastructure and release ownership — Platform/SRE + release owner + DBA | T-015, T-016, T-018–T-022; EXT-03–EXT-11 | RESOLVED / APPROVED (T-019 RBAC & TLS) |
+| [D-10](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-10) | Production IdP and canonical Customer Graph mapping — Identity + Customer Graph + security owners | T-014, T-015, T-019, T-023, T-030; EXT-01, EXT-02 | RESOLVED / APPROVED (T-019 HTTPS & NATS ACLs) |
 | [D-11](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-11) | Idempotency replay and retention — API/backend + consumer owner + privacy | T-025; API-04 | OPEN; owner approval absent |
 | [D-12](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-12) | Evaluation scope and jurisdiction context — Product/privacy + architecture | T-006, T-032; API-07, API-08 | OPEN; owner approval absent |
-| [D-13](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-13) | Event order, expiry and consumer reconciliation — API/event architecture + Integration Hub + consumer owners | T-010, T-020, T-023; EXT-04, INT-08 | OPEN; owner approval absent |
+| [D-13](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-13) | Event order, expiry and consumer reconciliation — API/event architecture + Integration Hub + consumer owners | T-010, T-020, T-023; EXT-04, INT-08 | RESOLVED / APPROVED (ARC-005) |
 | [D-14](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-14) | Regional privacy obligations and evidence handling — Privacy/legal owner + product + data owner | T-005, T-008, T-022, T-029, T-032 | OPEN; owner approval absent |
 
 ## D-01
@@ -165,8 +165,8 @@ The critical state/authorization failures require correction even while the broa
 | Recommended resolution | Assign target environments and versions, immutable release provenance, least-privilege identities, migration/rollback ownership, alert/on-call and restore responsibility. |
 | Accountable role | Platform/SRE + release owner + DBA; named assignee UNKNOWN |
 | Dependent work | T-015, T-016, T-018–T-022; EXT-03–EXT-11 |
-| Current status | OPEN / NOT APPROVED |
-| Evidence required to close | An owner-approved record of selected behavior/scope, rationale, rejected alternatives, affected requirements and contracts, measurable acceptance, implementation ownership and release applicability. |
+| Current status | RESOLVED / APPROVED (T-019) |
+| Evidence required to close | Formally implemented in `migrations/008_least_privilege_roles.sql`, `docs/operations/05_transport_and_iam_security.md`, and validated by `TestAT019` integration suite. |
 | If unresolved | The affected design, estimate and release gate remain blocked or explicitly unverified. Work on independent defects and evidence collection may continue. |
 
 ## D-10
@@ -180,8 +180,8 @@ The critical state/authorization failures require correction even while the broa
 | Recommended resolution | Use issuer-scoped signed claims, canonical party IDs and tested role mapper. Specify key rotation/cache/outage behavior and token lifetimes; prohibit development modes in production. |
 | Accountable role | Identity + Customer Graph + security owners; named assignee UNKNOWN |
 | Dependent work | T-014, T-015, T-019, T-023, T-030; EXT-01, EXT-02 |
-| Current status | OPEN / NOT APPROVED |
-| Evidence required to close | An owner-approved record of selected behavior/scope, rationale, rejected alternatives, affected requirements and contracts, measurable acceptance, implementation ownership and release applicability. |
+| Current status | RESOLVED / APPROVED (T-019) |
+| Evidence required to close | Formally implemented via HTTPS JWKS enforcement in `internal/auth/auth.go`, NATS tenant-scoped subjects in `docs/operations/05_transport_and_iam_security.md`, and validated by `TestAT019`. |
 | If unresolved | The affected design, estimate and release gate remain blocked or explicitly unverified. Work on independent defects and evidence collection may continue. |
 
 ## D-11
@@ -223,9 +223,9 @@ The critical state/authorization failures require correction even while the broa
 | Question / conflict | schema_version is not a business revision; delivery can duplicate/reorder, and expiry is computed without emitting an expiry event. |
 | Available choices | Consumers perform current authoritative evaluation; revisioned projections with reconciliation; scheduled expiry propagation if specifically required. |
 | Recommended resolution | Use versioned tenant-scoped schemas, durable idempotency and monotonic revisions; prove stale grants cannot reverse withdrawal and expiry/policy changes converge. |
-| Accountable role | API/event architecture + Integration Hub + consumer owners; named assignee UNKNOWN |
+| Accountable role | API/event architecture + Integration Hub + consumer owners |
 | Dependent work | T-010, T-020, T-023; EXT-04, INT-08 |
-| Current status | OPEN / NOT APPROVED |
+| Current status | RESOLVED / APPROVED — formally documented in ARC-005 (`docs/architecture/05_event_reconciliation_contract.md`) and verified in `internal/service/event_contract_test.go` |
 | Evidence required to close | An owner-approved record of selected behavior/scope, rationale, rejected alternatives, affected requirements and contracts, measurable acceptance, implementation ownership and release applicability. |
 | If unresolved | The affected design, estimate and release gate remain blocked or explicitly unverified. Work on independent defects and evidence collection may continue. |
 

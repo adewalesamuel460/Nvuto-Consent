@@ -16,4 +16,9 @@ Do not drop the added tables or columns during an incident rollback. Doing so wo
 
 `009_legacy_quarantine_reconciliation.sql` is additive (`consent_legacy_reconciliation` audit table and `view_consent_legacy_classification` view). Rolling back application code to a pre-009 image is schema-safe: older binaries do not reference the reconciliation table or view. Do not drop the table or view during an incident rollback; retain reconciliation audit records and roll forward if fixes are required.
 
+`009_audit_history_enhancement.sql` is additive (`consent_audit_events` columns: `resource_type`, `resource_id`, `revision`, `before_state`, `after_state`, `correlation_id`, `reason`, index `idx_consent_audit_export`, and the `trg_consent_audit_immutable` trigger enforcing strict append-only immutability against UPDATE and DELETE). Rolling back application binaries to a prior image is schema-safe: older binaries continue to insert rows using defaults and cannot mutate existing audit rows. Do not drop added audit columns or disable the immutability trigger during an incident rollback, as this would compromise the cryptographic and legal integrity of the compliance audit trail; prefer forward corrective fixes if necessary.
+
+`010_idempotency_snapshots.sql` is additive (`consent_idempotency` columns: `request_hash`, `response_snapshot`, `original_response`, and the retention index `idx_consent_idempotency_retention`). It backfills between `original_response` and `response_snapshot` for historical rows. Rolling back application code to a pre-010 image is schema-safe: older binaries continue to query and insert into `consent_idempotency` using existing columns and defaults. Do not drop added columns or the retention index during an incident rollback; keep the schema and roll forward if fixes are required.
+
+
 

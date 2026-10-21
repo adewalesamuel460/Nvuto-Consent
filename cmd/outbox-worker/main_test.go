@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -322,4 +323,214 @@ func TestWorkerReadyzReflectsDependencies(t *testing.T) {
 			t.Fatalf("expected status: ready, got %v", body["status"])
 		}
 	})
+}
+
+func TestDatabaseTLSValidation(t *testing.T) {
+	tests := []struct {
+		name         string
+		url          string
+		allowDev     bool
+		isProduction bool
+		wantErr      bool
+		errSubstring string
+	}{
+		{
+			name:         "disable rejected outside dev",
+			url:          "postgresql://user:pass@localhost:5432/db?sslmode=disable",
+			allowDev:     false,
+			isProduction: false,
+			wantErr:      true,
+			errSubstring: "sslmode=disable is prohibited",
+		},
+		{
+			name:         "disable allowed with allowDev",
+			url:          "postgresql://user:pass@localhost:5432/db?sslmode=disable",
+			allowDev:     true,
+			isProduction: false,
+			wantErr:      false,
+		},
+		{
+			name:         "require allowed in production",
+			url:          "postgresql://user:pass@localhost:5432/db?sslmode=require",
+			allowDev:     false,
+			isProduction: true,
+			wantErr:      false,
+		},
+		{
+			name:         "verify-full allowed in production",
+			url:          "postgresql://user:pass@localhost:5432/db?sslmode=verify-full",
+			allowDev:     false,
+			isProduction: true,
+			wantErr:      false,
+		},
+		{
+			name:         "missing sslmode rejected in production",
+			url:          "postgresql://user:pass@localhost:5432/db",
+			allowDev:     false,
+			isProduction: true,
+			wantErr:      true,
+			errSubstring: "DATABASE_URL requires sslmode=verify-full or sslmode=require in production",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDatabaseTLS(tc.url, tc.allowDev, tc.isProduction)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if tc.errSubstring != "" && !strings.Contains(err.Error(), tc.errSubstring) {
+					t.Fatalf("expected error containing %q, got %q", tc.errSubstring, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigureNATS(t *testing.T) {
+	t.Run("missing URL returns error", func(t *testing.T) {
+		_, err := configureNATS(natsConfig{AllowInsecure: true})
+		if err == nil || !strings.Contains(err.Error(), "NATS_URL is required") {
+			t.Fatalf("expected NATS_URL is required error, got %v", err)
+		}
+	})
+
+	t.Run("rejects non-TLS URL when insecure not allowed", func(t *testing.T) {
+		_, err := configureNATS(natsConfig{
+			URL:           "nats://localhost:4222",
+			AllowInsecure: false,
+			CredsFile:     "test.creds",
+		})
+		if err == nil || !strings.Contains(err.Error(), "must use tls:// scheme") {
+			t.Fatalf("expected tls:// scheme error, got %v", err)
+		}
+	})
+
+	t.Run("rejects missing auth when insecure not allowed", func(t *testing.T) {
+		_, err := configureNATS(natsConfig{
+			URL:           "tls://localhost:4222",
+			AllowInsecure: false,
+		})
+		if err == nil || !strings.Contains(err.Error(), "authentication credentials") {
+			t.Fatalf("expected auth credentials error, got %v", err)
+		}
+	})
+
+	t.Run("rejects partial client cert/key", func(t *testing.T) {
+		_, err := configureNATS(natsConfig{
+			URL:           "tls://localhost:4222",
+			ClientCert:    "cert.pem",
+			AllowInsecure: false,
+		})
+		if err == nil || !strings.Contains(err.Error(), "both NATS_CLIENT_CERT and NATS_CLIENT_KEY") {
+			t.Fatalf("expected both cert and key error, got %v", err)
+		}
+	})
+
+	t.Run("accepts insecure nats:// when allowInsecure=true", func(t *testing.T) {
+		opts, err := configureNATS(natsConfig{
+			URL:           "nats://localhost:4222",
+			AllowInsecure: true,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(opts) == 0 {
+			t.Fatalf("expected options to be populated")
+		}
+	})
+}
+
+type fakeWorkerClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeWorkerClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeWorkerClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+func TestAT021_WorkerQuarantinesPoisonEventAndAllowsManualReplay(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeWorkerClock{now: time.Date(2026, 10, 21, 14, 0, 0, 0, time.UTC)}
+	m := store.NewMemory()
+	m.SetClock(clock.Now)
+
+	if err := m.AppendOutbox(ctx, domain.OutboxEvent{
+		ID:            "evt-worker-poison",
+		TenantID:      "tenant-obs",
+		EventType:     "consent.granted",
+		AggregateType: "consent",
+		AggregateID:   "con-obs-1",
+		Payload:       map[string]any{"customer": "c1"},
+		OccurredAt:    clock.now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	publishCalls := 0
+	publishErr := errors.New("simulated jetstream broker outage")
+	w := newWorker(m, func(_ context.Context, item event) error {
+		publishCalls++
+		return publishErr
+	}, "worker-obs")
+	w.now = clock.Now
+	w.maxAttempts = 5
+
+	soft, cancelSoft := context.WithCancel(ctx)
+	defer cancelSoft()
+	hard, cancelHard := context.WithCancel(ctx)
+	defer cancelHard()
+
+	// 5 cycles: each encounters failure, retries, and the 5th quarantines
+	for i := 0; i < 5; i++ {
+		w.cycle(soft, hard)
+		clock.Advance(30 * time.Minute)
+	}
+
+	if publishCalls != 5 {
+		t.Fatalf("expected 5 publish attempts, got %d", publishCalls)
+	}
+
+	state, ok := m.OutboxLease("evt-worker-poison")
+	if !ok || !state.Quarantined {
+		t.Fatalf("expected event to be quarantined after 5 failed attempts, got state: %+v", state)
+	}
+	if state.QuarantineReason != publishErr.Error() {
+		t.Fatalf("expected quarantine reason %q, got %q", publishErr.Error(), state.QuarantineReason)
+	}
+
+	// Subsequent cycle should skip quarantined event
+	if full := w.cycle(soft, hard); full {
+		t.Fatal("expected empty queue (not full) while event is quarantined")
+	}
+
+	// Manual replay by operator
+	if err := m.ReplayOutbox(ctx, "evt-worker-poison"); err != nil {
+		t.Fatalf("ReplayOutbox failed: %v", err)
+	}
+
+	// Broker recovers
+	publishErr = nil
+
+	// Next cycle claims and completes successfully
+	w.cycle(soft, hard)
+
+	replayedState, _ := m.OutboxLease("evt-worker-poison")
+	if replayedState.PublishedAt == nil {
+		t.Fatal("expected event to be completed and published after manual replay and broker recovery")
+	}
 }

@@ -133,3 +133,29 @@ func TestGovernedConsentIdempotencySubjectAuthorizationReevaluated(t *testing.T)
 		t.Fatalf("expected subject cus-1, got %v", replayAdmin.SubjectID)
 	}
 }
+
+func TestGovernedConsentIdempotencyTokenRotationAndWallClockTolerance(t *testing.T) {
+	repo := store.NewMemory()
+	svc := New(repo)
+	installPolicyFixture(t, svc, "tenant-a")
+	evidence1 := domain.Evidence{Method: "preference_center", ArtifactHash: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", CollectedAt: time.Now().UTC()}
+
+	// 1. Initial creation by actor-1
+	first, err := svc.RecordGovernedIdempotent(context.Background(), "key-rotation-1", "tenant-a", "actor-1", "cus-1", "marketing", "email", "consent", "granted", "portal", nil, nil, "NG", "2026-08", evidence1)
+	if err != nil {
+		t.Fatalf("first creation failed: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	// 2. Replay with different actor (token rotation) and later wall-clock time
+	evidence2 := domain.Evidence{Method: "preference_center", ArtifactHash: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", CollectedAt: time.Now().UTC()}
+	second, err := svc.RecordGovernedIdempotent(context.Background(), "key-rotation-1", "tenant-a", "actor-rotated-2", "cus-1", "marketing", "email", "consent", "granted", "portal", nil, nil, "NG", "2026-08", evidence2)
+	if err != nil {
+		t.Fatalf("replay with rotated token/wall-clock failed: %v", err)
+	}
+
+	if first.ID != second.ID || first.ReceiptID != second.ReceiptID {
+		t.Fatalf("replay must return identical original snapshot: first=%+v second=%+v", first, second)
+	}
+}

@@ -27,7 +27,11 @@ func (m *Memory) FindIdempotencySnapshot(ctx context.Context, tenantID, idempKey
 	if !ok {
 		return domain.Consent{}, "", false, nil
 	}
-	return cloneConsent(entry.ResponseSnapshot), entry.RequestHash, true, nil
+	snap := entry.OriginalResponse
+	if snap.ID == "" {
+		snap = entry.ResponseSnapshot
+	}
+	return cloneConsent(snap), entry.RequestHash, true, nil
 }
 
 func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempKey, requestHash string, consent domain.Consent, receipt domain.ConsentReceipt, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error) {
@@ -42,7 +46,11 @@ func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempKey, request
 		if existing.RequestHash != requestHash {
 			return domain.Consent{}, ErrConflict
 		}
-		return cloneConsent(existing.ResponseSnapshot), nil
+		snap := existing.OriginalResponse
+		if snap.ID == "" {
+			snap = existing.ResponseSnapshot
+		}
+		return cloneConsent(snap), nil
 	}
 	cKey := consentKey{tenantID: consent.TenantID, consentID: consent.ID}
 	if _, exists := m.consents[cKey]; exists {
@@ -66,6 +74,7 @@ func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempKey, request
 		RequestHash:      requestHash,
 		ConsentID:        consent.ID,
 		ResponseSnapshot: clonedConsent,
+		OriginalResponse: clonedConsent,
 	}
 	return cloneConsent(consent), nil
 }
@@ -73,7 +82,11 @@ func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempKey, request
 func (p *Postgres) FindIdempotencySnapshot(ctx context.Context, tenantID, idempKey string) (domain.Consent, string, bool, error) {
 	var storedHash, storedConsentID string
 	var snapshotBytes []byte
-	err := p.pool.QueryRow(ctx, `SELECT request_hash, consent_id, response_snapshot FROM consent_idempotency WHERE tenant_id=$1 AND idempotency_key=$2`, tenantID, idempKey).Scan(&storedHash, &storedConsentID, &snapshotBytes)
+	err := p.pool.QueryRow(ctx, `
+		SELECT request_hash, consent_id, COALESCE(NULLIF(original_response, '{}'::jsonb), response_snapshot)
+		FROM consent_idempotency
+		WHERE tenant_id=$1 AND idempotency_key=$2
+	`, tenantID, idempKey).Scan(&storedHash, &storedConsentID, &snapshotBytes)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Consent{}, "", false, nil
@@ -106,7 +119,12 @@ func (p *Postgres) RecordGovernedIdempotent(ctx context.Context, idempotencyKey,
 	err := p.inTx(ctx, func(tx pgx.Tx) error {
 		var storedHash, storedConsentID string
 		var snapshotBytes []byte
-		err := tx.QueryRow(ctx, `SELECT request_hash, consent_id, response_snapshot FROM consent_idempotency WHERE tenant_id=$1 AND idempotency_key=$2 FOR UPDATE`, consent.TenantID, idempotencyKey).Scan(&storedHash, &storedConsentID, &snapshotBytes)
+		err := tx.QueryRow(ctx, `
+			SELECT request_hash, consent_id, COALESCE(NULLIF(original_response, '{}'::jsonb), response_snapshot)
+			FROM consent_idempotency
+			WHERE tenant_id=$1 AND idempotency_key=$2
+			FOR UPDATE
+		`, consent.TenantID, idempotencyKey).Scan(&storedHash, &storedConsentID, &snapshotBytes)
 		if err == nil {
 			if storedHash != requestHash {
 				return ErrConflict
@@ -138,10 +156,12 @@ func (p *Postgres) RecordGovernedIdempotent(ctx context.Context, idempotencyKey,
 		if err != nil {
 			return domain.ErrInternal.Wrap(err)
 		}
-		err = tx.QueryRow(ctx, `INSERT INTO consent_idempotency(tenant_id,idempotency_key,request_hash,consent_id,response_snapshot,created_at)
-		VALUES($1,$2,$3,$4,$5,$6)
-		ON CONFLICT(tenant_id,idempotency_key) DO UPDATE SET idempotency_key=excluded.idempotency_key
-		RETURNING request_hash,consent_id,response_snapshot`, consent.TenantID, idempotencyKey, requestHash, result.ID, snapJSON, time.Now().UTC()).Scan(&storedHash, &storedConsentID, &snapshotBytes)
+		err = tx.QueryRow(ctx, `
+			INSERT INTO consent_idempotency(tenant_id, idempotency_key, request_hash, consent_id, response_snapshot, original_response, created_at)
+			VALUES($1, $2, $3, $4, $5, $5, $6)
+			ON CONFLICT(tenant_id, idempotency_key) DO UPDATE SET idempotency_key=excluded.idempotency_key
+			RETURNING request_hash, consent_id, COALESCE(NULLIF(original_response, '{}'::jsonb), response_snapshot)
+		`, consent.TenantID, idempotencyKey, requestHash, result.ID, snapJSON, time.Now().UTC()).Scan(&storedHash, &storedConsentID, &snapshotBytes)
 		if err != nil {
 			return classify(err)
 		}

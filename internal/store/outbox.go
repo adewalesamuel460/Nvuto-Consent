@@ -25,18 +25,22 @@ var ErrOutboxClaimLost = ErrLeaseLost
 
 // OutboxRecord is one pending outbox event as seen by a publisher.
 type OutboxRecord struct {
-	ID            string          `json:"id"`
-	SchemaVersion int             `json:"schema_version"`
-	Source        string          `json:"source"`
-	TenantID      string          `json:"tenant_id"`
-	EventType     string          `json:"event_type"`
-	AggregateType string          `json:"aggregate_type"`
-	AggregateID   string          `json:"aggregate_id"`
-	Payload       json.RawMessage `json:"payload"`
-	OccurredAt    time.Time       `json:"occurred_at"`
+	ID                string          `json:"id"`
+	SchemaVersion     int             `json:"schema_version"`
+	Source            string          `json:"source"`
+	TenantID          string          `json:"tenant_id"`
+	EventType         string          `json:"event_type"`
+	AggregateType     string          `json:"aggregate_type"`
+	AggregateID       string          `json:"aggregate_id"`
+	AggregateRevision int64           `json:"aggregate_revision"`
+	Payload           json.RawMessage `json:"payload"`
+	OccurredAt        time.Time       `json:"occurred_at"`
 	// Attempts is the number of earlier claims of this row (excluding this one).
-	Attempts   int    `json:"attempts"`
-	ClaimToken string `json:"claim_token,omitempty"`
+	Attempts         int        `json:"attempts"`
+	ClaimToken       string     `json:"claim_token,omitempty"`
+	Quarantined      bool       `json:"quarantined,omitempty"`
+	QuarantinedAt    *time.Time `json:"quarantined_at,omitempty"`
+	QuarantineReason string     `json:"quarantine_reason,omitempty"`
 }
 
 // OutboxClaim is a batch of rows locked under a single token.
@@ -69,6 +73,14 @@ type OutboxLeaser interface {
 	RescheduleOutbox(ctx context.Context, id, token string, delay time.Duration) error
 	// ReleaseOutboxBatch releases uncommitted claimed events during graceful shutdown.
 	ReleaseOutboxBatch(ctx context.Context, workerID string, events []OutboxRecord) error
+	// QuarantineOutbox isolates a poison event that exceeded max retry attempts.
+	QuarantineOutbox(ctx context.Context, id, token string, reason string) error
+	// ReplayOutbox manually resets a quarantined event back to actionable state.
+	ReplayOutbox(ctx context.Context, id string) error
+	// OutboxLag returns the age of the oldest unpublished, non-quarantined event.
+	OutboxLag(ctx context.Context, tenantFilter string) (time.Duration, error)
+	// QuarantinedOutboxCount returns the number of quarantined events.
+	QuarantinedOutboxCount(ctx context.Context, tenantFilter string) (int64, error)
 }
 
 // newClaimToken returns 128 random bits as 32 lowercase hex characters.

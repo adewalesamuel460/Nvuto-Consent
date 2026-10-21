@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type Status string
 
@@ -202,37 +205,59 @@ func (c DoubleOptInChallenge) ToResponse() DoubleOptInResponse {
 }
 
 type AuditEvent struct {
-	ID           string         `json:"id"`
-	TenantID     string         `json:"tenant_id"`
-	ActorID      string         `json:"actor_id"`
-	Action       string         `json:"action"`
-	ConsentID    string         `json:"consent_id"`
-	ResourceType string         `json:"resource_type,omitempty"`
-	Revision     int64          `json:"revision,omitempty"`
-	Changes      map[string]any `json:"changes,omitempty"`
-	OccurredAt   time.Time      `json:"occurred_at"`
+	ID            string         `json:"id"`
+	TenantID      string         `json:"tenant_id"`
+	ActorID       string         `json:"actor_id"`
+	Action        string         `json:"action"`
+	ConsentID     string         `json:"consent_id"`
+	ResourceType  string         `json:"resource_type,omitempty"`
+	ResourceID    string         `json:"resource_id,omitempty"`
+	Revision      int64          `json:"revision,omitempty"`
+	BeforeState   map[string]any `json:"before_state,omitempty"`
+	AfterState    map[string]any `json:"after_state,omitempty"`
+	CorrelationID string         `json:"correlation_id,omitempty"`
+	Reason        string         `json:"reason,omitempty"`
+	Changes       map[string]any `json:"changes,omitempty"`
+	OccurredAt    time.Time      `json:"occurred_at"`
+}
+
+type CorrelationKey struct{}
+
+// WithCorrelationID stores a correlation identifier in the context.
+func WithCorrelationID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, CorrelationKey{}, id)
+}
+
+// CorrelationID retrieves the correlation identifier from context, or empty string if not set.
+func CorrelationID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(CorrelationKey{}).(string)
+	return id
 }
 
 type OutboxEvent struct {
-	ID            string         `json:"id"`
-	SchemaVersion int            `json:"schema_version"`
-	Source        string         `json:"source"`
-	TenantID      string         `json:"tenant_id"`
-	EventType     string         `json:"event_type"`
-	AggregateType string         `json:"aggregate_type"`
-	AggregateID   string         `json:"aggregate_id"`
-	Payload       map[string]any `json:"payload"`
-	OccurredAt    time.Time      `json:"occurred_at"`
-	ClaimToken    string         `json:"claim_token,omitempty"`
+	ID                string         `json:"id"`
+	SchemaVersion     int            `json:"schema_version"`
+	Source            string         `json:"source"`
+	TenantID          string         `json:"tenant_id"`
+	EventType         string         `json:"event_type"`
+	AggregateType     string         `json:"aggregate_type"`
+	AggregateID       string         `json:"aggregate_id"`
+	AggregateRevision int64          `json:"aggregate_revision"`
+	Payload           map[string]any `json:"payload"`
+	OccurredAt        time.Time      `json:"occurred_at"`
+	ClaimToken        string         `json:"claim_token,omitempty"`
 }
 
 // T-030: Role authority and protection helpers.
 
 // IsAdministrativeRole reports whether role is an administrative authority
-// (privacy_admin, consent_admin, or developer).
+// (privacy_admin, consent_admin, developer, or auditor).
 func IsAdministrativeRole(role string) bool {
 	switch role {
-	case "privacy_admin", "consent_admin", "developer":
+	case "privacy_admin", "consent_admin", "developer", "auditor":
 		return true
 	default:
 		return false

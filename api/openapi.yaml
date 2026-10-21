@@ -599,6 +599,52 @@ paths:
         '503':
           $ref: '#/components/responses/503ServiceUnavailable'
 
+  /v1/audit:
+    get:
+      summary: Export immutable audit log events
+      description: |
+        Retrieves a paginated list of immutable audit log events scoped strictly to the caller's tenant.
+        Events contain before/after state captures, resource revisions, correlation IDs, and reasons
+        enabling full historical reconstruction of policy and preference changes.
+        Strictly restricted to administrative roles (privacy_admin, consent_admin, auditor, developer).
+      parameters:
+        - name: resource_type
+          in: query
+          required: false
+          description: Optional filter by resource type (e.g., purpose, lawful_basis, privacy_notice, consent, suppression).
+          schema:
+            type: string
+            example: suppression
+        - name: resource_id
+          in: query
+          required: false
+          description: Optional filter by resource identifier.
+          schema:
+            type: string
+            example: sup_3847291a
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: Paginated list of immutable audit events
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventListResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
 components:
   securitySchemes:
     BearerAuth:
@@ -1476,6 +1522,82 @@ components:
           type: string
           description: Secret token issued with the double opt-in challenge.
           example: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+    AuditEvent:
+      type: object
+      required:
+        - id
+        - tenant_id
+        - actor_id
+        - action
+        - occurred_at
+        - resource_type
+        - revision
+      properties:
+        id:
+          type: string
+          example: aud_1001a
+        tenant_id:
+          type: string
+          example: tenant-alpha
+        actor_id:
+          type: string
+          example: admin-1
+        action:
+          type: string
+          example: consent.suppression.changed
+        consent_id:
+          type: string
+          example: con_7df32a101b9a
+        occurred_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T10:00:00Z'
+        resource_type:
+          type: string
+          example: suppression
+        resource_id:
+          type: string
+          example: sup_3847291a
+        revision:
+          type: integer
+          example: 2
+        before_state:
+          type: object
+          additionalProperties: true
+          description: Serialized entity state immediately prior to mutation (empty object on creation).
+        after_state:
+          type: object
+          additionalProperties: true
+          description: Serialized entity state immediately following mutation.
+        correlation_id:
+          type: string
+          example: corr-audit-update-002
+        reason:
+          type: string
+          example: customer rescinded opt-out via preference center
+
+    AuditEventListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        total:
+          type: integer
+          example: 2
+        limit:
+          type: integer
+          example: 20
+        offset:
+          type: integer
+          example: 0
 
     ErrorResponse:
       type: object

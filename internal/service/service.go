@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -88,8 +89,54 @@ func (s *Service) RegisterPurpose(ctx context.Context, tenantID, actorID string,
 	purpose.AllowedChannels = channels
 	purpose.TenantID = tenantID
 	purpose.UpdatedAt = time.Now().UTC()
-	audit := domain.AuditEvent{ID: id("aud"), TenantID: tenantID, ActorID: actorID, Action: "consent.purpose.registered", ConsentID: purpose.Code, OccurredAt: purpose.UpdatedAt, ResourceType: "purpose"}
-	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.purpose.changed", AggregateID: purpose.Code, Payload: map[string]any{"category": purpose.Category, "active": purpose.Active}, OccurredAt: purpose.UpdatedAt}
+	rev := purpose.Version
+	if rev <= 0 {
+		rev = 1
+	}
+	var before any
+	var beforeState map[string]any
+	if existing, err := s.repo.GetPurpose(ctx, tenantID, purpose.Code); err == nil && existing.Code != "" {
+		before = existing
+		beforeState = toMap(existing)
+	}
+	afterState := toMap(purpose)
+	audit := domain.AuditEvent{
+		ID:            id("aud"),
+		TenantID:      tenantID,
+		ActorID:       actorID,
+		Action:        "consent.purpose.registered",
+		ConsentID:     purpose.Code,
+		ResourceID:    purpose.Code,
+		OccurredAt:    purpose.UpdatedAt,
+		ResourceType:  "purpose",
+		Revision:      rev,
+		CorrelationID: domain.CorrelationID(ctx),
+		BeforeState:   beforeState,
+		AfterState:    afterState,
+		Changes:       map[string]any{"before": before, "after": purpose},
+	}
+	outbox := domain.OutboxEvent{
+		ID:                id("evt"),
+		SchemaVersion:     1,
+		TenantID:          tenantID,
+		EventType:         "consent.purpose.changed",
+		AggregateType:     "consent.purpose",
+		AggregateID:       purpose.Code,
+		AggregateRevision: rev,
+		Payload: map[string]any{
+			"tenant_id":                    tenantID,
+			"code":                         purpose.Code,
+			"category":                     purpose.Category,
+			"active":                       purpose.Active,
+			"allowed_channels":             purpose.AllowedChannels,
+			"requires_affirmative_consent": purpose.RequiresAffirmativeConsent,
+			"requires_double_opt_in":       purpose.RequiresDoubleOptIn,
+			"aggregate_type":               "consent.purpose",
+			"aggregate_revision":           rev,
+			"schema_version":               1,
+		},
+		OccurredAt: purpose.UpdatedAt,
+	}
 	return s.repo.PutPurpose(ctx, purpose, audit, outbox)
 }
 
@@ -109,8 +156,52 @@ func (s *Service) RegisterLawfulBasis(ctx context.Context, tenantID, actorID str
 	basis.AllowedCategories = categories
 	basis.TenantID = tenantID
 	basis.UpdatedAt = time.Now().UTC()
-	audit := domain.AuditEvent{ID: id("aud"), TenantID: tenantID, ActorID: actorID, Action: "consent.lawful_basis.registered", ConsentID: basis.Code, OccurredAt: basis.UpdatedAt, ResourceType: "lawful_basis"}
-	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.lawful_basis.changed", AggregateID: basis.Code, Payload: map[string]any{"active": basis.Active}, OccurredAt: basis.UpdatedAt}
+	basisRev := basis.Version
+	if basisRev <= 0 {
+		basisRev = 1
+	}
+	var before any
+	var beforeState map[string]any
+	if existing, err := s.repo.GetLawfulBasis(ctx, tenantID, basis.Code); err == nil && existing.Code != "" {
+		before = existing
+		beforeState = toMap(existing)
+	}
+	afterState := toMap(basis)
+	audit := domain.AuditEvent{
+		ID:            id("aud"),
+		TenantID:      tenantID,
+		ActorID:       actorID,
+		Action:        "consent.lawful_basis.registered",
+		ConsentID:     basis.Code,
+		ResourceID:    basis.Code,
+		OccurredAt:    basis.UpdatedAt,
+		ResourceType:  "lawful_basis",
+		Revision:      basisRev,
+		CorrelationID: domain.CorrelationID(ctx),
+		BeforeState:   beforeState,
+		AfterState:    afterState,
+		Changes:       map[string]any{"before": before, "after": basis},
+	}
+	outbox := domain.OutboxEvent{
+		ID:                id("evt"),
+		SchemaVersion:     1,
+		TenantID:          tenantID,
+		EventType:         "consent.lawful_basis.changed",
+		AggregateType:     "consent.lawful_basis",
+		AggregateID:       basis.Code,
+		AggregateRevision: basisRev,
+		Payload: map[string]any{
+			"tenant_id":          tenantID,
+			"code":               basis.Code,
+			"active":             basis.Active,
+			"allowed_categories": basis.AllowedCategories,
+			"requires_evidence":  basis.RequiresEvidence,
+			"aggregate_type":     "consent.lawful_basis",
+			"aggregate_revision": basisRev,
+			"schema_version":     1,
+		},
+		OccurredAt: basis.UpdatedAt,
+	}
 	return s.repo.PutLawfulBasis(ctx, basis, audit, outbox)
 }
 
@@ -149,8 +240,47 @@ func (s *Service) PublishNotice(ctx context.Context, tenantID, actorID string, n
 			return domain.PrivacyNotice{}, invalid("content_hash", "does not match sha256 of notice content")
 		}
 	}
-	audit := domain.AuditEvent{ID: id("aud"), TenantID: tenantID, ActorID: actorID, Action: "consent.notice.published", ConsentID: notice.Version, OccurredAt: notice.PublishedAt, ResourceType: "privacy_notice"}
-	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.notice.published", AggregateID: notice.Version, Payload: map[string]any{"jurisdiction": notice.Jurisdiction, "active": notice.Active}, OccurredAt: notice.PublishedAt}
+	var beforeState map[string]any
+	if existing, err := s.repo.GetNotice(ctx, tenantID, notice.Jurisdiction, notice.Version); err == nil {
+		beforeState = toMap(existing)
+	}
+	afterState := toMap(notice)
+	audit := domain.AuditEvent{
+		ID:            id("aud"),
+		TenantID:      tenantID,
+		ActorID:       actorID,
+		Action:        "consent.notice.published",
+		ConsentID:     notice.Version,
+		ResourceID:    notice.Jurisdiction + "/" + notice.Version,
+		OccurredAt:    notice.PublishedAt,
+		ResourceType:  "privacy_notice",
+		Revision:      1,
+		CorrelationID: domain.CorrelationID(ctx),
+		BeforeState:   beforeState,
+		AfterState:    afterState,
+		Changes:       map[string]any{"before": beforeState, "after": afterState},
+	}
+	outbox := domain.OutboxEvent{
+		ID:                id("evt"),
+		SchemaVersion:     1,
+		TenantID:          tenantID,
+		EventType:         "consent.notice.published",
+		AggregateType:     "consent.notice",
+		AggregateID:       notice.Version,
+		AggregateRevision: 1,
+		Payload: map[string]any{
+			"tenant_id":          tenantID,
+			"jurisdiction":       notice.Jurisdiction,
+			"version":            notice.Version,
+			"content_hash":       notice.ContentHash,
+			"active":             notice.Active,
+			"published_at":       notice.PublishedAt,
+			"aggregate_type":     "consent.notice",
+			"aggregate_revision": int64(1),
+			"schema_version":     1,
+		},
+		OccurredAt: notice.PublishedAt,
+	}
 	return s.repo.PutNotice(ctx, notice, audit, outbox)
 }
 
@@ -175,24 +305,47 @@ func (s *Service) RetireNotice(ctx context.Context, tenantID, actorID, jurisdict
 		}
 	}
 
+	existing, _ := s.repo.GetNotice(ctx, tenantID, jurisdiction, version)
+	beforeState := toMap(existing)
+	retired := existing
+	retired.Active = false
+	retired.Retired = true
+	retired.SupersededBy = supersededBy
+	afterState := toMap(retired)
+
 	audit := domain.AuditEvent{
-		ID:           id("aud"),
-		TenantID:     tenantID,
-		ActorID:      actorID,
-		Action:       "consent.notice.retired",
-		ConsentID:    jurisdiction + "/" + version,
-		OccurredAt:   time.Now().UTC(),
-		ResourceType: "privacy_notice",
+		ID:            id("aud"),
+		TenantID:      tenantID,
+		ActorID:       actorID,
+		Action:        "consent.notice.retired",
+		ConsentID:     jurisdiction + "/" + version,
+		ResourceID:    jurisdiction + "/" + version,
+		OccurredAt:    time.Now().UTC(),
+		ResourceType:  "privacy_notice",
+		Revision:      2,
+		CorrelationID: domain.CorrelationID(ctx),
+		Reason:        "superseded_by:" + supersededBy,
+		BeforeState:   beforeState,
+		AfterState:    afterState,
+		Changes:       map[string]any{"before": beforeState, "after": afterState},
 	}
 	outbox := domain.OutboxEvent{
-		ID:          id("evt"),
-		TenantID:    tenantID,
-		EventType:   "consent.notice.retired",
-		AggregateID: version,
+		ID:                id("evt"),
+		SchemaVersion:     1,
+		TenantID:          tenantID,
+		EventType:         "consent.notice.retired",
+		AggregateType:     "consent.notice",
+		AggregateID:       version,
+		AggregateRevision: 2,
 		Payload: map[string]any{
-			"jurisdiction":  jurisdiction,
-			"retired":       true,
-			"superseded_by": supersededBy,
+			"tenant_id":          tenantID,
+			"jurisdiction":       jurisdiction,
+			"version":            version,
+			"retired":            true,
+			"superseded_by":      supersededBy,
+			"aggregate_type":     "consent.notice",
+			"aggregate_revision": int64(2),
+			"schema_version":     1,
 		},
 		OccurredAt: time.Now().UTC(),
 	}
@@ -298,8 +451,43 @@ func governedRecords(in governedInput, now time.Time, purpose domain.Purpose, no
 		return domain.Consent{}, domain.ConsentReceipt{}, domain.AuditEvent{}, domain.OutboxEvent{}, domain.ErrInternal.Wrap(err)
 	}
 	consent.ReceiptID = receipt.ID
-	audit := domain.AuditEvent{ID: id("aud"), TenantID: in.TenantID, ActorID: in.ActorID, Action: "consent." + string(in.Status), ConsentID: consent.ID, OccurredAt: now, ResourceType: "consent"}
-	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: in.TenantID, EventType: "consent." + string(in.Status), AggregateID: consent.ID, Payload: map[string]any{"subject_id": in.SubjectID, "purpose": in.Purpose, "channel": in.Channel, "receipt_id": receipt.ID, "notice_version": in.NoticeVersion}, OccurredAt: now}
+	audit := domain.AuditEvent{
+		ID:           id("aud"),
+		TenantID:     in.TenantID,
+		ActorID:      in.ActorID,
+		Action:       "consent." + string(in.Status),
+		ConsentID:    consent.ID,
+		ResourceID:   consent.ID,
+		OccurredAt:   now,
+		ResourceType: "consent",
+		Revision:     1,
+		AfterState:   toMap(consent),
+		Changes:      map[string]any{"before": nil, "after": consent},
+	}
+	outbox := domain.OutboxEvent{
+		ID:                id("evt"),
+		SchemaVersion:     1,
+		TenantID:          in.TenantID,
+		EventType:         "consent." + string(in.Status),
+		AggregateType:     "consent.preference",
+		AggregateID:       consent.ID,
+		AggregateRevision: 1,
+		Payload: map[string]any{
+			"tenant_id":             in.TenantID,
+			"subject_id":            in.SubjectID,
+			"purpose":               in.Purpose,
+			"channel":               in.Channel,
+			"status":                string(in.Status),
+			"legal_basis":           in.LegalBasis,
+			"receipt_id":            receipt.ID,
+			"notice_version":        in.NoticeVersion,
+			"preference_generation": int64(1),
+			"aggregate_type":        "consent.preference",
+			"aggregate_revision":    int64(1),
+			"schema_version":        1,
+		},
+		OccurredAt: now,
+	}
 	return consent, receipt, audit, outbox, nil
 }
 
@@ -338,12 +526,48 @@ func (s *Service) Withdraw(ctx context.Context, tenantID, actorID, consentID str
 		return c, nil
 	}
 	now := time.Now().UTC()
+	before := c
+	beforeState := toMap(c)
 	c.Status = domain.StatusWithdrawn
 	c.WithdrawnAt = &now
 	c.UpdatedAt = now
 	c.Version++
-	audit := domain.AuditEvent{ID: id("aud"), TenantID: tenantID, ActorID: actorID, Action: "consent.withdrawn", ConsentID: consentID, OccurredAt: now, ResourceType: "consent"}
-	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.withdrawn", AggregateID: consentID, Payload: map[string]any{"subject_id": c.SubjectID, "purpose": c.Purpose, "channel": c.Channel}, OccurredAt: now}
+	audit := domain.AuditEvent{
+		ID:            id("aud"),
+		TenantID:      tenantID,
+		ActorID:       actorID,
+		Action:        "consent.withdrawn",
+		ConsentID:     consentID,
+		ResourceID:    consentID,
+		OccurredAt:    now,
+		ResourceType:  "consent",
+		Revision:      c.Version,
+		CorrelationID: domain.CorrelationID(ctx),
+		BeforeState:   beforeState,
+		AfterState:    toMap(c),
+		Changes:       map[string]any{"before": before, "after": c},
+	}
+	outbox := domain.OutboxEvent{
+		ID:                id("evt"),
+		SchemaVersion:     1,
+		TenantID:          tenantID,
+		EventType:         "consent.withdrawn",
+		AggregateType:     "consent.preference",
+		AggregateID:       consentID,
+		AggregateRevision: c.Version,
+		Payload: map[string]any{
+			"tenant_id":             tenantID,
+			"subject_id":            c.SubjectID,
+			"purpose":               c.Purpose,
+			"channel":               c.Channel,
+			"status":                string(domain.StatusWithdrawn),
+			"preference_generation": c.Version,
+			"aggregate_type":        "consent.preference",
+			"aggregate_revision":    c.Version,
+			"schema_version":        1,
+		},
+		OccurredAt: now,
+	}
 	return s.repo.Withdraw(ctx, c, audit, outbox)
 }
 
@@ -399,8 +623,41 @@ func (s *Service) SetSuppression(ctx context.Context, tenantID, actorID string, 
 	suppression.ID = id("sup")
 	suppression.TenantID = tenantID
 	suppression.UpdatedAt = now
-	audit := domain.AuditEvent{ID: id("aud"), TenantID: tenantID, ActorID: actorID, Action: "consent.suppression.changed", ConsentID: suppression.ID, OccurredAt: now, ResourceType: "suppression"}
-	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.suppression.changed", AggregateID: suppression.ID, Payload: map[string]any{"subject_id": suppression.SubjectID, "scope": suppression.Scope, "purpose": suppression.Purpose, "channel": suppression.Channel, "active": suppression.Active, "created_by_role": suppression.CreatedByRole}, OccurredAt: now}
+	audit := domain.AuditEvent{
+		ID:            id("aud"),
+		TenantID:      tenantID,
+		ActorID:       actorID,
+		Action:        "consent.suppression.changed",
+		ConsentID:     suppression.ID,
+		ResourceID:    suppression.ID,
+		OccurredAt:    now,
+		ResourceType:  "suppression",
+		CorrelationID: domain.CorrelationID(ctx),
+		Reason:        suppression.Reason,
+		AfterState:    toMap(suppression),
+	}
+	outbox := domain.OutboxEvent{
+		ID:                id("evt"),
+		SchemaVersion:     1,
+		TenantID:          tenantID,
+		EventType:         "consent.suppression.changed",
+		AggregateType:     "consent.suppression",
+		AggregateID:       suppression.ID,
+		AggregateRevision: 1,
+		Payload: map[string]any{
+			"schema_version":     1,
+			"aggregate_type":     "consent.suppression",
+			"aggregate_revision": int64(1),
+			"tenant_id":          tenantID,
+			"subject_id":         suppression.SubjectID,
+			"scope":              suppression.Scope,
+			"purpose":            suppression.Purpose,
+			"channel":            suppression.Channel,
+			"active":             suppression.Active,
+			"created_by_role":    suppression.CreatedByRole,
+		},
+		OccurredAt: now,
+	}
 	return s.repo.SetSuppression(ctx, suppression, audit, outbox)
 }
 
@@ -473,13 +730,32 @@ func (s *Service) StartDoubleOptIn(ctx context.Context, tenantID, actorID, subje
 		CreatedAt:             now,
 		UpdatedAt:             now,
 	}
-	audit := domain.AuditEvent{ID: id("aud"), TenantID: in.TenantID, ActorID: in.ActorID, Action: "consent.pending_confirmation", ConsentID: consent.ID, OccurredAt: now}
+	audit := domain.AuditEvent{
+		ID:            id("aud"),
+		TenantID:      in.TenantID,
+		ActorID:       in.ActorID,
+		Action:        "consent.pending_confirmation",
+		ConsentID:     consent.ID,
+		ResourceID:    consent.ID,
+		OccurredAt:    now,
+		ResourceType:  "consent",
+		Revision:      1,
+		CorrelationID: domain.CorrelationID(ctx),
+		AfterState:    toMap(consent),
+		Changes:       map[string]any{"before": nil, "after": consent},
+	}
 	outbox := domain.OutboxEvent{
-		ID:          id("evt"),
-		TenantID:    in.TenantID,
-		EventType:   "consent.challenge.created",
-		AggregateID: consent.ID,
+		ID:                id("evt"),
+		SchemaVersion:     1,
+		TenantID:          in.TenantID,
+		EventType:         "consent.challenge.created",
+		AggregateType:     "consent.double_opt_in",
+		AggregateID:       consent.ID,
+		AggregateRevision: int64(1),
 		Payload: map[string]any{
+			"schema_version":        1,
+			"aggregate_type":        "consent.double_opt_in",
+			"aggregate_revision":    int64(1),
 			"tenant_id":             in.TenantID,
 			"subject_id":            in.SubjectID,
 			"purpose":               in.Purpose,
@@ -570,8 +846,45 @@ func (s *Service) ConfirmDoubleOptIn(ctx context.Context, tenantID, actorID stri
 		if err != nil {
 			return domain.ConsentReceipt{}, domain.AuditEvent{}, domain.OutboxEvent{}, domain.ErrInternal.Wrap(err)
 		}
-		audit := domain.AuditEvent{ID: id("aud"), TenantID: tenantID, ActorID: actorID, Action: "consent.confirmed", ConsentID: locked.ID, OccurredAt: at}
-		outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.confirmed", AggregateID: locked.ID, Payload: map[string]any{"subject_id": locked.SubjectID, "purpose": locked.Purpose, "channel": locked.Channel, "receipt_id": receipt.ID}, OccurredAt: at}
+		audit := domain.AuditEvent{
+			ID:            id("aud"),
+			TenantID:      tenantID,
+			ActorID:       actorID,
+			Action:        "consent.confirmed",
+			ConsentID:     locked.ID,
+			ResourceID:    locked.ID,
+			OccurredAt:    at,
+			ResourceType:  "consent",
+			Revision:      locked.Version + 1,
+			CorrelationID: domain.CorrelationID(ctx),
+			BeforeState:   toMap(locked),
+		}
+		confRev := locked.PreferenceGeneration
+		if confRev <= 0 {
+			confRev = locked.Version + 1
+		}
+		outbox := domain.OutboxEvent{
+			ID:                id("evt"),
+			SchemaVersion:     1,
+			TenantID:          tenantID,
+			EventType:         "consent.confirmed",
+			AggregateType:     "consent.preference",
+			AggregateID:       locked.ID,
+			AggregateRevision: confRev,
+			Payload: map[string]any{
+				"schema_version":        1,
+				"aggregate_type":        "consent.preference",
+				"aggregate_revision":    confRev,
+				"preference_generation": confRev,
+				"tenant_id":             tenantID,
+				"subject_id":            locked.SubjectID,
+				"purpose":               locked.Purpose,
+				"channel":               locked.Channel,
+				"status":                string(domain.StatusGranted),
+				"receipt_id":            receipt.ID,
+			},
+			OccurredAt: at,
+		}
 		return receipt, audit, outbox, nil
 	}
 	// Full precision: truncating before the policy comparison could make
@@ -785,4 +1098,31 @@ func (s *Service) ListNotices(ctx context.Context, tenantID string, limit, offse
 	}
 	limit, offset = sanitizePagination(limit, offset)
 	return s.repo.ListNotices(ctx, tenantID, limit, offset)
+}
+
+func (s *Service) ListAuditEvents(ctx context.Context, tenantID, resourceType, resourceID string, limit, offset int) ([]domain.AuditEvent, int, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if err := checkText("tenant_id", tenantID, maxIdentifierLen); err != nil {
+		return nil, 0, err
+	}
+	limit, offset = sanitizePagination(limit, offset)
+	return s.repo.ListAuditEvents(ctx, tenantID, resourceType, resourceID, limit, offset)
+}
+
+func toMap(v any) map[string]any {
+	if v == nil {
+		return map[string]any{}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return map[string]any{}
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return map[string]any{}
+	}
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
 }

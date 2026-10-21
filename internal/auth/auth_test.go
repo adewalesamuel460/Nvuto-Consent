@@ -89,6 +89,7 @@ func TestAuthentikCompatibleJWKSValidation(t *testing.T) {
 		}}})
 	}))
 	defer server.Close()
+	t.Setenv("ALLOW_DEV_HEADERS", "true")
 	t.Setenv("JWT_JWKS_URL", server.URL)
 	t.Setenv("JWT_ISSUER", "https://auth.nvuto.example/application/o/customer-services/")
 	t.Setenv("JWT_AUDIENCE", "nvuto-customer-services")
@@ -217,6 +218,28 @@ func TestValidateConfig(t *testing.T) {
 		t.Setenv("JWT_AUDIENCE", "consent-service")
 		if err := ValidateConfig(); err == nil {
 			t.Fatal("expected error for non-http/https URL, got nil")
+		}
+	})
+
+	t.Run("JWKS http scheme fails when dev headers off", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("JWT_JWKS_URL", "http://auth.example.com/jwks")
+		t.Setenv("JWT_ISSUER", "https://auth.example.com/")
+		t.Setenv("JWT_AUDIENCE", "consent-service")
+		t.Setenv("ALLOW_DEV_HEADERS", "false")
+		if err := ValidateConfig(); err == nil {
+			t.Fatal("expected error for http:// scheme without ALLOW_DEV_HEADERS=true, got nil")
+		}
+	})
+
+	t.Run("JWKS http scheme succeeds when dev headers on", func(t *testing.T) {
+		clearEnv()
+		t.Setenv("JWT_JWKS_URL", "http://auth.example.com/jwks")
+		t.Setenv("JWT_ISSUER", "https://auth.example.com/")
+		t.Setenv("JWT_AUDIENCE", "consent-service")
+		t.Setenv("ALLOW_DEV_HEADERS", "true")
+		if err := ValidateConfig(); err != nil {
+			t.Fatalf("expected nil for http:// with ALLOW_DEV_HEADERS=true, got %v", err)
 		}
 	})
 }

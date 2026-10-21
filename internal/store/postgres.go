@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
@@ -43,6 +44,38 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 		pool.Close()
 		return nil, err
 	}
+	_, _ = pool.Exec(ctx, `
+		ALTER TABLE consent_outbox_events
+		  ADD COLUMN IF NOT EXISTS quarantined boolean NOT NULL DEFAULT false,
+		  ADD COLUMN IF NOT EXISTS quarantined_at timestamptz,
+		  ADD COLUMN IF NOT EXISTS quarantine_reason text NOT NULL DEFAULT '';
+
+		ALTER TABLE consent_audit_events
+		  ADD COLUMN IF NOT EXISTS resource_type text NOT NULL DEFAULT 'consent',
+		  ADD COLUMN IF NOT EXISTS resource_id text NOT NULL DEFAULT '',
+		  ADD COLUMN IF NOT EXISTS revision bigint NOT NULL DEFAULT 1,
+		  ADD COLUMN IF NOT EXISTS before_state jsonb NOT NULL DEFAULT '{}'::jsonb,
+		  ADD COLUMN IF NOT EXISTS after_state jsonb NOT NULL DEFAULT '{}'::jsonb,
+		  ADD COLUMN IF NOT EXISTS correlation_id text NOT NULL DEFAULT '',
+		  ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT '';
+
+		ALTER TABLE consent_idempotency
+		  ADD COLUMN IF NOT EXISTS original_response jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+		CREATE OR REPLACE FUNCTION reject_consent_audit_mutation()
+		RETURNS trigger AS $$
+		BEGIN
+		    RAISE EXCEPTION 'consent_audit_events is append-only: updates and deletes are prohibited'
+		        USING ERRCODE = '55000';
+		END;
+		$$ LANGUAGE plpgsql;
+
+		DROP TRIGGER IF EXISTS trg_consent_audit_immutable ON consent_audit_events;
+		CREATE TRIGGER trg_consent_audit_immutable
+		    BEFORE UPDATE OR DELETE ON consent_audit_events
+		    FOR EACH ROW
+		    EXECUTE FUNCTION reject_consent_audit_mutation();
+	`)
 	return &Postgres{pool: pool, outboxLease: OutboxLeaseDuration, txRetry: defaultTxRetry}, nil
 }
 
@@ -185,21 +218,69 @@ func advanceGenerationTx(ctx context.Context, tx pgx.Tx, c domain.Consent, at ti
 	return generation, classify(err)
 }
 
+func toMap(v any) map[string]any {
+	if v == nil {
+		return map[string]any{}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return map[string]any{}
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return map[string]any{}
+	}
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
+}
+
 func appendAuditTx(ctx context.Context, tx pgx.Tx, event domain.AuditEvent) error {
 	resourceType := event.ResourceType
 	if resourceType == "" {
 		resourceType = "consent"
 	}
+	resourceID := event.ResourceID
+	if resourceID == "" {
+		resourceID = event.ConsentID
+	}
 	revision := event.Revision
 	if revision <= 0 {
 		revision = 1
 	}
+	beforeState := event.BeforeState
+	if beforeState == nil {
+		beforeState = map[string]any{}
+	}
+	beforeJSON, _ := json.Marshal(beforeState)
+
+	afterState := event.AfterState
+	if afterState == nil {
+		afterState = map[string]any{}
+	}
+	afterJSON, _ := json.Marshal(afterState)
+
 	changes := event.Changes
 	if changes == nil {
-		changes = map[string]any{}
+		changes = map[string]any{"before": beforeState, "after": afterState}
 	}
 	changesJSON, _ := json.Marshal(changes)
-	_, err := tx.Exec(ctx, `INSERT INTO consent_audit_events(id,tenant_id,actor_id,action,consent_id,occurred_at,resource_type,revision,changes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, event.ID, event.TenantID, event.ActorID, event.Action, event.ConsentID, event.OccurredAt, resourceType, revision, changesJSON)
+
+	correlationID := event.CorrelationID
+	if correlationID == "" {
+		correlationID = domain.CorrelationID(ctx)
+	}
+	reason := event.Reason
+
+	_, err := tx.Exec(ctx, `INSERT INTO consent_audit_events(
+		id, tenant_id, actor_id, action, consent_id, occurred_at,
+		resource_type, resource_id, revision, before_state, after_state,
+		correlation_id, reason, changes
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		event.ID, event.TenantID, event.ActorID, event.Action, event.ConsentID, event.OccurredAt,
+		resourceType, resourceID, revision, beforeJSON, afterJSON,
+		correlationID, reason, changesJSON)
 	return classify(err)
 }
 
@@ -218,7 +299,26 @@ func normalizeOutbox(event domain.OutboxEvent) domain.OutboxEvent {
 		event.Source = "nvuto/consent"
 	}
 	if event.AggregateType == "" {
-		event.AggregateType = "consent"
+		event.AggregateType = "consent.preference"
+	}
+	if event.AggregateRevision <= 0 {
+		event.AggregateRevision = 1
+	}
+	if event.Payload != nil {
+		if _, ok := event.Payload["schema_version"]; !ok {
+			event.Payload["schema_version"] = event.SchemaVersion
+		}
+		if _, ok := event.Payload["aggregate_type"]; !ok {
+			event.Payload["aggregate_type"] = event.AggregateType
+		}
+		if _, ok := event.Payload["aggregate_revision"]; !ok {
+			event.Payload["aggregate_revision"] = event.AggregateRevision
+		}
+		if event.TenantID != "" {
+			if _, ok := event.Payload["tenant_id"]; !ok {
+				event.Payload["tenant_id"] = event.TenantID
+			}
+		}
 	}
 	return event
 }
@@ -306,8 +406,17 @@ func (p *Postgres) PutPurpose(ctx context.Context, purpose domain.Purpose, audit
 		if audit.ConsentID == "" {
 			audit.ConsentID = purpose.Code
 		}
+		if audit.ResourceID == "" {
+			audit.ResourceID = audit.ConsentID
+		}
 		audit.Revision = purpose.Version
-		audit.Changes = map[string]any{"before": before, "after": purpose}
+		if audit.BeforeState == nil && before != nil {
+			audit.BeforeState = toMap(before)
+		}
+		if audit.AfterState == nil {
+			audit.AfterState = toMap(purpose)
+		}
+		audit.Changes = map[string]any{"before": audit.BeforeState, "after": audit.AfterState}
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
 	if err != nil {
@@ -405,8 +514,17 @@ func (p *Postgres) PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis,
 		if audit.ConsentID == "" {
 			audit.ConsentID = basis.Code
 		}
+		if audit.ResourceID == "" {
+			audit.ResourceID = audit.ConsentID
+		}
 		audit.Revision = basis.Version
-		audit.Changes = map[string]any{"before": before, "after": basis}
+		if audit.BeforeState == nil && before != nil {
+			audit.BeforeState = toMap(before)
+		}
+		if audit.AfterState == nil {
+			audit.AfterState = toMap(basis)
+		}
+		audit.Changes = map[string]any{"before": audit.BeforeState, "after": audit.AfterState}
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
 	if err != nil {
@@ -460,10 +578,16 @@ func (p *Postgres) PutNotice(ctx context.Context, notice domain.PrivacyNotice, a
 		if audit.ConsentID == "" {
 			audit.ConsentID = notice.Jurisdiction + "/" + notice.Version
 		}
+		if audit.ResourceID == "" {
+			audit.ResourceID = audit.ConsentID
+		}
 		if audit.Revision <= 0 {
 			audit.Revision = 1
 		}
-		audit.Changes = map[string]any{"before": nil, "after": notice}
+		if audit.AfterState == nil {
+			audit.AfterState = toMap(notice)
+		}
+		audit.Changes = map[string]any{"before": audit.BeforeState, "after": audit.AfterState}
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
 	if err != nil {
@@ -529,10 +653,19 @@ func (p *Postgres) RetireNotice(ctx context.Context, tenantID, jurisdiction, ver
 		if audit.ConsentID == "" {
 			audit.ConsentID = notice.Jurisdiction + "/" + notice.Version
 		}
+		if audit.ResourceID == "" {
+			audit.ResourceID = audit.ConsentID
+		}
 		if audit.Revision <= 0 {
 			audit.Revision = 2
 		}
-		audit.Changes = map[string]any{"before": before, "after": notice}
+		if audit.BeforeState == nil {
+			audit.BeforeState = toMap(before)
+		}
+		if audit.AfterState == nil {
+			audit.AfterState = toMap(notice)
+		}
+		audit.Changes = map[string]any{"before": audit.BeforeState, "after": audit.AfterState}
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
 	if err != nil {
@@ -576,16 +709,24 @@ func recordGovernedTx(ctx context.Context, tx pgx.Tx, consent domain.Consent, re
 	if audit.ResourceType == "" {
 		audit.ResourceType = "consent"
 	}
+	if audit.ResourceID == "" {
+		audit.ResourceID = consent.ID
+	}
 	if audit.Revision <= 0 {
 		audit.Revision = 1
 	}
+	if audit.AfterState == nil {
+		audit.AfterState = toMap(consent)
+	}
 	if audit.Changes == nil {
-		audit.Changes = map[string]any{"before": nil, "after": consent}
+		audit.Changes = map[string]any{"before": audit.BeforeState, "after": audit.AfterState}
 	}
 	if outbox.Payload != nil {
 		outbox.Payload["generation"] = generation
 		outbox.Payload["preference_generation"] = generation
+		outbox.Payload["aggregate_revision"] = generation
 	}
+	outbox.AggregateRevision = generation
 	if err := appendEffectsTx(ctx, tx, audit, outbox); err != nil {
 		return domain.Consent{}, err
 	}
@@ -640,8 +781,21 @@ func (p *Postgres) Withdraw(ctx context.Context, consent domain.Consent, audit d
 			audit.ResourceType = "consent"
 		}
 		audit.ConsentID = updated.ID
+		audit.ResourceID = updated.ID
 		audit.Revision = updated.Version
-		audit.Changes = map[string]any{"before": current, "after": updated}
+		if audit.BeforeState == nil {
+			audit.BeforeState = toMap(current)
+		}
+		if audit.AfterState == nil {
+			audit.AfterState = toMap(updated)
+		}
+		audit.Changes = map[string]any{"before": audit.BeforeState, "after": audit.AfterState}
+		if outbox.Payload != nil {
+			outbox.Payload["generation"] = generation
+			outbox.Payload["preference_generation"] = generation
+			outbox.Payload["aggregate_revision"] = generation
+		}
+		outbox.AggregateRevision = generation
 		if err := appendEffectsTx(ctx, tx, audit, outbox); err != nil {
 			return err
 		}
@@ -705,9 +859,32 @@ func (p *Postgres) SetSuppression(ctx context.Context, suppression domain.Suppre
 			audit.ResourceType = "suppression"
 		}
 		audit.ConsentID = stored.ID
+		audit.ResourceID = stored.ID
 		audit.Revision = stored.Version
-		audit.Changes = map[string]any{"before": before, "after": stored}
+		if audit.Reason == "" {
+			audit.Reason = stored.Reason
+		}
+		if audit.CorrelationID == "" {
+			audit.CorrelationID = domain.CorrelationID(ctx)
+		}
+		if audit.BeforeState == nil && before != nil {
+			audit.BeforeState = toMap(before)
+		}
+		if audit.AfterState == nil {
+			audit.AfterState = toMap(stored)
+		}
+		audit.Changes = map[string]any{"before": audit.BeforeState, "after": audit.AfterState}
 		outbox.AggregateID = stored.ID
+		outbox.AggregateType = "consent.suppression"
+		outbox.AggregateRevision = stored.Version
+		if outbox.Payload != nil {
+			outbox.Payload["schema_version"] = 1
+			outbox.Payload["aggregate_type"] = "consent.suppression"
+			outbox.Payload["aggregate_revision"] = stored.Version
+			outbox.Payload["tenant_id"] = stored.TenantID
+			outbox.Payload["subject_id"] = stored.SubjectID
+			outbox.Payload["version"] = stored.Version
+		}
 		return appendEffectsTx(ctx, tx, audit, outbox)
 	})
 	if err != nil {
@@ -843,8 +1020,25 @@ func (p *Postgres) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash s
 			audit.ResourceType = "consent"
 		}
 		audit.ConsentID = consent.ID
+		audit.ResourceID = consent.ID
 		audit.Revision = consent.Version
-		audit.Changes = map[string]any{"before": before, "after": consent}
+		if audit.BeforeState == nil {
+			audit.BeforeState = toMap(before)
+		}
+		if audit.AfterState == nil {
+			audit.AfterState = toMap(consent)
+		}
+		audit.Changes = map[string]any{"before": audit.BeforeState, "after": audit.AfterState}
+		if outbox.Payload != nil {
+			outbox.Payload["generation"] = current
+			outbox.Payload["preference_generation"] = current
+			outbox.Payload["aggregate_revision"] = current
+			outbox.Payload["schema_version"] = 1
+			outbox.Payload["aggregate_type"] = "consent.preference"
+			outbox.Payload["tenant_id"] = tenantID
+		}
+		outbox.AggregateType = "consent.preference"
+		outbox.AggregateRevision = current
 		if err := appendEffectsTx(ctx, tx, audit, outbox); err != nil {
 			return err
 		}
@@ -862,17 +1056,132 @@ func (p *Postgres) AppendAudit(ctx context.Context, event domain.AuditEvent) err
 	if resourceType == "" {
 		resourceType = "consent"
 	}
+	resourceID := event.ResourceID
+	if resourceID == "" {
+		resourceID = event.ConsentID
+	}
 	revision := event.Revision
 	if revision <= 0 {
 		revision = 1
 	}
+	beforeState := event.BeforeState
+	if beforeState == nil {
+		beforeState = map[string]any{}
+	}
+	beforeJSON, _ := json.Marshal(beforeState)
+
+	afterState := event.AfterState
+	if afterState == nil {
+		afterState = map[string]any{}
+	}
+	afterJSON, _ := json.Marshal(afterState)
+
 	changes := event.Changes
 	if changes == nil {
-		changes = map[string]any{}
+		changes = map[string]any{"before": beforeState, "after": afterState}
 	}
 	changesJSON, _ := json.Marshal(changes)
-	_, err := p.pool.Exec(ctx, `INSERT INTO consent_audit_events(id,tenant_id,actor_id,action,consent_id,occurred_at,resource_type,revision,changes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, event.ID, event.TenantID, event.ActorID, event.Action, event.ConsentID, event.OccurredAt, resourceType, revision, changesJSON)
+
+	correlationID := event.CorrelationID
+	if correlationID == "" {
+		correlationID = domain.CorrelationID(ctx)
+	}
+	reason := event.Reason
+
+	_, err := p.pool.Exec(ctx, `INSERT INTO consent_audit_events(
+		id, tenant_id, actor_id, action, consent_id, occurred_at,
+		resource_type, resource_id, revision, before_state, after_state,
+		correlation_id, reason, changes
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		event.ID, event.TenantID, event.ActorID, event.Action, event.ConsentID, event.OccurredAt,
+		resourceType, resourceID, revision, beforeJSON, afterJSON,
+		correlationID, reason, changesJSON)
 	return classify(err)
+}
+
+func (p *Postgres) ListAuditEvents(ctx context.Context, tenantID, resourceType, resourceID string, limit, offset int) ([]domain.AuditEvent, int, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var conditions []string
+	var args []any
+	args = append(args, tenantID)
+	conditions = append(conditions, fmt.Sprintf("tenant_id = $%d", len(args)))
+
+	if resourceType != "" {
+		args = append(args, resourceType)
+		conditions = append(conditions, fmt.Sprintf("resource_type = $%d", len(args)))
+	}
+	if resourceID != "" {
+		args = append(args, resourceID)
+		conditions = append(conditions, fmt.Sprintf("(resource_id = $%d OR consent_id = $%d)", len(args), len(args)))
+	}
+
+	whereClause := strings.Join(conditions, " AND ")
+
+	var total int
+	countQuery := fmt.Sprintf("SELECT count(*) FROM consent_audit_events WHERE %s", whereClause)
+	if err := p.pool.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, classify(err)
+	}
+
+	if total == 0 || offset >= total {
+		return []domain.AuditEvent{}, total, nil
+	}
+
+	limitIdx := len(args) + 1
+	offsetIdx := len(args) + 2
+	selectQuery := fmt.Sprintf(`SELECT id, tenant_id, actor_id, action, consent_id, occurred_at,
+		COALESCE(resource_type, 'consent'), COALESCE(resource_id, consent_id), revision,
+		before_state, after_state, correlation_id, reason, changes
+		FROM consent_audit_events
+		WHERE %s
+		ORDER BY occurred_at ASC, revision ASC, id ASC
+		LIMIT $%d OFFSET $%d`, whereClause, limitIdx, offsetIdx)
+
+	queryArgs := append(args, limit, offset)
+	rows, err := p.pool.Query(ctx, selectQuery, queryArgs...)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	defer rows.Close()
+
+	items := make([]domain.AuditEvent, 0, limit)
+	for rows.Next() {
+		var event domain.AuditEvent
+		var beforeBytes, afterBytes, changesBytes []byte
+		if err := rows.Scan(
+			&event.ID, &event.TenantID, &event.ActorID, &event.Action, &event.ConsentID, &event.OccurredAt,
+			&event.ResourceType, &event.ResourceID, &event.Revision,
+			&beforeBytes, &afterBytes, &event.CorrelationID, &event.Reason, &changesBytes,
+		); err != nil {
+			return nil, 0, classify(err)
+		}
+		if len(beforeBytes) > 0 {
+			_ = json.Unmarshal(beforeBytes, &event.BeforeState)
+		}
+		if len(afterBytes) > 0 {
+			_ = json.Unmarshal(afterBytes, &event.AfterState)
+		}
+		if len(changesBytes) > 0 {
+			_ = json.Unmarshal(changesBytes, &event.Changes)
+		}
+		if event.BeforeState == nil {
+			event.BeforeState = map[string]any{}
+		}
+		if event.AfterState == nil {
+			event.AfterState = map[string]any{}
+		}
+		items = append(items, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, classify(err)
+	}
+	return items, total, nil
 }
 
 func (p *Postgres) AppendOutbox(ctx context.Context, event domain.OutboxEvent) error {
@@ -901,9 +1210,9 @@ func (p *Postgres) ClaimOutbox(ctx context.Context, workerID string, limit int, 
 		return OutboxClaim{}, err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT id,schema_version,source,tenant_id,event_type,aggregate_type,aggregate_id,payload,occurred_at,attempts
+	rows, err := tx.Query(ctx, `SELECT id,schema_version,source,tenant_id,event_type,aggregate_type,aggregate_id,payload,occurred_at,attempts,quarantined,quarantined_at,quarantine_reason
 		FROM consent_outbox_events
-		WHERE published_at IS NULL AND next_attempt_at<=now()
+		WHERE published_at IS NULL AND (quarantined IS NULL OR quarantined = false) AND next_attempt_at<=now()
 		AND (locked_at IS NULL OR locked_at<now()-($3::bigint*interval '1 millisecond'))
 		AND ($2='' OR tenant_id=$2)
 		ORDER BY occurred_at,id LIMIT $1 FOR UPDATE SKIP LOCKED`, limit, tenantFilter, p.outboxLease.Milliseconds())
@@ -914,9 +1223,31 @@ func (p *Postgres) ClaimOutbox(ctx context.Context, workerID string, limit int, 
 	ids := make([]string, 0, limit)
 	for rows.Next() {
 		var item OutboxRecord
-		if err := rows.Scan(&item.ID, &item.SchemaVersion, &item.Source, &item.TenantID, &item.EventType, &item.AggregateType, &item.AggregateID, &item.Payload, &item.OccurredAt, &item.Attempts); err != nil {
+		var quarantinedAt *time.Time
+		var quarantined bool
+		var quarantineReason string
+		if err := rows.Scan(&item.ID, &item.SchemaVersion, &item.Source, &item.TenantID, &item.EventType, &item.AggregateType, &item.AggregateID, &item.Payload, &item.OccurredAt, &item.Attempts, &quarantined, &quarantinedAt, &quarantineReason); err != nil {
 			rows.Close()
 			return OutboxClaim{}, err
+		}
+		item.Quarantined = quarantined
+		item.QuarantinedAt = quarantinedAt
+		item.QuarantineReason = quarantineReason
+		if len(item.Payload) > 0 {
+			var aux struct {
+				AggregateRevision    int64 `json:"aggregate_revision"`
+				PreferenceGeneration int64 `json:"preference_generation"`
+			}
+			if err := json.Unmarshal(item.Payload, &aux); err == nil {
+				if aux.AggregateRevision > 0 {
+					item.AggregateRevision = aux.AggregateRevision
+				} else if aux.PreferenceGeneration > 0 {
+					item.AggregateRevision = aux.PreferenceGeneration
+				}
+			}
+		}
+		if item.AggregateRevision <= 0 {
+			item.AggregateRevision = 1
 		}
 		claim.Events = append(claim.Events, item)
 		ids = append(ids, item.ID)
@@ -991,4 +1322,63 @@ func (p *Postgres) ReleaseOutboxBatch(ctx context.Context, workerID string, even
 		SET locked_at=NULL,locked_by=NULL,claim_token=NULL,attempts=GREATEST(attempts-1,0)
 		WHERE id=ANY($1) AND published_at IS NULL AND (locked_by=$2 OR $2='')`, ids, workerID)
 	return err
+}
+
+func (p *Postgres) QuarantineOutbox(ctx context.Context, id, token string, reason string) error {
+	return p.fencedOutboxUpdate(ctx, `quarantined=true,quarantined_at=now(),quarantine_reason=$3,locked_at=NULL,locked_by=NULL,claim_token=NULL`, id, token, reason)
+}
+
+func (p *Postgres) ReplayOutbox(ctx context.Context, id string) error {
+	if id == "" {
+		return ErrNotFound
+	}
+	command, err := p.pool.Exec(ctx, `UPDATE consent_outbox_events
+		SET quarantined=false,quarantined_at=NULL,quarantine_reason='',attempts=0,next_attempt_at=now(),locked_at=NULL,locked_by=NULL,claim_token=NULL
+		WHERE id=$1 AND published_at IS NULL AND quarantined=true`, id)
+	if err != nil {
+		return classify(err)
+	}
+	if command.RowsAffected() == 0 {
+		var exists bool
+		_ = p.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM consent_outbox_events WHERE id=$1)`, id).Scan(&exists)
+		if !exists {
+			return ErrNotFound
+		}
+		return nil
+	}
+	return nil
+}
+
+func (p *Postgres) OutboxLag(ctx context.Context, tenantFilter string) (time.Duration, error) {
+	var oldest *time.Time
+	query := `SELECT MIN(occurred_at) FROM consent_outbox_events
+		WHERE published_at IS NULL AND (quarantined IS NULL OR quarantined = false)
+		AND ($1 = '' OR tenant_id = $1)`
+	err := p.pool.QueryRow(ctx, query, tenantFilter).Scan(&oldest)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, classify(err)
+	}
+	if oldest == nil || oldest.IsZero() {
+		return 0, nil
+	}
+	lag := time.Since(*oldest)
+	if lag < 0 {
+		return 0, nil
+	}
+	return lag, nil
+}
+
+func (p *Postgres) QuarantinedOutboxCount(ctx context.Context, tenantFilter string) (int64, error) {
+	var count int64
+	query := `SELECT COUNT(*) FROM consent_outbox_events
+		WHERE published_at IS NULL AND quarantined = true
+		AND ($1 = '' OR tenant_id = $1)`
+	err := p.pool.QueryRow(ctx, query, tenantFilter).Scan(&count)
+	if err != nil {
+		return 0, classify(err)
+	}
+	return count, nil
 }

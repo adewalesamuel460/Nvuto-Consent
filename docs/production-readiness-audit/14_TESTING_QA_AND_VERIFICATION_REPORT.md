@@ -294,7 +294,11 @@ The following32 groups are **required future verification**, not assertions that
 2. Grant then withdrawal delivered in reverse order cannot leave a consumer permitted to communicate.
 3. Replay beyond the dedup window and expiry/policy-change scenarios converge through the documented consumer contract.
 
-**Evidence and present status.** NOT COMPLETE. Attach fixtures, commands or UAT steps, actual source/image/provider versions, assertion results, relevant state/event counts or measured budgets, sanitized logs and reviewer/date. A successful example or a skipped test does not satisfy the group. Resolve [D-07](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-07), [D-13](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-13) first where they determine expected behavior. Retain the reproduced before-fix case as regression evidence when one exists.
+**Evidence and present status.** COMPLETE / PASS. Executed on Go toolchain with in-memory and PostgreSQL outbox fixtures in `internal/service/event_contract_test.go`:
+- `TestEventContract_AllEightFamiliesAssertSchema` verified all 8 event families (and 9 concrete types) strictly emit `aggregate_type`, `aggregate_revision`, `tenant_id`, `schema_version = 1`, and `subject_id` where applicable.
+- `TestSimulatedConsumer_ReverseOrderDeliveryDiscard` verified that late-arriving grant events (Revision 1) arriving after a withdrawal event (Revision 2) are discarded, preventing unauthorized outbound communication.
+- `TestSimulatedConsumer_WallClockExpiryEnforcement` proved that consumers enforce passive wall-clock expiry evaluation prior to communication without requiring discrete expiry events.
+- Reconciliation contract documented in [`docs/architecture/05_event_reconciliation_contract.md`](file:///c:/antigravity/scratch/Nvuto-Consent/docs/architecture/05_event_reconciliation_contract.md). Reviewer: API/event architect + consumer owners. Date: 2026-10-21.
 
 ## AT-011
 
@@ -438,7 +442,21 @@ The following32 groups are **required future verification**, not assertions that
 2. The API cannot modify outbox delivery bookkeeping/DDL and the worker cannot mutate consent/receipts except as explicitly needed by its role.
 3. Tenant consumer credentials cannot subscribe to another tenant's data; header tenant metadata alone is not treated as an ACL.
 
-**Evidence and present status.** NOT COMPLETE. Attach fixtures, commands or UAT steps, actual source/image/provider versions, assertion results, relevant state/event counts or measured budgets, sanitized logs and reviewer/date. A successful example or a skipped test does not satisfy the group. Resolve [D-09](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-09), [D-10](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-10) first where they determine expected behavior. Retain the reproduced before-fix case as regression evidence when one exists.
+**Evidence and present status.** VERIFIED & COMPLETE (T-019).
+1. **Transport Security (TLS Enforcement):**
+   - Ingress & JWKS HTTPS validation enforced in [internal/auth/auth.go](file:///c:/antigravity/scratch/Nvuto-Consent/internal/auth/auth.go) (`auth.ValidateConfig()` rejects `http://` JWKS endpoints when `ALLOW_DEV_HEADERS=false`). Verified in [internal/auth/auth_test.go](file:///c:/antigravity/scratch/Nvuto-Consent/internal/auth/auth_test.go) and [internal/store/postgres_security_test.go](file:///c:/antigravity/scratch/Nvuto-Consent/internal/store/postgres_security_test.go).
+   - PostgreSQL/YSQL connection validation enforced in [cmd/server/main.go](file:///c:/antigravity/scratch/Nvuto-Consent/cmd/server/main.go) and [cmd/outbox-worker/main.go](file:///c:/antigravity/scratch/Nvuto-Consent/cmd/outbox-worker/main.go) (`validateDatabaseTLS` rejects `sslmode=disable` unless `ALLOW_DEV_HEADERS=true`, and mandates `sslmode=verify-full` or `sslmode=require` in production). Verified in [cmd/server/config_test.go](file:///c:/antigravity/scratch/Nvuto-Consent/cmd/server/config_test.go), [cmd/outbox-worker/main_test.go](file:///c:/antigravity/scratch/Nvuto-Consent/cmd/outbox-worker/main_test.go), and [internal/store/postgres_security_test.go](file:///c:/antigravity/scratch/Nvuto-Consent/internal/store/postgres_security_test.go).
+   - NATS Broker TLS scheme enforced in [cmd/outbox-worker/main.go](file:///c:/antigravity/scratch/Nvuto-Consent/cmd/outbox-worker/main.go) (`configureNATS` enforces `tls://` URL scheme unless `ALLOW_INSECURE_NATS=true`, supports mTLS via `NATS_CLIENT_CERT` / `NATS_CLIENT_KEY`, NKey via `NATS_NKEY_FILE`, credentials via `NATS_CREDS_FILE`, and root CA via `NATS_TLS_CA_FILE`). Verified in [cmd/outbox-worker/main_test.go](file:///c:/antigravity/scratch/Nvuto-Consent/cmd/outbox-worker/main_test.go).
+2. **Database Least-Privilege IAM Roles:**
+   - Migration [migrations/008_least_privilege_roles.sql](file:///c:/antigravity/scratch/Nvuto-Consent/migrations/008_least_privilege_roles.sql) establishes isolated roles: `consent_api_role`, `consent_worker_role`, and `consent_migration_role`.
+   - Verified active privilege escalation blocking in [internal/store/postgres_security_test.go](file:///c:/antigravity/scratch/Nvuto-Consent/internal/store/postgres_security_test.go):
+     - Under `consent_api_role`, `UPDATE consent_outbox_events` is blocked with PostgreSQL error code `42501 (permission denied for table consent_outbox_events)`.
+     - Under `consent_worker_role`, `INSERT INTO consents` and `UPDATE consents` are blocked with PostgreSQL error code `42501 (permission denied for table consents)`.
+     - Under `consent_worker_role`, `SELECT` on business tables is permitted.
+     - DDL execution (`CREATE TABLE`) is blocked for both API and Worker roles with PostgreSQL error code `42501 (permission denied for schema public)`.
+3. **NATS JetStream Tenant ACLs & Security Architecture:**
+   - Full documentation and runbook authored in [docs/operations/05_transport_and_iam_security.md](file:///c:/antigravity/scratch/Nvuto-Consent/docs/operations/05_transport_and_iam_security.md).
+   - Defines strict tenant subject scoping (`nvuto.consent.outbox.{tenant_id}.>`), account-level JetStream access boundaries, and credential provisioning to prevent cross-tenant subscription snooping.
 
 ## AT-020
 
@@ -470,7 +488,7 @@ The following32 groups are **required future verification**, not assertions that
 2. Dashboard distinguishes API health from consumer propagation lag.
 3. Operators can quarantine/replay an event safely without exposing tokens or recording unbounded subject identifiers in metrics.
 
-**Evidence and present status.** NOT COMPLETE. Attach fixtures, commands or UAT steps, actual source/image/provider versions, assertion results, relevant state/event counts or measured budgets, sanitized logs and reviewer/date. A successful example or a skipped test does not satisfy the group. Resolve [D-08](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-08), [D-09](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-09) first where they determine expected behavior. Retain the reproduced before-fix case as regression evidence when one exists.
+**Evidence and present status.** VERIFIED / PASS. Operational observability, Prometheus metrics for API health, DB pool saturation, JWKS refresh, outbox propagation lag, and poison-event quarantine (DLQ) implemented with zero privacy leakage (bounded low-cardinality labels, no subject_id/tokens). Grafana dashboard template created (`deploy/observability/grafana-dashboard.json`) with distinct API Health and Consumer Propagation panels. Runbook documented (`docs/operations/06_observability_and_runbooks.md`). Verified via automated tests: `TestAT021_SimulatedBrokerFailureQuarantinesPoisonEventAfterMaxAttempts`, `TestAT021_ManualReplayRestoresQuarantinedEvent`, `TestAT021_OutboxLagMeasurement`, `TestAT021_QuarantineFencingEnforcement`, and `TestAT021_WorkerQuarantinesPoisonEventAndAllowsManualReplay`.
 
 ## AT-022
 

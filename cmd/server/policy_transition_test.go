@@ -23,7 +23,6 @@ func TestAT007_DoubleOptInTightening(t *testing.T) {
 	repo := store.NewMemory()
 	svc, handler, _, evidence := setupEvaluateFixture(t, repo, tenantID)
 	ctx := context.Background()
-	now := time.Now().UTC()
 
 	// 1. Register purpose with RequiresDoubleOptIn = false
 	_, err := svc.RegisterPurpose(ctx, tenantID, "admin", domain.Purpose{
@@ -48,7 +47,7 @@ func TestAT007_DoubleOptInTightening(t *testing.T) {
 	}
 
 	// 3. Evaluation must return allowed=true before policy tightening
-	decision, err := svc.Evaluate(ctx, tenantID, "subj-doi-1", "newsletter", "email", now)
+	decision, err := svc.Evaluate(ctx, tenantID, "subj-doi-1", "newsletter", "email", time.Now().UTC())
 	if err != nil || !decision.Allowed || decision.Reason != domain.DecisionReasonGranted {
 		t.Fatalf("expected allowed=true, reason=granted before tightening, got %+v (err=%v)", decision, err)
 	}
@@ -88,7 +87,7 @@ func TestAT007_DoubleOptInTightening(t *testing.T) {
 	}
 
 	// 5. Strict Re-evaluation: No silent grandfathering. Must return allowed=false, reason=policy_requirement_unmet
-	decisionAfter, err := svc.Evaluate(ctx, tenantID, "subj-doi-1", "newsletter", "email", now)
+	decisionAfter, err := svc.Evaluate(ctx, tenantID, "subj-doi-1", "newsletter", "email", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("evaluation returned unexpected error: %v", err)
 	}
@@ -285,7 +284,6 @@ func TestAT007_AffirmativeConsentTightening(t *testing.T) {
 	repo := store.NewMemory()
 	svc, handler, _, evidence := setupEvaluateFixture(t, repo, tenantID)
 	ctx := context.Background()
-	now := time.Now().UTC()
 
 	// 1. Register lawful basis "contract"
 	_, err := svc.RegisterLawfulBasis(ctx, tenantID, "admin", domain.LawfulBasis{
@@ -321,7 +319,8 @@ func TestAT007_AffirmativeConsentTightening(t *testing.T) {
 	}
 
 	// 4. Initially allowed
-	decBefore, err := svc.Evaluate(ctx, tenantID, "subj-aff-1", "analytics", "email", now)
+	evalTime := consent.CreatedAt.Add(time.Millisecond)
+	decBefore, err := svc.Evaluate(ctx, tenantID, "subj-aff-1", "analytics", "email", evalTime)
 	if err != nil || !decBefore.Allowed || decBefore.Reason != domain.DecisionReasonGranted {
 		t.Fatalf("expected allowed before tightening: %+v (err=%v)", decBefore, err)
 	}
@@ -340,7 +339,7 @@ func TestAT007_AffirmativeConsentTightening(t *testing.T) {
 	}
 
 	// 6. Evaluation must strictly deny the lesser legal basis (no grandfathering)
-	decAfter, err := svc.Evaluate(ctx, tenantID, "subj-aff-1", "analytics", "email", now)
+	decAfter, err := svc.Evaluate(ctx, tenantID, "subj-aff-1", "analytics", "email", evalTime)
 	if err != nil {
 		t.Fatalf("unexpected evaluate error: %v", err)
 	}
@@ -475,7 +474,6 @@ func TestAT007_ChannelCapabilityRemoval(t *testing.T) {
 	repo := store.NewMemory()
 	svc, handler, _, evidence := setupEvaluateFixture(t, repo, tenantID)
 	ctx := context.Background()
-	now := time.Now().UTC()
 
 	// 1. Purpose allows email and push
 	_, err := svc.RegisterPurpose(ctx, tenantID, "admin", domain.Purpose{
@@ -497,7 +495,7 @@ func TestAT007_ChannelCapabilityRemoval(t *testing.T) {
 	}
 
 	// 3. Initially allowed for "push"
-	decBefore, err := svc.Evaluate(ctx, tenantID, "subj-chan-1", "updates", "push", now)
+	decBefore, err := svc.Evaluate(ctx, tenantID, "subj-chan-1", "updates", "push", time.Now().UTC())
 	if err != nil || !decBefore.Allowed || decBefore.Reason != domain.DecisionReasonGranted {
 		t.Fatalf("expected allowed for push initially: %+v (err=%v)", decBefore, err)
 	}
@@ -516,7 +514,7 @@ func TestAT007_ChannelCapabilityRemoval(t *testing.T) {
 	}
 
 	// 5. Strict Re-evaluation: Evaluation for "push" must return allowed=false, reason=channel_not_allowed
-	decAfter, err := svc.Evaluate(ctx, tenantID, "subj-chan-1", "updates", "push", now)
+	decAfter, err := svc.Evaluate(ctx, tenantID, "subj-chan-1", "updates", "push", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("unexpected evaluate error: %v", err)
 	}
@@ -556,7 +554,6 @@ func TestAT007_PurposeDeactivationAgainstExistingGrant(t *testing.T) {
 	repo := store.NewMemory()
 	svc, handler, _, evidence := setupEvaluateFixture(t, repo, tenantID)
 	ctx := context.Background()
-	now := time.Now().UTC()
 
 	// 1. Purpose initially active
 	_, err := svc.RegisterPurpose(ctx, tenantID, "admin", domain.Purpose{
@@ -578,7 +575,7 @@ func TestAT007_PurposeDeactivationAgainstExistingGrant(t *testing.T) {
 	}
 
 	// 3. Initially allowed
-	decBefore, err := svc.Evaluate(ctx, tenantID, "subj-off-1", "offers", "email", now)
+	decBefore, err := svc.Evaluate(ctx, tenantID, "subj-off-1", "offers", "email", time.Time{})
 	if err != nil || !decBefore.Allowed || decBefore.Reason != domain.DecisionReasonGranted {
 		t.Fatalf("expected allowed before deactivation: %+v (err=%v)", decBefore, err)
 	}
@@ -597,7 +594,7 @@ func TestAT007_PurposeDeactivationAgainstExistingGrant(t *testing.T) {
 	}
 
 	// 5. Strict Re-evaluation: Must return allowed=false, reason=purpose_inactive
-	decAfter, err := svc.Evaluate(ctx, tenantID, "subj-off-1", "offers", "email", now)
+	decAfter, err := svc.Evaluate(ctx, tenantID, "subj-off-1", "offers", "email", time.Time{})
 	if err != nil {
 		t.Fatalf("unexpected evaluate error: %v", err)
 	}

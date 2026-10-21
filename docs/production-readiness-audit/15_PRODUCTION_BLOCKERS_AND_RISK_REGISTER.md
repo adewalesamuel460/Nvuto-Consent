@@ -39,9 +39,9 @@ These are audit priorities, not CVSS scores or legal conclusions. There are no s
 | [F-016](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-016) | P1 | Release evidence — Durable API, transaction and multi-node Yugabyte behavior remain unverified | NOT VERIFIED — required infrastructure unavailable in audit | [T-016](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-016), [AT-016](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-016), [G-016](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-016) |
 | [F-017](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-017) | P1 | CI and migration testing — CI omits durable idempotency coverage and migration 003 upgrade verification | CONFIRMED — workflow and fixture omissions | [T-017](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-017), [AT-017](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-017), [G-017](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-017) |
 | [F-018](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-018) | P1 | Deployment — Release packaging and deployment are not reproducible from the supplied manifests | CONFIRMED — configuration gaps; actual hosting unknown | [T-018](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-018), [AT-018](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-018), [G-018](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-018) |
-| [F-019](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-019) | P1 | Infrastructure security — Transport security and least-privilege service identities are not established | NOT VERIFIED / source enforcement gap | [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019), [AT-019](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-019), [G-019](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-019) |
+| [F-019](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-019) | P1 | Infrastructure security — Transport security and least-privilege service identities are not established | RESOLVED / VERIFIED (T-019) | [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019), [AT-019](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-019), [G-019](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-019) |
 | [F-020](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-020) | P1 | Broker configuration — Existing NATS streams are accepted without checking durability, subjects or retention | CONFIRMED — source gap; broker configuration unknown | [T-020](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-020), [AT-020](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-020), [G-020](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-020) |
-| [F-021](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-021) | P1 | Observability — Operators cannot reliably detect stalled consent propagation or diagnose request failures | CONFIRMED — source/configuration gap | [T-021](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-021), [AT-021](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-021), [G-021](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-021) |
+| [F-021](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-021) | P1 | Observability — Operators cannot reliably detect stalled consent propagation or diagnose request failures | RESOLVED — implemented and verified (T-021) | [T-021](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-021), [AT-021](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-021), [G-021](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-021) |
 | [F-022](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-022) | P1 | Data operations — Backup, restore, retention and recovery procedures are not production-evidenced | NOT VERIFIED — required operational policy absent | [T-022](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-022), [AT-022](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-022), [G-022](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-022) |
 | [F-023](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-023) | P1 | Platform integration — Named NVUTO product integrations have no end-to-end verification in this repository | NOT VERIFIED — consumer repositories and evidence not supplied | [T-023](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-023), [AT-023](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-023), [G-023](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-023) |
 | [F-024](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-024) | P2 | API completeness — Preference discovery, registry reads and a machine-readable client contract are absent | CONFIRMED absence — new endpoint scope requires decision | [T-024](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-024), [AT-024](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-024), [G-024](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-024) |
@@ -357,7 +357,7 @@ These are audit priorities, not CVSS scores or legal conclusions. There are no s
 | Field | Audit record |
 | --- | --- |
 | Severity / category | P1 / Event contracts |
-| Status | CONFIRMED — payload/schema gap; consumer behavior unavailable |
+| Status | CLOSED — resolved in T-010; verified via AT-010 / G-010 |
 | Affected module(s) | MOD-03 — Domain contracts; MOD-04 — Consent service; MOD-05 — Persistence; MOD-06 — Outbox worker |
 | Affected users/roles | All eight named consuming products |
 | Affected APIs | No direct route; affects runtime, delivery, infrastructure or release evidence |
@@ -366,7 +366,7 @@ These are audit priorities, not CVSS scores or legal conclusions. There are no s
 | Effort | 4–7 senior-engineer person-days, provisional; see ticket assumptions |
 | Dependencies | [T-001](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-001), [T-006](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-006), [T-007](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-007), [T-009](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-009) |
 | Open decisions | [D-07](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-07), [D-13](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-13) |
-| Release blocker status | Blocks current affected launch path |
+| Release blocker status | Closed; gate G-010 verified PASS |
 | Implementation and verification | [T-010](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-010), [AT-010](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-010), [G-010](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-010) |
 
 **Description, business and technical impact.** schema_version is an event-format version, not a preference revision. Events omit an aggregate state version; registry payloads omit key rules; aggregate_type defaults to consent even for registries/suppressions. Multiple workers and retries can publish out of order. Expiry is evaluated on reads without an expiry event. No consumer reconciliation contract is supplied.
@@ -654,16 +654,16 @@ These are audit priorities, not CVSS scores or legal conclusions. There are no s
 | Field | Audit record |
 | --- | --- |
 | Severity / category | P1 / Infrastructure security |
-| Status | NOT VERIFIED / source enforcement gap |
+| Status | RESOLVED / VERIFIED (T-019) |
 | Affected module(s) | MOD-01 — HTTP API; MOD-02 — Authentication; MOD-06 — Outbox worker; MOD-08 — Build, CI and deployment |
 | Affected users/roles | Security/platform operators |
 | Affected APIs | No direct route; affects runtime, delivery, infrastructure or release evidence |
-| Database implications | No mandatory table change established; implementation design may add approved metadata |
+| Database implications | Least-privilege roles (`consent_api_role`, `consent_worker_role`, `consent_migration_role`) added via `migrations/008_least_privilege_roles.sql` |
 | Proposed accountable role | Platform/security + DBA + identity owner |
 | Effort | 3–6 senior-engineer person-days, provisional; see ticket assumptions |
 | Dependencies | [T-018](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-018) |
 | Open decisions | [D-09](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-09), [D-10](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-10) |
-| Release blocker status | Blocks current affected launch path |
+| Release blocker status | Release unblocked for T-019 scope |
 | Implementation and verification | [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019), [AT-019](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-019), [G-019](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-019) |
 
 **Description, business and technical impact.** JWKS accepts configurable HTTP URLs; API serves plaintext behind an unspecified boundary; NATS credentials do not themselves require TLS. The manifest uses nats:// and no CA setting. Database TLS/roles and broker tenant ACLs are not supplied. This is not evidence that actual production traffic is plaintext.
@@ -720,11 +720,11 @@ These are audit priorities, not CVSS scores or legal conclusions. There are no s
 | Field | Audit record |
 | --- | --- |
 | Severity / category | P1 / Observability |
-| Status | CONFIRMED — source/configuration gap |
+| Status | RESOLVED — implemented and verified in T-021 |
 | Affected module(s) | MOD-01 — HTTP API; MOD-06 — Outbox worker; MOD-08 — Build, CI and deployment |
 | Affected users/roles | SRE, support, privacy operations |
 | Affected APIs | No direct route; affects runtime, delivery, infrastructure or release evidence |
-| Database implications | No mandatory table change established; implementation design may add approved metadata |
+| Database implications | Added outbox quarantine schema (quarantined, quarantined_at, quarantine_reason) |
 | Proposed accountable role | SRE + backend engineer |
 | Effort | 3–5 senior-engineer person-days, provisional; see ticket assumptions |
 | Dependencies | [T-009](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-009), [T-012](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-012), [T-013](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-013), [T-015](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-015) |

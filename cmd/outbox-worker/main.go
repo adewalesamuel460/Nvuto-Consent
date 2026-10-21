@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Atlasfsp/Nvuto-Consent/internal/auth"
+	"github.com/Atlasfsp/Nvuto-Consent/internal/observability"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
@@ -23,16 +25,18 @@ import (
 type event = store.OutboxRecord
 
 type cloudEvent struct {
-	SpecVersion   string          `json:"specversion"`
-	ID            string          `json:"id"`
-	Source        string          `json:"source"`
-	Type          string          `json:"type"`
-	Subject       string          `json:"subject"`
-	Time          time.Time       `json:"time"`
-	DataType      string          `json:"datacontenttype"`
-	SchemaVersion int             `json:"nvutoschemaversion"`
-	TenantID      string          `json:"nvutotenantid"`
-	Data          json.RawMessage `json:"data"`
+	SpecVersion       string          `json:"specversion"`
+	ID                string          `json:"id"`
+	Source            string          `json:"source"`
+	Type              string          `json:"type"`
+	Subject           string          `json:"subject"`
+	Time              time.Time       `json:"time"`
+	DataType          string          `json:"datacontenttype"`
+	SchemaVersion     int             `json:"nvutoschemaversion"`
+	TenantID          string          `json:"nvutotenantid"`
+	AggregateType     string          `json:"nvutoaggregatetype,omitempty"`
+	AggregateRevision int64           `json:"nvutoaggregaterevision,omitempty"`
+	Data              json.RawMessage `json:"data"`
 }
 
 const (
@@ -52,6 +56,7 @@ const (
 	// re-published under the same Msg-Id, which JetStream then drops.
 	jetStreamDuplicateWindow = 10 * time.Minute
 	completionAttempts       = 3
+	defaultMaxAttempts       = 5
 )
 
 // publishFunc publishes one event and returns once the broker acknowledged
@@ -66,6 +71,7 @@ type worker struct {
 	publish        publishFunc
 	id             string
 	batchSize      int
+	maxAttempts    int
 	tenantFilter   string
 	pollInterval   time.Duration
 	publishTimeout time.Duration
@@ -79,7 +85,8 @@ type worker struct {
 func newWorker(leaser store.OutboxLeaser, publish publishFunc, id string) *worker {
 	return &worker{
 		leaser: leaser, publish: publish, id: id,
-		batchSize: defaultBatchSize, pollInterval: defaultPollInterval,
+		batchSize: defaultBatchSize, maxAttempts: defaultMaxAttempts,
+		pollInterval:   defaultPollInterval,
 		publishTimeout: defaultPublishTimeout, leaseMargin: leaseSafetyMargin,
 		shutdownGrace: defaultShutdownGrace, now: time.Now,
 		logger: slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
@@ -166,6 +173,12 @@ func (w *worker) cycle(soft, hard context.Context) bool {
 		w.logEvent(slog.LevelInfo, "claim_succeeded", slog.String("worker_id", w.id), slog.Int("claimed_count", len(claim.Events)), slog.Duration("lease", claim.Lease))
 	}
 	processed := w.process(soft, hard, claim, started)
+	if lag, err := w.leaser.OutboxLag(hard, w.tenantFilter); err == nil {
+		observability.DefaultMetrics.SetOutboxLag(w.tenantFilter, lag.Seconds())
+	}
+	if count, err := w.leaser.QuarantinedOutboxCount(hard, w.tenantFilter); err == nil {
+		observability.DefaultMetrics.SetOutboxPendingCount(w.tenantFilter, float64(count))
+	}
 	if len(claim.Events) > 0 {
 		w.logEvent(slog.LevelInfo, "batch_completed", slog.String("worker_id", w.id), slog.Int("claimed_count", len(claim.Events)), slog.Int("processed_count", processed), slog.Duration("duration", w.now().Sub(started)))
 	}
@@ -190,10 +203,12 @@ func (w *worker) process(soft, hard context.Context, claim store.OutboxClaim, st
 		}
 		limit := min(remaining, w.publishTimeout)
 		publishCtx, cancel := context.WithTimeout(soft, limit)
+		observability.DefaultMetrics.RecordOutboxPublishAttempt(item.TenantID, item.EventType)
 		err := w.publish(publishCtx, item)
 		budgetHit := errors.Is(publishCtx.Err(), context.DeadlineExceeded) && limit < w.publishTimeout
 		cancel()
 		if err == nil {
+			observability.DefaultMetrics.RecordOutboxPublishSuccess(item.TenantID, item.EventType)
 			w.logEvent(slog.LevelInfo, "publish_succeeded", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("event_type", item.EventType), slog.String("aggregate_id", item.AggregateID))
 			w.complete(hard, claim.Token, item)
 			processed++
@@ -209,12 +224,33 @@ func (w *worker) process(soft, hard context.Context, claim store.OutboxClaim, st
 			w.release(hard, claim.Token, claim.Events[i:], "lease budget exhausted during publish")
 			return processed
 		}
-		w.logEvent(slog.LevelWarn, "publish_failed", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("event_type", item.EventType), slog.Int("attempts", item.Attempts), slog.String("error", err.Error()))
+		w.logEvent(slog.LevelWarn, "publish_failed", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("event_type", item.EventType), slog.Int("attempts", item.Attempts+1), slog.String("error", err.Error()))
 		w.emitLogf("publish %s failed: %v", item.ID, err)
-		w.retry(hard, claim.Token, item)
+		observability.DefaultMetrics.RecordOutboxPublishFailure(item.TenantID, item.EventType, "publish_error")
+		if item.Attempts+1 >= w.maxAttempts {
+			w.quarantine(hard, claim.Token, item, err.Error())
+		} else {
+			w.retry(hard, claim.Token, item)
+		}
 		processed++
 	}
 	return processed
+}
+
+func (w *worker) quarantine(ctx context.Context, token string, item event, reason string) {
+	err := w.leaser.QuarantineOutbox(ctx, item.ID, token, reason)
+	switch {
+	case errors.Is(err, store.ErrLeaseLost) || errors.Is(err, store.ErrOutboxClaimLost):
+		w.logEvent(slog.LevelWarn, "quarantine_refused", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("reason", "lease_lost"))
+		w.emitLogf("quarantine %s refused: lease is owned by a newer claim", item.ID)
+	case err != nil:
+		w.logEvent(slog.LevelError, "quarantine_failed", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("error", err.Error()))
+		w.emitLogf("quarantine %s failed: %v", item.ID, err)
+	default:
+		w.logEvent(slog.LevelError, "event_quarantined", slog.String("worker_id", w.id), slog.String("event_id", item.ID), slog.String("tenant_id", item.TenantID), slog.String("event_type", item.EventType), slog.Int("attempts", item.Attempts+1), slog.String("reason", reason))
+		w.emitLogf("event %s quarantined after %d attempts: %s", item.ID, item.Attempts+1, reason)
+		observability.DefaultMetrics.RecordOutboxQuarantined(item.TenantID, item.EventType)
+	}
 }
 
 // complete records publication. A lost lease means a newer claim owns the
@@ -308,16 +344,18 @@ func subject(prefix string, item event) string {
 
 func envelope(item event) ([]byte, error) {
 	return json.Marshal(cloudEvent{
-		SpecVersion:   "1.0",
-		ID:            item.ID,
-		Source:        item.Source,
-		Type:          item.EventType,
-		Subject:       item.AggregateType + "/" + item.AggregateID,
-		Time:          item.OccurredAt,
-		DataType:      "application/json",
-		SchemaVersion: item.SchemaVersion,
-		TenantID:      item.TenantID,
-		Data:          item.Payload,
+		SpecVersion:       "1.0",
+		ID:                item.ID,
+		Source:            item.Source,
+		Type:              item.EventType,
+		Subject:           item.AggregateType + "/" + item.AggregateID,
+		Time:              item.OccurredAt,
+		DataType:          "application/json",
+		SchemaVersion:     item.SchemaVersion,
+		TenantID:          item.TenantID,
+		AggregateType:     item.AggregateType,
+		AggregateRevision: item.AggregateRevision,
+		Data:              item.Payload,
 	})
 }
 
@@ -332,6 +370,8 @@ func publish(ctx context.Context, js nats.JetStreamContext, prefix string, item 
 	message.Header.Set(nats.MsgIdHdr, item.ID)
 	message.Header.Set("Content-Type", "application/cloudevents+json")
 	message.Header.Set("X-Nvuto-Tenant-ID", item.TenantID)
+	message.Header.Set("X-Nvuto-Aggregate-Type", item.AggregateType)
+	message.Header.Set("X-Nvuto-Aggregate-Revision", strconv.FormatInt(item.AggregateRevision, 10))
 	message.Data = body
 	_, err = js.PublishMsg(message, nats.Context(ctx))
 	return err
@@ -453,11 +493,90 @@ func newWorkerHealthMux(h *workerHealthHandler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", h.healthz)
 	mux.HandleFunc("/readyz", h.readyz)
+	mux.Handle("/metrics", observability.Handler())
 	return mux
 }
 
 func newWorkerHealthServer(repo store.Repository, nc *nats.Conn, js nats.JetStreamContext, stream string) http.Handler {
 	return newWorkerHealthMux(&workerHealthHandler{repo: repo, nc: nc, js: js, stream: stream})
+}
+
+func validateDatabaseTLS(databaseURL string, allowDev, isProduction bool) error {
+	u, err := url.Parse(databaseURL)
+	var sslmode string
+	if err == nil && u != nil {
+		sslmode = strings.ToLower(strings.TrimSpace(u.Query().Get("sslmode")))
+	}
+	if sslmode == "" {
+		for _, part := range strings.Fields(databaseURL) {
+			if strings.HasPrefix(strings.ToLower(part), "sslmode=") {
+				sslmode = strings.ToLower(strings.TrimPrefix(part, "sslmode="))
+				break
+			}
+		}
+	}
+	if sslmode == "disable" && !allowDev {
+		return errors.New("sslmode=disable is prohibited in production configuration (requires ALLOW_DEV_HEADERS=true)")
+	}
+	if isProduction && sslmode != "verify-full" && sslmode != "require" && sslmode != "verify-ca" {
+		return errors.New("DATABASE_URL requires sslmode=verify-full or sslmode=require in production")
+	}
+	return nil
+}
+
+type natsConfig struct {
+	URL           string
+	CredsFile     string
+	NkeyFile      string
+	ClientCert    string
+	ClientKey     string
+	RootCA        string
+	AllowInsecure bool
+	WorkerID      string
+}
+
+func configureNATS(cfg natsConfig) ([]nats.Option, error) {
+	if cfg.URL == "" {
+		return nil, errors.New("NATS_URL is required")
+	}
+	if !cfg.AllowInsecure && !strings.HasPrefix(cfg.URL, "tls://") {
+		return nil, errors.New("NATS_URL must use tls:// scheme unless ALLOW_INSECURE_NATS=true")
+	}
+	opts := []nats.Option{
+		nats.Name(cfg.WorkerID),
+		nats.Timeout(10 * time.Second),
+		nats.MaxReconnects(-1),
+	}
+	if strings.HasPrefix(cfg.URL, "tls://") {
+		opts = append(opts, nats.Secure())
+	}
+	hasAuth := false
+	if cfg.CredsFile != "" {
+		opts = append(opts, nats.UserCredentials(cfg.CredsFile))
+		hasAuth = true
+	}
+	if cfg.NkeyFile != "" {
+		nkeyOpt, err := nats.NkeyOptionFromSeed(cfg.NkeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load NKEY seed file: %w", err)
+		}
+		opts = append(opts, nkeyOpt)
+		hasAuth = true
+	}
+	if cfg.ClientCert != "" || cfg.ClientKey != "" {
+		if cfg.ClientCert == "" || cfg.ClientKey == "" {
+			return nil, errors.New("both NATS_CLIENT_CERT and NATS_CLIENT_KEY must be provided for mTLS")
+		}
+		opts = append(opts, nats.ClientCert(cfg.ClientCert, cfg.ClientKey))
+		hasAuth = true
+	}
+	if !hasAuth && !cfg.AllowInsecure {
+		return nil, errors.New("NATS authentication credentials (creds, nkey, or client cert/key) are required unless ALLOW_INSECURE_NATS=true")
+	}
+	if cfg.RootCA != "" {
+		opts = append(opts, nats.RootCAs(cfg.RootCA))
+	}
+	return opts, nil
 }
 
 func main() {
@@ -475,6 +594,16 @@ func main() {
 		fatal("auth configuration invalid", err)
 	}
 
+	allowDev := strings.EqualFold(os.Getenv("ALLOW_DEV_HEADERS"), "true")
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("ENVIRONMENT")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+	}
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("NVUTO_ENV")))
+	}
+	isProduction := env == "production" || env == "prod"
+
 	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	natsURL := strings.TrimSpace(os.Getenv("NATS_URL"))
 	if databaseURL == "" || natsURL == "" {
@@ -482,6 +611,9 @@ func main() {
 	}
 	if _, err := pgxpool.ParseConfig(databaseURL); err != nil {
 		fatal("malformed DATABASE_URL", err)
+	}
+	if err := validateDatabaseTLS(databaseURL, allowDev, isProduction); err != nil {
+		fatal("database security configuration invalid", err)
 	}
 	stream := strings.TrimSpace(os.Getenv("NATS_STREAM"))
 	if stream == "" {
@@ -512,6 +644,20 @@ func main() {
 	if workerID == "" {
 		workerID = "consent-outbox-worker"
 	}
+	natsOpts, err := configureNATS(natsConfig{
+		URL:           natsURL,
+		CredsFile:     strings.TrimSpace(os.Getenv("NATS_CREDS_FILE")),
+		NkeyFile:      strings.TrimSpace(os.Getenv("NATS_NKEY_FILE")),
+		ClientCert:    strings.TrimSpace(os.Getenv("NATS_CLIENT_CERT")),
+		ClientKey:     strings.TrimSpace(os.Getenv("NATS_CLIENT_KEY")),
+		RootCA:        strings.TrimSpace(os.Getenv("NATS_TLS_CA_FILE")),
+		AllowInsecure: strings.EqualFold(os.Getenv("ALLOW_INSECURE_NATS"), "true"),
+		WorkerID:      workerID,
+	})
+	if err != nil {
+		fatal("nats security configuration invalid", err)
+	}
+
 	stop, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	connectCtx, cancelConnect := context.WithTimeout(stop, 30*time.Second)
@@ -521,16 +667,8 @@ func main() {
 		fatal("postgres connection failed", err)
 	}
 	defer repo.Close()
-	natsOptions := []nats.Option{nats.Name(workerID), nats.Timeout(10 * time.Second), nats.MaxReconnects(-1)}
-	if credentialsFile := strings.TrimSpace(os.Getenv("NATS_CREDS_FILE")); credentialsFile != "" {
-		natsOptions = append(natsOptions, nats.UserCredentials(credentialsFile))
-	} else if !strings.EqualFold(os.Getenv("ALLOW_INSECURE_NATS"), "true") {
-		fatal("NATS_CREDS_FILE is required unless ALLOW_INSECURE_NATS=true", nil)
-	}
-	if rootCA := strings.TrimSpace(os.Getenv("NATS_TLS_CA_FILE")); rootCA != "" {
-		natsOptions = append(natsOptions, nats.RootCAs(rootCA))
-	}
-	connection, err := nats.Connect(natsURL, natsOptions...)
+
+	connection, err := nats.Connect(natsURL, natsOpts...)
 	if err != nil {
 		fatal("nats connection failed", err)
 	}
@@ -570,8 +708,16 @@ func main() {
 		_ = healthServer.Shutdown(shutdownCtx)
 	}()
 
+	maxAttempts := defaultMaxAttempts
+	if configured := strings.TrimSpace(os.Getenv("OUTBOX_MAX_ATTEMPTS")); configured != "" {
+		if parsed, err := strconv.Atoi(configured); err == nil && parsed > 0 {
+			maxAttempts = parsed
+		}
+	}
+
 	w := newWorker(repo, func(ctx context.Context, item event) error { return publish(ctx, js, prefix, item) }, workerID)
 	w.logger = logger
+	w.maxAttempts = maxAttempts
 	w.shutdownGrace, w.publishTimeout = shutdownGrace, publishTimeout
 	logger.Info("outbox_worker_started",
 		slog.String("worker_id", workerID),
