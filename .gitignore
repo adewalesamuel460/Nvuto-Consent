@@ -17,3 +17,12 @@ go.work
 # Test results and temporary logs
 test-results/
 *.log
+
+# Local deployment secrets (never commit secrets to git)
+deploy/overlays/*/secrets.env
+deploy/overlays/*/nats.creds
+*.env
+!*.env.example
+!deploy/overlays/*/config.env
+*.creds
+!*.creds.example

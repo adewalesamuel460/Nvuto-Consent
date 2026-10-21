@@ -284,3 +284,79 @@ func TestMemoryIdempotentReplayDoesNotAdvanceGeneration(t *testing.T) {
 		t.Fatal("conflicting replay must not advance the generation")
 	}
 }
+
+func TestMemoryDeterministicOrderingOnTimestampTies(t *testing.T) {
+	m := NewMemory()
+	now := time.Now().UTC()
+
+	// 1. Consent tie-breaking on same UpdatedAt
+	// c1 and c2 have the same UpdatedAt, but c2 has higher PreferenceGeneration
+	c1 := genConsent("con_gen1", domain.StatusGranted, now)
+	c1.PreferenceGeneration = 1
+	c2 := genConsent("con_gen2", domain.StatusWithdrawn, now)
+	c2.PreferenceGeneration = 2
+
+	m.SeedConsent(c1)
+	m.SeedConsent(c2)
+
+	eff, err := m.FindEffective(context.Background(), genTenant, "cus-1", "marketing", "email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eff.ID != "con_gen2" {
+		t.Fatalf("higher generation must win on timestamp tie, got %s", eff.ID)
+	}
+
+	// 2. Consent fallback to descending ID when Generation AND UpdatedAt tie
+	cA := genConsent("con_alpha", domain.StatusGranted, now)
+	cA.PreferenceGeneration = 5
+	cZ := genConsent("con_omega", domain.StatusWithdrawn, now)
+	cZ.PreferenceGeneration = 5
+
+	m2 := NewMemory()
+	m2.SeedConsent(cA)
+	m2.SeedConsent(cZ)
+
+	eff2, err := m2.FindEffective(context.Background(), genTenant, "cus-1", "marketing", "email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eff2.ID != "con_omega" {
+		t.Fatalf("descending ID must win when gen and updated_at tie, got %s", eff2.ID)
+	}
+
+	// 3. Suppression tie-breaking on same UpdatedAt
+	// Higher scope rank wins (Global=3 > Channel=2)
+	sGlobal := domain.Suppression{
+		ID:        "sup_global",
+		TenantID:  genTenant,
+		SubjectID: "cus-1",
+		Scope:     domain.SuppressionGlobal,
+		Active:    true,
+		UpdatedAt: now,
+	}
+	sChannel := domain.Suppression{
+		ID:        "sup_channel",
+		TenantID:  genTenant,
+		SubjectID: "cus-1",
+		Scope:     domain.SuppressionChannel,
+		Channel:   "email",
+		Active:    true,
+		UpdatedAt: now,
+	}
+	m3 := NewMemory()
+	if _, err := m3.SetSuppression(context.Background(), sChannel, domain.AuditEvent{}, domain.OutboxEvent{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m3.SetSuppression(context.Background(), sGlobal, domain.AuditEvent{}, domain.OutboxEvent{}); err != nil {
+		t.Fatal(err)
+	}
+
+	sup, err := m3.FindSuppression(context.Background(), genTenant, "cus-1", "marketing", "email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sup.ID != "sup_global" || sup.Scope != domain.SuppressionGlobal {
+		t.Fatalf("global suppression must take precedence over channel suppression, got %+v", sup)
+	}
+}

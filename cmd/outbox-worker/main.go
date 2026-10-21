@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,7 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Atlasfsp/Nvuto-Consent/internal/auth"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/store"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 )
 
@@ -386,6 +389,77 @@ func durationEnv(name string, fallback, lowest, highest time.Duration) (time.Dur
 	return parsed, nil
 }
 
+// workerHealthHandler provides operational liveness and readiness probe endpoints (T-015).
+type workerHealthHandler struct {
+	repo        store.Repository
+	nc          *nats.Conn
+	js          nats.JetStreamContext
+	stream      string
+	customReady func(ctx context.Context) error
+}
+
+func (h *workerHealthHandler) checkReadiness(ctx context.Context) error {
+	if h.customReady != nil {
+		return h.customReady(ctx)
+	}
+	if h.repo != nil {
+		if err := h.repo.Ping(ctx); err != nil {
+			return fmt.Errorf("database unreachable: %w", err)
+		}
+		if err := h.repo.VerifySchema(ctx); err != nil {
+			return fmt.Errorf("database schema unverified: %w", err)
+		}
+	}
+	if h.nc != nil && h.nc.Status() != nats.CONNECTED {
+		return fmt.Errorf("nats disconnected (status=%v)", h.nc.Status())
+	}
+	if h.js != nil && h.stream != "" {
+		if _, err := h.js.StreamInfo(h.stream); err != nil {
+			return fmt.Errorf("jetstream stream %s check failed: %w", h.stream, err)
+		}
+	}
+	return nil
+}
+
+func (h *workerHealthHandler) healthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (h *workerHealthHandler) readyz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.checkReadiness(r.Context()); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not_ready", "reason": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+func newWorkerHealthMux(h *workerHealthHandler) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", h.healthz)
+	mux.HandleFunc("/readyz", h.readyz)
+	return mux
+}
+
+func newWorkerHealthServer(repo store.Repository, nc *nats.Conn, js nats.JetStreamContext, stream string) http.Handler {
+	return newWorkerHealthMux(&workerHealthHandler{repo: repo, nc: nc, js: js, stream: stream})
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	fatal := func(msg string, err error) {
@@ -397,10 +471,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := auth.ValidateConfig(); err != nil {
+		fatal("auth configuration invalid", err)
+	}
+
 	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	natsURL := strings.TrimSpace(os.Getenv("NATS_URL"))
 	if databaseURL == "" || natsURL == "" {
 		fatal("DATABASE_URL and NATS_URL are required", nil)
+	}
+	if _, err := pgxpool.ParseConfig(databaseURL); err != nil {
+		fatal("malformed DATABASE_URL", err)
 	}
 	stream := strings.TrimSpace(os.Getenv("NATS_STREAM"))
 	if stream == "" {
@@ -461,6 +542,34 @@ func main() {
 	if err := ensureStream(js, stream, prefix, replicas); err != nil {
 		fatal("ensure stream failed", err)
 	}
+
+	healthPort := strings.TrimSpace(os.Getenv("HEALTH_PORT"))
+	if healthPort == "" {
+		healthPort = strings.TrimSpace(os.Getenv("PORT"))
+	}
+	if healthPort == "" {
+		healthPort = "8081"
+	}
+	if !strings.HasPrefix(healthPort, ":") {
+		healthPort = ":" + healthPort
+	}
+	healthHandler := newWorkerHealthServer(repo, connection, js, stream)
+	healthServer := &http.Server{
+		Addr:              healthPort,
+		Handler:           healthHandler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := healthServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("health_server_failed", slog.String("error", err.Error()))
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelShutdown()
+		_ = healthServer.Shutdown(shutdownCtx)
+	}()
+
 	w := newWorker(repo, func(ctx context.Context, item event) error { return publish(ctx, js, prefix, item) }, workerID)
 	w.logger = logger
 	w.shutdownGrace, w.publishTimeout = shutdownGrace, publishTimeout

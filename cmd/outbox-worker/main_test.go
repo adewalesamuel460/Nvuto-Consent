@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -185,4 +188,138 @@ func TestWorkerStructuredJSONLoggingCriticalEvents(t *testing.T) {
 		t.Fatalf("missing required structured log events: claim=%v, publish=%v, batch=%v. Log buffer: %s",
 			foundClaim, foundPublish, foundBatch, logBuf.String())
 	}
+}
+
+func TestWorkerHealthEndpointsMethodRestrictions(t *testing.T) {
+	h := &workerHealthHandler{}
+	mux := newWorkerHealthMux(h)
+
+	methods := []string{http.MethodPost, http.MethodPut, http.MethodDelete, "CONNECT"}
+	endpoints := []string{"/healthz", "/readyz"}
+
+	for _, endpoint := range endpoints {
+		for _, method := range methods {
+			t.Run(endpoint+"_"+method, func(t *testing.T) {
+				req := httptest.NewRequest(method, endpoint, nil)
+				resp := httptest.NewRecorder()
+				mux.ServeHTTP(resp, req)
+
+				if resp.Code != http.StatusMethodNotAllowed {
+					t.Fatalf("expected 405 Method Not Allowed for %s %s, got %d", method, endpoint, resp.Code)
+				}
+				if allow := resp.Header().Get("Allow"); allow != http.MethodGet {
+					t.Fatalf("expected Allow: %s, got %s", http.MethodGet, allow)
+				}
+			})
+		}
+	}
+}
+
+func TestWorkerHealthLivenessIndependentOfDependencies(t *testing.T) {
+	// Worker liveness should return 200 even when dependencies fail readiness
+	h := &workerHealthHandler{
+		customReady: func(ctx context.Context) error {
+			return errors.New("dependencies down")
+		},
+	}
+	mux := newWorkerHealthMux(h)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	resp := httptest.NewRecorder()
+	mux.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /healthz, got %d", resp.Code)
+	}
+
+	var body map[string]string
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "ok" {
+		t.Fatalf("expected status: ok, got %v", body["status"])
+	}
+}
+
+type mockWorkerRepo struct {
+	store.Repository
+	pingErr         error
+	verifySchemaErr error
+}
+
+func (m *mockWorkerRepo) Ping(ctx context.Context) error {
+	return m.pingErr
+}
+
+func (m *mockWorkerRepo) VerifySchema(ctx context.Context) error {
+	return m.verifySchemaErr
+}
+
+func TestWorkerReadyzReflectsDependencies(t *testing.T) {
+	t.Run("fails when database ping fails", func(t *testing.T) {
+		h := &workerHealthHandler{
+			repo: &mockWorkerRepo{
+				Repository: store.NewMemory(),
+				pingErr:    errors.New("db connection refused"),
+			},
+		}
+		mux := newWorkerHealthMux(h)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		resp := httptest.NewRecorder()
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 for failed ping, got %d", resp.Code)
+		}
+		var body map[string]string
+		if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body["status"] != "not_ready" {
+			t.Fatalf("expected status: not_ready, got %v", body["status"])
+		}
+	})
+
+	t.Run("fails when schema verification fails", func(t *testing.T) {
+		h := &workerHealthHandler{
+			repo: &mockWorkerRepo{
+				Repository:      store.NewMemory(),
+				verifySchemaErr: errors.New("missing outbox table"),
+			},
+		}
+		mux := newWorkerHealthMux(h)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		resp := httptest.NewRecorder()
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 for failed schema, got %d", resp.Code)
+		}
+	})
+
+	t.Run("succeeds when ready", func(t *testing.T) {
+		h := &workerHealthHandler{
+			customReady: func(ctx context.Context) error {
+				return nil
+			},
+		}
+		mux := newWorkerHealthMux(h)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		resp := httptest.NewRecorder()
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for ready worker, got %d", resp.Code)
+		}
+		var body map[string]string
+		if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body["status"] != "ready" {
+			t.Fatalf("expected status: ready, got %v", body["status"])
+		}
+	})
 }

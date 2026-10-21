@@ -15,7 +15,12 @@ import (
 )
 
 // ErrValidation matches every input-validation and policy-rejection error.
-var ErrValidation = domain.ErrValidation
+var (
+	ErrValidation                      = domain.ErrValidation
+	ErrUnsupportedHistoricalEvaluation = domain.ErrUnsupportedHistoricalEvaluation
+)
+
+const maxEvaluationClockSkew = time.Minute
 
 type Service struct{ repo store.Repository }
 
@@ -129,9 +134,69 @@ func (s *Service) PublishNotice(ctx context.Context, tenantID, actorID string, n
 		return domain.PrivacyNotice{}, invalid("published_at", "must not be in the future")
 	}
 	notice.TenantID = tenantID
+	if notice.ContentHash == "" {
+		if notice.Content != "" {
+			digest := sha256.Sum256([]byte(notice.Content))
+			notice.ContentHash = "sha256:" + hex.EncodeToString(digest[:])
+		} else {
+			digest := sha256.Sum256([]byte(notice.TenantID + ":" + notice.Jurisdiction + ":" + notice.Version))
+			notice.ContentHash = "sha256:" + hex.EncodeToString(digest[:])
+		}
+	} else if notice.Content != "" {
+		digest := sha256.Sum256([]byte(notice.Content))
+		expected := "sha256:" + hex.EncodeToString(digest[:])
+		if !hashesEqual(notice.ContentHash, expected) && !hashesEqual(notice.ContentHash, hex.EncodeToString(digest[:])) {
+			return domain.PrivacyNotice{}, invalid("content_hash", "does not match sha256 of notice content")
+		}
+	}
 	audit := domain.AuditEvent{ID: id("aud"), TenantID: tenantID, ActorID: actorID, Action: "consent.notice.published", ConsentID: notice.Version, OccurredAt: notice.PublishedAt, ResourceType: "privacy_notice"}
 	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.notice.published", AggregateID: notice.Version, Payload: map[string]any{"jurisdiction": notice.Jurisdiction, "active": notice.Active}, OccurredAt: notice.PublishedAt}
 	return s.repo.PutNotice(ctx, notice, audit, outbox)
+}
+
+func (s *Service) RetireNotice(ctx context.Context, tenantID, actorID, jurisdiction, version, supersededBy string) (domain.PrivacyNotice, error) {
+	tenantID, actorID = strings.TrimSpace(tenantID), strings.TrimSpace(actorID)
+	jurisdiction = strings.ToUpper(strings.TrimSpace(jurisdiction))
+	version = strings.TrimSpace(version)
+	supersededBy = strings.TrimSpace(supersededBy)
+
+	if err := checkPrincipal(tenantID, actorID); err != nil {
+		return domain.PrivacyNotice{}, err
+	}
+	if err := checkJurisdiction("jurisdiction", jurisdiction); err != nil {
+		return domain.PrivacyNotice{}, err
+	}
+	if err := checkNoticeVersion("version", version); err != nil {
+		return domain.PrivacyNotice{}, err
+	}
+	if supersededBy != "" {
+		if err := checkNoticeVersion("superseded_by", supersededBy); err != nil {
+			return domain.PrivacyNotice{}, err
+		}
+	}
+
+	audit := domain.AuditEvent{
+		ID:           id("aud"),
+		TenantID:     tenantID,
+		ActorID:      actorID,
+		Action:       "consent.notice.retired",
+		ConsentID:    jurisdiction + "/" + version,
+		OccurredAt:   time.Now().UTC(),
+		ResourceType: "privacy_notice",
+	}
+	outbox := domain.OutboxEvent{
+		ID:          id("evt"),
+		TenantID:    tenantID,
+		EventType:   "consent.notice.retired",
+		AggregateID: version,
+		Payload: map[string]any{
+			"jurisdiction":  jurisdiction,
+			"retired":       true,
+			"superseded_by": supersededBy,
+		},
+		OccurredAt: time.Now().UTC(),
+	}
+	return s.repo.RetireNotice(ctx, tenantID, jurisdiction, version, supersededBy, audit, outbox)
 }
 
 // policyLookup separates "the policy record does not exist" (a 422 policy
@@ -149,70 +214,86 @@ func policyLookup(err error, field, message string) error {
 // registries as seen through reader at instant now. The confirmation path
 // passes a reader bound to its transaction so the policy that is checked is the
 // policy in force when the grant commits.
-func checkPolicy(ctx context.Context, reader store.PolicyReader, tenantID, purposeCode, channel, basisCode, jurisdiction, noticeVersion string, evidence domain.Evidence, now time.Time) (domain.Purpose, error) {
+func checkPolicy(ctx context.Context, reader store.PolicyReader, tenantID, purposeCode, channel, basisCode, jurisdiction, noticeVersion string, evidence domain.Evidence, now time.Time) (domain.Purpose, domain.PrivacyNotice, error) {
 	purpose, err := reader.GetPurpose(ctx, tenantID, purposeCode)
 	if err != nil {
-		return domain.Purpose{}, policyLookup(err, "purpose", "is not registered for this tenant")
+		return domain.Purpose{}, domain.PrivacyNotice{}, policyLookup(err, "purpose", "is not registered for this tenant")
 	}
 	if !purpose.Active {
-		return domain.Purpose{}, rejected("purpose", "is not active")
+		return domain.Purpose{}, domain.PrivacyNotice{}, rejected("purpose", "is not active")
 	}
 	if !includes(purpose.AllowedChannels, channel) {
-		return domain.Purpose{}, rejected("channel", "is not allowed for this purpose")
+		return domain.Purpose{}, domain.PrivacyNotice{}, rejected("channel", "is not allowed for this purpose")
 	}
 	basis, err := reader.GetLawfulBasis(ctx, tenantID, basisCode)
 	if err != nil {
-		return domain.Purpose{}, policyLookup(err, "legal_basis", "is not registered for this tenant")
+		return domain.Purpose{}, domain.PrivacyNotice{}, policyLookup(err, "legal_basis", "is not registered for this tenant")
 	}
 	if !basis.Active || !includes(basis.AllowedCategories, purpose.Category) {
-		return domain.Purpose{}, rejected("legal_basis", "is not active or does not cover the purpose category")
+		return domain.Purpose{}, domain.PrivacyNotice{}, rejected("legal_basis", "is not active or does not cover the purpose category")
 	}
 	notice, err := reader.GetNotice(ctx, tenantID, jurisdiction, noticeVersion)
 	if err != nil {
-		return domain.Purpose{}, policyLookup(err, "notice_version", "is not published for this jurisdiction")
+		return domain.Purpose{}, domain.PrivacyNotice{}, policyLookup(err, "notice_version", "is not published for this jurisdiction")
 	}
-	if !notice.Active || notice.PublishedAt.After(now) {
-		return domain.Purpose{}, rejected("notice_version", "is not active or not yet published")
+	if !notice.Active || notice.Retired || notice.PublishedAt.After(now) {
+		return domain.Purpose{}, domain.PrivacyNotice{}, rejected("notice_version", "is not active, retired, or not yet published")
 	}
 	if basis.RequiresEvidence {
 		switch {
 		case strings.TrimSpace(evidence.Method) == "" || strings.TrimSpace(evidence.ArtifactHash) == "" || evidence.CollectedAt.IsZero():
-			return domain.Purpose{}, rejected("evidence", "is required by the lawful basis")
+			return domain.Purpose{}, domain.PrivacyNotice{}, rejected("evidence", "is required by the lawful basis")
 		case evidence.CollectedAt.Before(notice.PublishedAt):
-			return domain.Purpose{}, rejected("evidence.collected_at", "must not precede the notice publication")
+			return domain.Purpose{}, domain.PrivacyNotice{}, rejected("evidence.collected_at", "must not precede the notice publication")
 		case evidence.CollectedAt.After(now):
-			return domain.Purpose{}, rejected("evidence.collected_at", "must not be in the future")
+			return domain.Purpose{}, domain.PrivacyNotice{}, rejected("evidence.collected_at", "must not be in the future")
 		}
 	}
-	return purpose, nil
+	return purpose, notice, nil
 }
 
 // admitGoverned applies the registry policy and the grant rules that depend
 // on the purpose. A grant may only be recorded when every rule passes.
-func (s *Service) admitGoverned(ctx context.Context, in governedInput, now time.Time) error {
-	purpose, err := checkPolicy(ctx, s.repo, in.TenantID, in.Purpose, in.Channel, in.LegalBasis, in.Jurisdiction, in.NoticeVersion, in.Evidence, now)
+// Opt-outs (denials) bypass strict policy availability checks so a subject cannot
+// be blocked from opting out or denying consent (T-027).
+func (s *Service) admitGoverned(ctx context.Context, in governedInput, now time.Time) (domain.Purpose, domain.PrivacyNotice, error) {
+	if in.Status == domain.StatusDenied {
+		var notice domain.PrivacyNotice
+		if in.NoticeVersion != "" && in.Jurisdiction != "" {
+			notice, _ = s.repo.GetNotice(ctx, in.TenantID, in.Jurisdiction, in.NoticeVersion)
+		}
+		return domain.Purpose{}, notice, nil
+	}
+	purpose, notice, err := checkPolicy(ctx, s.repo, in.TenantID, in.Purpose, in.Channel, in.LegalBasis, in.Jurisdiction, in.NoticeVersion, in.Evidence, now)
 	if err != nil {
-		return err
+		return domain.Purpose{}, domain.PrivacyNotice{}, err
 	}
 	if in.Status == domain.StatusGranted && purpose.RequiresDoubleOptIn {
-		return rejected("status", "this purpose requires double opt-in confirmation")
+		return domain.Purpose{}, domain.PrivacyNotice{}, rejected("status", "this purpose requires double opt-in confirmation")
 	}
 	if in.Status == domain.StatusGranted && purpose.RequiresAffirmativeConsent && in.LegalBasis != "consent" {
-		return rejected("legal_basis", "this purpose requires the consent lawful basis for a grant")
+		return domain.Purpose{}, domain.PrivacyNotice{}, rejected("legal_basis", "this purpose requires the consent lawful basis for a grant")
 	}
-	return nil
+	return purpose, notice, nil
 }
 
 // governedRecords builds the consent, receipt, audit and outbox records for a
 // validated, admitted request.
-func governedRecords(in governedInput, now time.Time) (domain.Consent, domain.ConsentReceipt, domain.AuditEvent, domain.OutboxEvent, error) {
+func governedRecords(in governedInput, now time.Time, purpose domain.Purpose, notice domain.PrivacyNotice) (domain.Consent, domain.ConsentReceipt, domain.AuditEvent, domain.OutboxEvent, error) {
 	consent := domain.Consent{ID: id("con"), TenantID: in.TenantID, SubjectID: in.SubjectID, Purpose: in.Purpose, Channel: in.Channel, LegalBasis: in.LegalBasis, Status: in.Status, Source: in.Source, Scope: in.Scope, Jurisdiction: in.Jurisdiction, NoticeVersion: in.NoticeVersion, Evidence: in.Evidence, Version: 1, ExpiresAt: in.ExpiresAt, CreatedAt: now, UpdatedAt: now}
 	if in.Status == domain.StatusGranted {
 		consent.GrantedAt = &now
 	} else {
 		consent.DeniedAt = &now
 	}
-	receipt, err := makeReceipt(consent, in.Evidence, now)
+	meta := ReceiptMetadata{
+		ActorID:           in.ActorID,
+		ConsentStatus:     in.Status,
+		LegalBasis:        in.LegalBasis,
+		NoticeContentHash: notice.ContentHash,
+		PolicyVersion:     purpose.Version,
+	}
+	receipt, err := makeReceipt(consent, in.Evidence, now, meta)
 	if err != nil {
 		return domain.Consent{}, domain.ConsentReceipt{}, domain.AuditEvent{}, domain.OutboxEvent{}, domain.ErrInternal.Wrap(err)
 	}
@@ -228,10 +309,11 @@ func (s *Service) RecordGoverned(ctx context.Context, tenantID, actorID, subject
 	if err != nil {
 		return domain.Consent{}, err
 	}
-	if err := s.admitGoverned(ctx, in, checkedAt); err != nil {
+	purpose, notice, err := s.admitGoverned(ctx, in, checkedAt)
+	if err != nil {
 		return domain.Consent{}, err
 	}
-	consent, receipt, audit, outbox, err := governedRecords(in, normalizeReceiptTime(time.Now()))
+	consent, receipt, audit, outbox, err := governedRecords(in, normalizeReceiptTime(time.Now()), purpose, notice)
 	if err != nil {
 		return domain.Consent{}, err
 	}
@@ -265,7 +347,7 @@ func (s *Service) Withdraw(ctx context.Context, tenantID, actorID, consentID str
 	return s.repo.Withdraw(ctx, c, audit, outbox)
 }
 
-func (s *Service) SetSuppression(ctx context.Context, tenantID, actorID string, suppression domain.Suppression) (domain.Suppression, error) {
+func (s *Service) SetSuppression(ctx context.Context, tenantID, actorID string, suppression domain.Suppression, callerRoles ...string) (domain.Suppression, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	actorID = strings.TrimSpace(actorID)
 	suppression.SubjectID = strings.TrimSpace(suppression.SubjectID)
@@ -303,12 +385,22 @@ func (s *Service) SetSuppression(ctx context.Context, tenantID, actorID string, 
 	default:
 		return domain.Suppression{}, invalid("scope", "must be global, channel or purpose_channel")
 	}
+
+	// T-030: Capture the caller's highest privileged role in created_by_role.
+	if suppression.CreatedByRole == "" {
+		if len(callerRoles) > 0 {
+			suppression.CreatedByRole = domain.HighestPrivilegedRole(callerRoles)
+		} else {
+			suppression.CreatedByRole = "privacy_admin"
+		}
+	}
+
 	now := time.Now().UTC()
 	suppression.ID = id("sup")
 	suppression.TenantID = tenantID
 	suppression.UpdatedAt = now
 	audit := domain.AuditEvent{ID: id("aud"), TenantID: tenantID, ActorID: actorID, Action: "consent.suppression.changed", ConsentID: suppression.ID, OccurredAt: now, ResourceType: "suppression"}
-	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.suppression.changed", AggregateID: suppression.ID, Payload: map[string]any{"subject_id": suppression.SubjectID, "scope": suppression.Scope, "purpose": suppression.Purpose, "channel": suppression.Channel, "active": suppression.Active}, OccurredAt: now}
+	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: tenantID, EventType: "consent.suppression.changed", AggregateID: suppression.ID, Payload: map[string]any{"subject_id": suppression.SubjectID, "scope": suppression.Scope, "purpose": suppression.Purpose, "channel": suppression.Channel, "active": suppression.Active, "created_by_role": suppression.CreatedByRole}, OccurredAt: now}
 	return s.repo.SetSuppression(ctx, suppression, audit, outbox)
 }
 
@@ -331,7 +423,7 @@ func (s *Service) BatchEvaluate(ctx context.Context, tenantID string, requests [
 		if err != nil {
 			var typed *domain.Error
 			if errors.As(err, &typed) && typed.Kind() == domain.KindValidation && typed.Field() != "" {
-				return nil, invalid(fmt.Sprintf("requests[%d].%s", i, typed.Field()), typed.Message())
+				return nil, typed.WithField(fmt.Sprintf("requests[%d].%s", i, typed.Field()), typed.Message())
 			}
 			return nil, err
 		}
@@ -349,7 +441,7 @@ func (s *Service) StartDoubleOptIn(ctx context.Context, tenantID, actorID, subje
 	if err := checkChallengeExpiry(expiresAt, now); err != nil {
 		return domain.DoubleOptInChallenge{}, err
 	}
-	purpose, err := checkPolicy(ctx, s.repo, in.TenantID, in.Purpose, in.Channel, "consent", in.Jurisdiction, in.NoticeVersion, in.Evidence, now)
+	purpose, _, err := checkPolicy(ctx, s.repo, in.TenantID, in.Purpose, in.Channel, "consent", in.Jurisdiction, in.NoticeVersion, in.Evidence, now)
 	if err != nil {
 		return domain.DoubleOptInChallenge{}, err
 	}
@@ -382,7 +474,25 @@ func (s *Service) StartDoubleOptIn(ctx context.Context, tenantID, actorID, subje
 		UpdatedAt:             now,
 	}
 	audit := domain.AuditEvent{ID: id("aud"), TenantID: in.TenantID, ActorID: in.ActorID, Action: "consent.pending_confirmation", ConsentID: consent.ID, OccurredAt: now}
-	outbox := domain.OutboxEvent{ID: id("evt"), TenantID: in.TenantID, EventType: "consent.pending_confirmation", AggregateID: consent.ID, Payload: map[string]any{"subject_id": in.SubjectID, "purpose": in.Purpose, "channel": in.Channel, "notice_version": in.NoticeVersion}, OccurredAt: now}
+	outbox := domain.OutboxEvent{
+		ID:          id("evt"),
+		TenantID:    in.TenantID,
+		EventType:   "consent.challenge.created",
+		AggregateID: consent.ID,
+		Payload: map[string]any{
+			"tenant_id":             in.TenantID,
+			"subject_id":            in.SubjectID,
+			"purpose":               in.Purpose,
+			"channel":               in.Channel,
+			"destination":           in.Channel,
+			"notice_version":        in.NoticeVersion,
+			"confirmation_token":    token,
+			"expires_at":            expiresAt,
+			"generation":            int64(1),
+			"preference_generation": int64(1),
+		},
+		OccurredAt: now,
+	}
 	stored, err := s.repo.StartDoubleOptIn(ctx, consent, audit, outbox)
 	if err != nil {
 		return domain.DoubleOptInChallenge{}, err
@@ -419,11 +529,28 @@ func (s *Service) ConfirmDoubleOptIn(ctx context.Context, tenantID, actorID stri
 	if !scope.Permits(pending.SubjectID) {
 		return domain.Consent{}, store.ErrNotFound
 	}
+	// Re-validate current policy for target purpose before initiating confirmation.
+	currentPurpose, err := s.repo.GetPurpose(ctx, tenantID, pending.Purpose)
+	if err != nil {
+		return domain.Consent{}, policyLookup(err, "purpose", "is not registered for this tenant")
+	}
+	if !currentPurpose.Active {
+		return domain.Consent{}, rejected("purpose", "is not active")
+	}
+	if !includes(currentPurpose.AllowedChannels, pending.Channel) {
+		return domain.Consent{}, rejected("channel", "is not allowed for this purpose")
+	}
+	if !currentPurpose.RequiresDoubleOptIn {
+		return domain.Consent{}, rejected("purpose", "no longer uses double opt-in")
+	}
+	if currentPurpose.RequiresAffirmativeConsent && pending.LegalBasis != "consent" {
+		return domain.Consent{}, rejected("legal_basis", "this purpose requires the consent lawful basis")
+	}
 	finalize := func(ctx context.Context, policy store.PolicyReader, locked domain.Consent, at time.Time) (domain.ConsentReceipt, domain.AuditEvent, domain.OutboxEvent, error) {
 		if !scope.Permits(locked.SubjectID) {
 			return domain.ConsentReceipt{}, domain.AuditEvent{}, domain.OutboxEvent{}, store.ErrNotFound
 		}
-		purpose, err := checkPolicy(ctx, policy, tenantID, locked.Purpose, locked.Channel, locked.LegalBasis, locked.Jurisdiction, locked.NoticeVersion, locked.Evidence, at)
+		purpose, notice, err := checkPolicy(ctx, policy, tenantID, locked.Purpose, locked.Channel, locked.LegalBasis, locked.Jurisdiction, locked.NoticeVersion, locked.Evidence, at)
 		if err != nil {
 			return domain.ConsentReceipt{}, domain.AuditEvent{}, domain.OutboxEvent{}, err
 		}
@@ -433,7 +560,13 @@ func (s *Service) ConfirmDoubleOptIn(ctx context.Context, tenantID, actorID stri
 		if purpose.RequiresAffirmativeConsent && locked.LegalBasis != "consent" {
 			return domain.ConsentReceipt{}, domain.AuditEvent{}, domain.OutboxEvent{}, rejected("legal_basis", "this purpose requires the consent lawful basis")
 		}
-		receipt, err := makeReceipt(locked, locked.Evidence, at)
+		receipt, err := makeReceipt(locked, locked.Evidence, at, ReceiptMetadata{
+			ActorID:           actorID,
+			ConsentStatus:     domain.StatusGranted,
+			LegalBasis:        locked.LegalBasis,
+			NoticeContentHash: notice.ContentHash,
+			PolicyVersion:     purpose.Version,
+		})
 		if err != nil {
 			return domain.ConsentReceipt{}, domain.AuditEvent{}, domain.OutboxEvent{}, domain.ErrInternal.Wrap(err)
 		}
@@ -499,8 +632,18 @@ func (s *Service) Evaluate(ctx context.Context, tenantID, subjectID, purpose, ch
 			return domain.SuppressionDecision{}, err
 		}
 	}
-	if at.IsZero() {
-		at = time.Now().UTC()
+	now := time.Now().UTC()
+	if !at.IsZero() {
+		at = at.UTC()
+		skew := now.Sub(at)
+		if skew < 0 {
+			skew = -skew
+		}
+		if skew > maxEvaluationClockSkew {
+			return domain.SuppressionDecision{}, ErrUnsupportedHistoricalEvaluation.WithField("at", "evaluation timestamp diverges from current time by more than allowed clock-skew margin (1 minute)")
+		}
+	} else {
+		at = now
 	}
 	suppression, err := s.repo.FindSuppression(ctx, tenantID, subjectID, purpose, channel)
 	if err == nil {
@@ -511,54 +654,120 @@ func (s *Service) Evaluate(ctx context.Context, tenantID, subjectID, purpose, ch
 	}
 	c, err := s.repo.FindEffective(ctx, tenantID, subjectID, purpose, channel)
 	if errors.Is(err, store.ErrNotFound) {
-		return domain.SuppressionDecision{Allowed: false, Reason: "no_consent", EvaluatedAt: at}, nil
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonNoConsent, EvaluatedAt: at}, nil
 	}
 	if err != nil {
 		return domain.SuppressionDecision{}, err
 	}
 	if c.ExpiresAt != nil && !c.ExpiresAt.After(at) {
-		return domain.SuppressionDecision{Allowed: false, Reason: "expired", ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonExpired, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
 	if c.Status != domain.StatusGranted {
 		return domain.SuppressionDecision{Allowed: false, Reason: string(c.Status), ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
+	if c.GrantedAt != nil && c.GrantedAt.After(at) {
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonNotYetGranted, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+	}
 	// Legacy rows with a blank notice_version must no longer bypass governed
 	// policy checks; reject/quarantine them explicitly (T-008).
 	if c.NoticeVersion == "" {
-		return domain.SuppressionDecision{Allowed: false, Reason: "policy_unavailable", ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyUnavailable, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
-	unavailable := domain.SuppressionDecision{Allowed: false, Reason: "policy_unavailable", ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}
 	registeredPurpose, err := s.repo.GetPurpose(ctx, tenantID, purpose)
 	if deny, failure := policyDecision(err); failure != nil {
 		return domain.SuppressionDecision{}, failure
-	} else if deny || !registeredPurpose.Active || !includes(registeredPurpose.AllowedChannels, channel) {
-		return unavailable, nil
+	} else if deny {
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyUnavailable, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+	} else if !registeredPurpose.Active {
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPurposeInactive, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+	} else if !includes(registeredPurpose.AllowedChannels, channel) {
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonChannelNotAllowed, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
 	// Policy transitions (T-007): stronger policy requirements (affirmative
 	// consent or Double-Opt-In) strictly apply to existing grants; unconfirmed
 	// or non-consent grants must not be grandfathered.
 	if registeredPurpose.RequiresAffirmativeConsent && c.LegalBasis != "consent" {
-		return unavailable, nil
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyRequirementUnmet, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
 	if registeredPurpose.RequiresDoubleOptIn && c.ConfirmedAt == nil {
-		return unavailable, nil
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyRequirementUnmet, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
 	basis, err := s.repo.GetLawfulBasis(ctx, tenantID, c.LegalBasis)
 	if deny, failure := policyDecision(err); failure != nil {
 		return domain.SuppressionDecision{}, failure
-	} else if deny || !basis.Active || !includes(basis.AllowedCategories, registeredPurpose.Category) {
-		return unavailable, nil
+	} else if deny {
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyUnavailable, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+	} else if !basis.Active || !includes(basis.AllowedCategories, registeredPurpose.Category) {
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyRequirementUnmet, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
-	if basis.RequiresEvidence && c.Evidence.IsZero() {
-		return unavailable, nil
+	if basis.RequiresEvidence && (c.Evidence.IsZero() || strings.TrimSpace(c.Evidence.ArtifactHash) == "") {
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyRequirementUnmet, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
 	notice, err := s.repo.GetNotice(ctx, tenantID, c.Jurisdiction, c.NoticeVersion)
 	if deny, failure := policyDecision(err); failure != nil {
 		return domain.SuppressionDecision{}, failure
-	} else if deny || !notice.Active || notice.PublishedAt.After(at) {
-		return unavailable, nil
+	} else if deny || !notice.Active || notice.Retired || notice.PublishedAt.After(at) {
+		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyUnavailable, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
-	return domain.SuppressionDecision{Allowed: true, Reason: "granted", ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+	return domain.SuppressionDecision{Allowed: true, Reason: domain.DecisionReasonGranted, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 }
 
-func (s *Service) Ready(ctx context.Context) error { return s.repo.Ping(ctx) }
+func (s *Service) Ready(ctx context.Context) error {
+	if err := s.repo.Ping(ctx); err != nil {
+		return err
+	}
+	return s.repo.VerifySchema(ctx)
+}
+
+func (s *Service) ListConsents(ctx context.Context, tenantID, subjectID string, limit, offset int) ([]domain.Consent, int, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	subjectID = strings.TrimSpace(subjectID)
+	if err := checkText("tenant_id", tenantID, maxIdentifierLen); err != nil {
+		return nil, 0, err
+	}
+	if err := checkText("subject_id", subjectID, maxIdentifierLen); err != nil {
+		return nil, 0, err
+	}
+	limit, offset = sanitizePagination(limit, offset)
+	return s.repo.ListConsents(ctx, tenantID, subjectID, limit, offset)
+}
+
+func (s *Service) ListSuppressions(ctx context.Context, tenantID, subjectID string, limit, offset int) ([]domain.Suppression, int, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	subjectID = strings.TrimSpace(subjectID)
+	if err := checkText("tenant_id", tenantID, maxIdentifierLen); err != nil {
+		return nil, 0, err
+	}
+	if err := checkText("subject_id", subjectID, maxIdentifierLen); err != nil {
+		return nil, 0, err
+	}
+	limit, offset = sanitizePagination(limit, offset)
+	return s.repo.ListSuppressions(ctx, tenantID, subjectID, limit, offset)
+}
+
+func (s *Service) ListPurposes(ctx context.Context, tenantID string, limit, offset int) ([]domain.Purpose, int, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if err := checkText("tenant_id", tenantID, maxIdentifierLen); err != nil {
+		return nil, 0, err
+	}
+	limit, offset = sanitizePagination(limit, offset)
+	return s.repo.ListPurposes(ctx, tenantID, limit, offset)
+}
+
+func (s *Service) ListLawfulBases(ctx context.Context, tenantID string, limit, offset int) ([]domain.LawfulBasis, int, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if err := checkText("tenant_id", tenantID, maxIdentifierLen); err != nil {
+		return nil, 0, err
+	}
+	limit, offset = sanitizePagination(limit, offset)
+	return s.repo.ListLawfulBases(ctx, tenantID, limit, offset)
+}
+
+func (s *Service) ListNotices(ctx context.Context, tenantID string, limit, offset int) ([]domain.PrivacyNotice, int, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if err := checkText("tenant_id", tenantID, maxIdentifierLen); err != nil {
+		return nil, 0, err
+	}
+	limit, offset = sanitizePagination(limit, offset)
+	return s.repo.ListNotices(ctx, tenantID, limit, offset)
+}

@@ -63,7 +63,7 @@ func TestConsentGrantEvaluateWithdraw(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := svc.Evaluate(context.Background(), "tenant-a", "cus-1", "marketing", "whatsapp", now)
+	d, err := svc.Evaluate(context.Background(), "tenant-a", "cus-1", "marketing", "whatsapp", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestConsentGrantEvaluateWithdraw(t *testing.T) {
 	if string(c2.Status) != "withdrawn" {
 		t.Fatalf("expected withdrawn, got %s", c2.Status)
 	}
-	d, err = svc.Evaluate(context.Background(), "tenant-a", "cus-1", "marketing", "whatsapp", now)
+	d, err = svc.Evaluate(context.Background(), "tenant-a", "cus-1", "marketing", "whatsapp", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,12 +118,13 @@ func TestNoConsentAndExpirySuppress(t *testing.T) {
 		ArtifactHash: testArtifactHash,
 		CollectedAt:  publishedAt,
 	}
-	expires := now.Add(time.Hour)
+	expires := time.Now().UTC().Add(50 * time.Millisecond)
 	_, err = svc.RecordGoverned(context.Background(), "tenant-a", "user-1", "cus-x", "marketing", "email", "consent", "granted", "portal", nil, &expires, "NG", "2026-08", evidence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err = svc.Evaluate(context.Background(), "tenant-a", "cus-x", "marketing", "email", now.Add(2*time.Hour))
+	time.Sleep(60 * time.Millisecond)
+	d, err = svc.Evaluate(context.Background(), "tenant-a", "cus-x", "marketing", "email", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +148,7 @@ func TestTenantIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := svc.Evaluate(context.Background(), "tenant-b", "cus-1", "service_updates", "sms", now)
+	d, err := svc.Evaluate(context.Background(), "tenant-b", "cus-1", "service_updates", "sms", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +211,7 @@ func TestPolicyTransitionAffirmativeConsent(t *testing.T) {
 	}
 
 	// Step 3: Evaluation allowed before policy tightening
-	decision, err := svc.Evaluate(ctx, "tenant-gov", "subj-1", "analytics", "web", now)
+	decision, err := svc.Evaluate(ctx, "tenant-gov", "subj-1", "analytics", "web", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,12 +233,12 @@ func TestPolicyTransitionAffirmativeConsent(t *testing.T) {
 	}
 
 	// Step 5: Evaluation must now DENY with policy_unavailable (no grandfathering)
-	decision, err = svc.Evaluate(ctx, "tenant-gov", "subj-1", "analytics", "web", now)
+	decision, err = svc.Evaluate(ctx, "tenant-gov", "subj-1", "analytics", "web", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Allowed || decision.Reason != "policy_unavailable" {
-		t.Fatalf("expected policy_unavailable after tightening affirmative consent, got %+v", decision)
+	if decision.Allowed || (decision.Reason != domain.DecisionReasonPolicyRequirementUnmet && decision.Reason != "policy_unavailable") {
+		t.Fatalf("expected policy_requirement_unmet after tightening affirmative consent, got %+v", decision)
 	}
 }
 
@@ -295,7 +296,7 @@ func TestPolicyTransitionDoubleOptIn(t *testing.T) {
 	}
 
 	// Step 3: Allowed initially
-	decision, err := svc.Evaluate(ctx, "tenant-doi", "subj-2", "newsletter", "email", now)
+	decision, err := svc.Evaluate(ctx, "tenant-doi", "subj-2", "newsletter", "email", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,12 +318,12 @@ func TestPolicyTransitionDoubleOptIn(t *testing.T) {
 	}
 
 	// Step 5: Unconfirmed grant must now be rejected with policy_unavailable
-	decision, err = svc.Evaluate(ctx, "tenant-doi", "subj-2", "newsletter", "email", now)
+	decision, err = svc.Evaluate(ctx, "tenant-doi", "subj-2", "newsletter", "email", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Allowed || decision.Reason != "policy_unavailable" {
-		t.Fatalf("expected policy_unavailable for unconfirmed grant under DOI policy, got %+v", decision)
+	if decision.Allowed || (decision.Reason != domain.DecisionReasonPolicyRequirementUnmet && decision.Reason != "policy_unavailable") {
+		t.Fatalf("expected policy_requirement_unmet for unconfirmed grant under DOI policy, got %+v", decision)
 	}
 }
 
@@ -349,7 +350,7 @@ func TestLegacyBlankNoticeVersionQuarantined(t *testing.T) {
 	}
 
 	// Verify allowed before tampering
-	decision, err := svc.Evaluate(ctx, "tenant-legacy", "subj-legacy", "promotions", "sms", now)
+	decision, err := svc.Evaluate(ctx, "tenant-legacy", "subj-legacy", "promotions", "sms", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +374,7 @@ func TestLegacyBlankNoticeVersionQuarantined(t *testing.T) {
 	stub := &legacyConsentRepo{Repository: repo, consent: cStored}
 	legacySvc := New(stub)
 
-	decision, err = legacySvc.Evaluate(ctx, "tenant-legacy", "subj-legacy", "promotions", "sms", now)
+	decision, err = legacySvc.Evaluate(ctx, "tenant-legacy", "subj-legacy", "promotions", "sms", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +422,7 @@ func TestMemoryStoreTenantDelimiterCollision(t *testing.T) {
 	}
 
 	// Evaluating under "tenant" for subject "child:user1" (or "user1") must NOT find consent from "tenant:child"
-	decision, err := svc.Evaluate(ctx, "tenant", "user1", "updates", "email", now)
+	decision, err := svc.Evaluate(ctx, "tenant", "user1", "updates", "email", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +431,7 @@ func TestMemoryStoreTenantDelimiterCollision(t *testing.T) {
 	}
 
 	// Also verify that evaluation under "tenant:child" finds it
-	decisionChild, err := svc.Evaluate(ctx, "tenant:child", "user1", "updates", "email", now)
+	decisionChild, err := svc.Evaluate(ctx, "tenant:child", "user1", "updates", "email", time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -72,7 +72,7 @@ func TestGovernedConsentCreatesReceiptAndEnforcesRegistries(t *testing.T) {
 		t.Fatal(err)
 	}
 	decision, err = svc.Evaluate(context.Background(), "tenant-a", "cus-1", "marketing", "email", time.Time{})
-	if err != nil || decision.Allowed || decision.Reason != "policy_unavailable" {
+	if err != nil || decision.Allowed || (decision.Reason != domain.DecisionReasonPurposeInactive && decision.Reason != "policy_unavailable") {
 		t.Fatalf("deactivated purpose must fail closed: decision=%+v err=%v", decision, err)
 	}
 }

@@ -31,6 +31,24 @@ func vectorReceipt() domain.ConsentReceipt {
 			CollectedAt:  time.Date(2026, 10, 19, 9, 0, 0, 999, lagos),
 		},
 		IssuedAt:    time.Date(2026, 10, 19, 10, 11, 12, 123456789, lagos),
+		HashVersion: ReceiptHashVersionV2,
+	}
+}
+
+func vectorReceiptV3() domain.ConsentReceipt {
+	lagos := time.FixedZone("UTC+1", 3600)
+	return domain.ConsentReceipt{
+		ID: "rcp_v3", TenantID: "tenant-a", ConsentID: "con_v3", SubjectID: "cus-v3",
+		ActorID: "actor-admin", Purpose: "marketing", Channel: "email",
+		ConsentStatus: domain.StatusGranted, LegalBasis: "consent",
+		NoticeVersion: "2026-08", NoticeContentHash: "sha256:noticehashv3", PolicyVersion: 1,
+		Jurisdiction: "NG",
+		Evidence: domain.Evidence{
+			Method:       "portal",
+			ArtifactHash: "sha256:abc",
+			CollectedAt:  time.Date(2026, 10, 19, 9, 0, 0, 999, lagos),
+		},
+		IssuedAt:    time.Date(2026, 10, 19, 10, 11, 12, 123456789, lagos),
 		HashVersion: ReceiptHashVersionCanonical,
 	}
 }
@@ -41,6 +59,10 @@ const (
 	// vectorHash is frozen: any change to it is a breaking format change and
 	// requires a new hash_version.
 	vectorHash = "2f69d6c5c69da4fa2d1fb4ed19774552d7b14558d6a35cbd90e428cdbdb4a5c3"
+
+	// vectorCanonicalV3 is the exact v3 byte sequence for vectorReceiptV3.
+	vectorCanonicalV3 = `{"v":3,"id":"rcp_v3","tenant_id":"tenant-a","consent_id":"con_v3","subject_id":"cus-v3","actor_id":"actor-admin","purpose":"marketing","channel":"email","consent_status":"granted","legal_basis":"consent","notice_version":"2026-08","notice_content_hash":"sha256:noticehashv3","policy_version":1,"jurisdiction":"NG","evidence":{"method":"portal","artifact_hash":"sha256:abc","collected_at":"2026-10-19T08:00:00.000000Z"},"issued_at":"2026-10-19T09:11:12.123456Z"}`
+	vectorHashV3      = "51769b2612ebe36e771a0c4244ec40f510dc6c58a66bfc6bb9ca2dd2fdbdfb42"
 )
 
 func sealed(t *testing.T, r domain.ConsentReceipt) domain.ConsentReceipt {
@@ -71,6 +93,28 @@ func TestCanonicalReceiptBytesVector(t *testing.T) {
 	}
 	if hash != vectorHash {
 		t.Fatalf("frozen v2 vector hash changed: got %s want %s", hash, vectorHash)
+	}
+}
+
+func TestCanonicalReceiptBytesVectorV3(t *testing.T) {
+	encoded, err := CanonicalReceiptBytes(vectorReceiptV3())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != vectorCanonicalV3 {
+		t.Fatalf("canonical v3 bytes changed\n got: %s\nwant: %s", encoded, vectorCanonicalV3)
+	}
+	hash, err := canonicalReceiptHash(vectorReceiptV3())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(vectorCanonicalV3))
+	expected := hex.EncodeToString(digest[:])
+	if hash != expected {
+		t.Fatalf("hash is not sha256 of the canonical v3 bytes: %s vs %s", hash, expected)
+	}
+	if hash != vectorHashV3 {
+		t.Fatalf("v3 vector hash changed: got %s want %s", hash, vectorHashV3)
 	}
 }
 
@@ -134,7 +178,7 @@ func TestMakeReceiptStoresNormalizedInstant(t *testing.T) {
 		t.Fatal(err)
 	}
 	if receipt.HashVersion != ReceiptHashVersionCanonical {
-		t.Fatalf("new receipts must be v2, got %d", receipt.HashVersion)
+		t.Fatalf("new receipts must be v3, got %d", receipt.HashVersion)
 	}
 	if !receipt.IssuedAt.Equal(at.Truncate(time.Microsecond)) || receipt.IssuedAt.Location() != time.UTC {
 		t.Fatalf("IssuedAt must be stored as UTC microseconds: %v", receipt.IssuedAt)
@@ -154,7 +198,7 @@ func TestReceiptHashSurvivesJSONExportImport(t *testing.T) {
 	if err := json.Unmarshal(exported, &imported); err != nil {
 		t.Fatal(err)
 	}
-	if imported.HashVersion != ReceiptHashVersionCanonical {
+	if imported.HashVersion != ReceiptHashVersionV2 {
 		t.Fatalf("hash_version must survive export: %s", exported)
 	}
 	if v := VerifyReceipt(imported); v.Status != ReceiptHashVerified {
@@ -254,7 +298,33 @@ func TestVerifyReceiptClassifiesFormats(t *testing.T) {
 			r.IssuedAt = r.IssuedAt.Add(789) // keep sub-µs digits so this is not excusable
 			return r
 		}(), want: ReceiptHashMismatch},
-		"unknown version": {receipt: func() domain.ConsentReceipt { r := sealed(t, vectorReceipt()); r.HashVersion = 3; return r }(), want: ReceiptHashUnsupportedVersion},
+		"v3 verified": {receipt: sealed(t, vectorReceiptV3()), want: ReceiptHashVerified},
+		"v3 tampered actor": {receipt: func() domain.ConsentReceipt {
+			r := sealed(t, vectorReceiptV3())
+			r.ActorID = "actor-other"
+			return r
+		}(), want: ReceiptHashMismatch},
+		"v3 tampered status": {receipt: func() domain.ConsentReceipt {
+			r := sealed(t, vectorReceiptV3())
+			r.ConsentStatus = domain.StatusDenied
+			return r
+		}(), want: ReceiptHashMismatch},
+		"v3 tampered legal basis": {receipt: func() domain.ConsentReceipt {
+			r := sealed(t, vectorReceiptV3())
+			r.LegalBasis = "legitimate_interest"
+			return r
+		}(), want: ReceiptHashMismatch},
+		"v3 tampered policy version": {receipt: func() domain.ConsentReceipt {
+			r := sealed(t, vectorReceiptV3())
+			r.PolicyVersion = 99
+			return r
+		}(), want: ReceiptHashMismatch},
+		"v3 tampered notice hash": {receipt: func() domain.ConsentReceipt {
+			r := sealed(t, vectorReceiptV3())
+			r.NoticeContentHash = "sha256:tampered"
+			return r
+		}(), want: ReceiptHashMismatch},
+		"unknown version": {receipt: func() domain.ConsentReceipt { r := sealed(t, vectorReceipt()); r.HashVersion = 99; return r }(), want: ReceiptHashUnsupportedVersion},
 	}
 	for name, tc := range cases {
 		original := tc.receipt
@@ -309,7 +379,7 @@ func TestServiceReceiptsVerifyAfterStorage(t *testing.T) {
 			t.Fatal(err)
 		}
 		if verification.Status != ReceiptHashVerified || verification.HashVersion != ReceiptHashVersionCanonical {
-			t.Fatalf("stored receipt %s must verify as v2: %+v", receiptID, verification)
+			t.Fatalf("stored receipt %s must verify as v3: %+v", receiptID, verification)
 		}
 		receipt, err := svc.Receipt(context.Background(), doiTenant, receiptID)
 		if err != nil {

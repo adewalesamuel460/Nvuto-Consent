@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nvuto-consent
+
+resources:
+  - ../../base
+
+configMapGenerator:
+  - name: consent-runtime
+    envs:
+      - config.env
+
+secretGenerator:
+  - name: consent-secrets
+    envs:
+      - secrets.env
+  - name: consent-nats-credentials
+    files:
+      - consent.creds=nats.creds
+
+images:
+  - name: consent-api
+    newName: ghcr.io/atlasfsp/nvuto-consent-api
+    digest: sha256:baae473c914d7cfec25e5cfad7e1e6951feef869151523ea397a6598c1ea993f
+  - name: consent-worker
+    newName: ghcr.io/atlasfsp/nvuto-consent-worker
+    digest: sha256:ca50785f29910d634cb9e4a3b81177699479e19d7d2238cfae4f8d5789d6e80b
+
+patches:
+  - path: patches/replicas.yaml

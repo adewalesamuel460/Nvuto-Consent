@@ -36,6 +36,10 @@ const (
 	KindUnavailable
 	// KindCanceled means the caller abandoned the request before it finished.
 	KindCanceled
+	// KindUnsupportedMediaType means the Content-Type is missing or not supported (415).
+	KindUnsupportedMediaType
+	// KindAuthorization means the principal is not authorized for the requested action (403).
+	KindAuthorization
 )
 
 func (k ErrorKind) String() string {
@@ -60,6 +64,10 @@ func (k ErrorKind) String() string {
 		return "unavailable"
 	case KindCanceled:
 		return "canceled"
+	case KindUnsupportedMediaType:
+		return "unsupported_media_type"
+	case KindAuthorization:
+		return "authorization"
 	default:
 		return "internal"
 	}
@@ -157,18 +165,22 @@ func (e *Error) Wrap(cause error) error {
 // Sentinels shared by every layer. Store and service re-export them so
 // existing errors.Is checks keep working.
 var (
-	ErrInternal        = NewError(KindInternal, "internal_error", "an internal error occurred")
-	ErrValidation      = NewError(KindValidation, "validation_failed", "the request failed validation")
-	ErrPolicyRejected  = &Error{kind: KindPolicy, code: "policy_rejected", message: "the request is not permitted by the tenant consent policy", base: ErrValidation}
-	ErrUnauthenticated = NewError(KindUnauthenticated, "unauthenticated", "valid authentication is required")
-	ErrForbidden       = NewError(KindForbidden, "forbidden", "the principal is not authorized for this action")
-	ErrNotFound        = NewError(KindNotFound, "not_found", "resource not found")
-	ErrConflict        = NewError(KindConflict, "conflict", "the request conflicts with the current state")
-	ErrExpired         = NewError(KindGone, "expired", "the resource has expired")
-	ErrTooLarge        = NewError(KindTooLarge, "body_too_large", "the request body is too large")
-	ErrUnavailable     = NewError(KindUnavailable, "unavailable", "the service is temporarily unavailable; retry later")
-	ErrContention      = ErrUnavailable.Derive("contention", "the request conflicted with concurrent updates; retry later")
-	ErrCanceled        = NewError(KindCanceled, "canceled", "the request was canceled")
+	ErrInternal                        = NewError(KindInternal, "internal_error", "an internal error occurred")
+	ErrValidation                      = NewError(KindValidation, "validation_failed", "the request failed validation")
+	ErrPolicyRejected                  = &Error{kind: KindPolicy, code: "policy_rejected", message: "the request is not permitted by the tenant consent policy", base: ErrValidation}
+	ErrUnauthenticated                 = NewError(KindUnauthenticated, "unauthenticated", "valid authentication is required")
+	ErrForbidden                       = NewError(KindForbidden, "forbidden", "the principal is not authorized for this action")
+	ErrNotFound                        = NewError(KindNotFound, "not_found", "resource not found")
+	ErrConflict                        = NewError(KindConflict, "conflict", "the request conflicts with the current state")
+	ErrExpired                         = NewError(KindGone, "expired", "the resource has expired")
+	ErrTooLarge                        = NewError(KindTooLarge, "body_too_large", "the request body is too large")
+	ErrUnavailable                     = NewError(KindUnavailable, "unavailable", "the service is temporarily unavailable; retry later")
+	ErrContention                      = ErrUnavailable.Derive("contention", "the request conflicted with concurrent updates; retry later")
+	ErrCanceled                        = NewError(KindCanceled, "canceled", "the request was canceled")
+	ErrSuppressionProtected            = ErrForbidden.Derive("suppression_protected", "administrative suppressions cannot be revoked by self_service users")
+	ErrUnsupportedMediaType            = NewError(KindUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+	ErrUnsupportedHistoricalEvaluation = ErrValidation.Derive("unsupported_historical_evaluation", "historical evaluation outside the allowed clock skew margin is unsupported")
+	ErrAuthorization                   = NewError(KindAuthorization, "forbidden", "the principal is not authorized for this action")
 )
 
 // KindOf classifies any error. Unclassified context errors are mapped so a
@@ -194,9 +206,19 @@ func KindOf(err error) ErrorKind {
 
 // Public returns the error whose code and message may be shown to a client.
 // Internal faults always collapse to ErrInternal so no cause text leaks.
+// Unavailable faults collapse to ErrUnavailable or ErrContention so no cause text leaks.
 func Public(err error) *Error {
 	var typed *Error
-	if errors.As(err, &typed) && typed.kind != KindInternal {
+	if errors.As(err, &typed) {
+		if typed.kind == KindInternal {
+			return ErrInternal
+		}
+		if typed.kind == KindUnavailable {
+			if typed.code == "contention" {
+				return ErrContention
+			}
+			return ErrUnavailable
+		}
 		return typed
 	}
 	switch KindOf(err) {

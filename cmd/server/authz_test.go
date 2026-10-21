@@ -290,6 +290,9 @@ func TestDoubleOptInConfirmationByTenantWideWriter(t *testing.T) {
 	for _, role := range []string{"consent_writer", "privacy_admin", "consent_admin", "developer"} {
 		t.Run(role, func(t *testing.T) {
 			f := newAuthzFixture(t)
+			if role == "developer" {
+				t.Setenv("ALLOW_DEV_HEADERS", "true")
+			}
 			challenge, err := f.svc.StartDoubleOptIn(context.Background(), authzTenant, "admin", "cus-a", "double_marketing", "email", "signup_form", "NG", "2026-08", f.evidence, time.Now().UTC().Add(time.Hour))
 			if err != nil {
 				t.Fatal(err)
@@ -328,5 +331,229 @@ func TestServiceConfirmDoubleOptInScopeFailsClosed(t *testing.T) {
 	}
 	if _, err := f.svc.ConfirmDoubleOptIn(context.Background(), authzTenant, "actor", service.OwnSubject("cus-a"), challenge.ConfirmationToken); err != nil {
 		t.Fatalf("own subject scope rejected: %v", err)
+	}
+}
+
+// T-030: Explicitly reject the developer role in production environments.
+func TestDeveloperRoleExplicitlyRejectedInProduction(t *testing.T) {
+	f := newAuthzFixture(t)
+	t.Setenv("ALLOW_DEV_HEADERS", "false")
+	devToken := f.token(authzTenant, "cus-dev", "developer")
+
+	// Write endpoint rejection
+	audit, outbox := f.mutationCounts()
+	respWrite := f.do(devToken, http.MethodPost, "/v1/consents", f.consentBody("cus-dev"))
+	if respWrite.Code != http.StatusUnauthorized && respWrite.Code != http.StatusForbidden {
+		t.Fatalf("developer write in production returned %d, want 401 or 403: %s", respWrite.Code, respWrite.Body.String())
+	}
+	f.assertNoMutation("developer write rejection", audit, outbox)
+
+	// Read endpoint rejection
+	respRead := f.do(devToken, http.MethodPost, "/v1/evaluate", map[string]any{"subject_id": "cus-dev", "purpose": "marketing", "channel": "email"})
+	if respRead.Code != http.StatusUnauthorized && respRead.Code != http.StatusForbidden {
+		t.Fatalf("developer read in production returned %d, want 401 or 403: %s", respRead.Code, respRead.Body.String())
+	}
+
+	// But in development mode (ALLOW_DEV_HEADERS=true), developer role is accepted.
+	t.Setenv("ALLOW_DEV_HEADERS", "true")
+	respDevWrite := f.do(devToken, http.MethodPost, "/v1/consents", f.consentBody("cus-dev"))
+	if respDevWrite.Code != http.StatusCreated {
+		t.Fatalf("developer write with ALLOW_DEV_HEADERS=true returned %d: %s", respDevWrite.Code, respDevWrite.Body.String())
+	}
+}
+
+// T-030: Exhaustive role-matrix tests checking all 7 roles against read and write boundaries.
+func TestExhaustiveRoleMatrixAll7Roles(t *testing.T) {
+	allRoles := []struct {
+		name        string
+		role        string
+		canWriteOwn bool
+		canWriteAll bool
+		canReadOwn  bool
+		canReadAll  bool
+	}{
+		{"privacy_admin", "privacy_admin", true, true, true, true},
+		{"consent_admin", "consent_admin", true, true, true, true},
+		{"consent_writer", "consent_writer", true, true, true, true},
+		{"consent_reader", "consent_reader", false, false, true, true},
+		{"service", "service", false, false, true, true},
+		{"self_service", "self_service", true, false, true, false},
+		{"developer", "developer", false, false, false, false}, // in production
+	}
+
+	for _, tc := range allRoles {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAuthzFixture(t)
+			t.Setenv("ALLOW_DEV_HEADERS", "false")
+			customer := "cus-" + tc.name
+			token := f.token(authzTenant, customer, tc.role)
+
+			// 1. Write own subject
+			audit, outbox := f.mutationCounts()
+			respOwnWrite := f.do(token, http.MethodPost, "/v1/consents", f.consentBody(customer))
+			if tc.canWriteOwn {
+				if respOwnWrite.Code != http.StatusCreated {
+					t.Fatalf("%s write own subject returned %d, want 201: %s", tc.name, respOwnWrite.Code, respOwnWrite.Body.String())
+				}
+			} else {
+				if respOwnWrite.Code != http.StatusForbidden && respOwnWrite.Code != http.StatusUnauthorized {
+					t.Fatalf("%s write own subject returned %d, want 401 or 403: %s", tc.name, respOwnWrite.Code, respOwnWrite.Body.String())
+				}
+				f.assertNoMutation(tc.name+" write own subject", audit, outbox)
+			}
+
+			// 2. Write other subject
+			audit, outbox = f.mutationCounts()
+			respOtherWrite := f.do(token, http.MethodPost, "/v1/consents", f.consentBody("cus-other"))
+			if tc.canWriteAll {
+				if respOtherWrite.Code != http.StatusCreated {
+					t.Fatalf("%s write other subject returned %d, want 201: %s", tc.name, respOtherWrite.Code, respOtherWrite.Body.String())
+				}
+			} else {
+				if respOtherWrite.Code != http.StatusForbidden && respOtherWrite.Code != http.StatusUnauthorized {
+					t.Fatalf("%s write other subject returned %d, want 401 or 403: %s", tc.name, respOtherWrite.Code, respOtherWrite.Body.String())
+				}
+				f.assertNoMutation(tc.name+" write other subject", audit, outbox)
+			}
+
+			// 3. Read own subject
+			respOwnRead := f.do(token, http.MethodPost, "/v1/evaluate", map[string]any{"subject_id": customer, "purpose": "marketing", "channel": "email"})
+			if tc.canReadOwn {
+				if respOwnRead.Code != http.StatusOK {
+					t.Fatalf("%s read own subject returned %d, want 200: %s", tc.name, respOwnRead.Code, respOwnRead.Body.String())
+				}
+			} else {
+				if respOwnRead.Code != http.StatusForbidden && respOwnRead.Code != http.StatusUnauthorized {
+					t.Fatalf("%s read own subject returned %d, want 401 or 403: %s", tc.name, respOwnRead.Code, respOwnRead.Body.String())
+				}
+			}
+
+			// 4. Read other subject
+			respOtherRead := f.do(token, http.MethodPost, "/v1/evaluate", map[string]any{"subject_id": "cus-other", "purpose": "marketing", "channel": "email"})
+			if tc.canReadAll {
+				if respOtherRead.Code != http.StatusOK {
+					t.Fatalf("%s read other subject returned %d, want 200: %s", tc.name, respOtherRead.Code, respOtherRead.Body.String())
+				}
+			} else {
+				if respOtherRead.Code != http.StatusForbidden && respOtherRead.Code != http.StatusUnauthorized {
+					t.Fatalf("%s read other subject returned %d, want 401 or 403: %s", tc.name, respOtherRead.Code, respOtherRead.Body.String())
+				}
+			}
+		})
+	}
+}
+
+// T-030: Protected administrative suppressions cannot be revoked by self_service callers.
+func TestProtectedAdministrativeSuppressionCannotBeRevokedBySelfService(t *testing.T) {
+	f := newAuthzFixture(t)
+	target := "cus-protected-target"
+
+	adminToken := f.token(authzTenant, "admin-user", "privacy_admin")
+	selfToken := f.token(authzTenant, target, "self_service")
+	mixedToken := f.token(authzTenant, target, "self_service", "consent_reader")
+
+	// 1. Administrative user creates an administrative global suppression.
+	respAdminGlobal := f.do(adminToken, http.MethodPost, "/v1/suppressions", map[string]any{
+		"subject_id": target,
+		"scope":      "global",
+		"reason":     "legal_compliance_hold",
+		"active":     true,
+	})
+	if respAdminGlobal.Code != http.StatusCreated {
+		t.Fatalf("admin create global suppression failed: %d %s", respAdminGlobal.Code, respAdminGlobal.Body.String())
+	}
+
+	// Also admin creates a channel suppression.
+	respAdminChannel := f.do(adminToken, http.MethodPost, "/v1/suppressions", map[string]any{
+		"subject_id": target,
+		"scope":      "channel",
+		"channel":    "email",
+		"reason":     "regulatory_channel_block",
+		"active":     true,
+	})
+	if respAdminChannel.Code != http.StatusCreated {
+		t.Fatalf("admin create channel suppression failed: %d %s", respAdminChannel.Code, respAdminChannel.Body.String())
+	}
+
+	// 2. Self_service caller attempts to clear / revoke the global administrative suppression.
+	auditBefore, outboxBefore := f.mutationCounts()
+	respRevokeGlobal := f.do(selfToken, http.MethodPost, "/v1/suppressions", map[string]any{
+		"subject_id": target,
+		"scope":      "global",
+		"reason":     "trying_to_unsuppress",
+		"active":     false,
+	})
+	if respRevokeGlobal.Code != http.StatusForbidden {
+		t.Fatalf("self_service revoke admin global suppression returned %d, want 403: %s", respRevokeGlobal.Code, respRevokeGlobal.Body.String())
+	}
+	var errBody struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(respRevokeGlobal.Body.Bytes(), &errBody)
+	if errBody.Error != "suppression_protected" {
+		t.Fatalf("expected error code suppression_protected, got %q", errBody.Error)
+	}
+	f.assertNoMutation("self_service clear admin global suppression", auditBefore, outboxBefore)
+
+	// 3. Mixed-role caller ["self_service", "consent_reader"] also cannot revoke the channel suppression.
+	auditBefore, outboxBefore = f.mutationCounts()
+	respRevokeChannel := f.do(mixedToken, http.MethodPost, "/v1/suppressions", map[string]any{
+		"subject_id": target,
+		"scope":      "channel",
+		"channel":    "email",
+		"reason":     "trying_to_unsuppress_channel",
+		"active":     false,
+	})
+	if respRevokeChannel.Code != http.StatusForbidden {
+		t.Fatalf("mixed self_service revoke admin channel suppression returned %d, want 403: %s", respRevokeChannel.Code, respRevokeChannel.Body.String())
+	}
+	_ = json.Unmarshal(respRevokeChannel.Body.Bytes(), &errBody)
+	if errBody.Error != "suppression_protected" {
+		t.Fatalf("expected error code suppression_protected, got %q", errBody.Error)
+	}
+	f.assertNoMutation("mixed self_service clear admin channel suppression", auditBefore, outboxBefore)
+
+	// 4. Verify suppression is STILL ACTIVE in storage.
+	stored, err := f.svc.Evaluate(context.Background(), authzTenant, target, "marketing", "email", time.Time{})
+	if err != nil || stored.Allowed {
+		t.Fatalf("administrative suppression must remain active: %+v", stored)
+	}
+
+	// 5. Self-service caller creates their own purpose_channel suppression.
+	respSelfCreate := f.do(selfToken, http.MethodPost, "/v1/suppressions", map[string]any{
+		"subject_id": target,
+		"scope":      "purpose_channel",
+		"purpose":    "marketing",
+		"channel":    "email",
+		"reason":     "customer_preference",
+		"active":     true,
+	})
+	if respSelfCreate.Code != http.StatusCreated {
+		t.Fatalf("self_service create own suppression returned %d: %s", respSelfCreate.Code, respSelfCreate.Body.String())
+	}
+
+	// 6. Self-service caller CAN revoke their own purpose_channel suppression.
+	respSelfRevoke := f.do(selfToken, http.MethodPost, "/v1/suppressions", map[string]any{
+		"subject_id": target,
+		"scope":      "purpose_channel",
+		"purpose":    "marketing",
+		"channel":    "email",
+		"reason":     "customer_re_opt_in",
+		"active":     false,
+	})
+	if respSelfRevoke.Code != http.StatusCreated {
+		t.Fatalf("self_service revoke own suppression returned %d: %s", respSelfRevoke.Code, respSelfRevoke.Body.String())
+	}
+
+	// 7. Administrative caller CAN revoke the protected administrative suppression.
+	respAdminRevoke := f.do(adminToken, http.MethodPost, "/v1/suppressions", map[string]any{
+		"subject_id": target,
+		"scope":      "global",
+		"reason":     "admin_lifted_hold",
+		"active":     false,
+	})
+	if respAdminRevoke.Code != http.StatusCreated {
+		t.Fatalf("admin revoke global suppression returned %d: %s", respAdminRevoke.Code, respAdminRevoke.Body.String())
 	}
 }

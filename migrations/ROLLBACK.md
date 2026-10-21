@@ -10,3 +10,8 @@ Do not drop the added tables or columns during an incident rollback. Doing so wo
 
 `006_schema_hardening_and_audit.sql` is additive (`consents(tenant_id, id)` composite uniqueness, `consent_receipts` and `consent_idempotency` composite foreign keys, `consent_suppressions` scope shape CHECK constraint, `consent_audit_events` resource_type/revision/changes columns, and `consent_idempotency.response_snapshot` column). Rolling back application code to a pre-006 image is schema-safe: pre-006 binaries insert into the same tables and default columns safely. Do not drop foreign keys, constraints or added columns during an incident; keep the schema and roll forward if fixes are required.
 
+`007_protected_suppressions.sql` is additive (`consent_suppressions.created_by_role`). Rolling back application code to a pre-007 image is schema-safe: pre-007 binaries read and write `consent_suppressions` safely with the added column defaulting to `''`. Do not drop the column during an incident rollback; keep the column and roll forward if fixes are required.
+
+`008_receipt_evidence_binding.sql` is additive (`consent_privacy_notices` content/content_hash/retired/superseded_by columns and `consent_receipts` actor_id/consent_status/legal_basis/notice_content_hash/policy_version columns, with triggers protecting notice and receipt immutability). Rolling back application code to a pre-008 image is schema-safe: older binaries continue to query and insert rows safely using default column values. Do not drop columns or triggers during an incident rollback; keep the schema and roll forward if fixes are required.
+
+

@@ -33,9 +33,21 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// RoleSelfService is the customer-facing role whose authority is bound to the
-// canonical customer_subject_id claim.
-const RoleSelfService = "self_service"
+// Supported roles (T-030).
+const (
+	RoleSelfService   = "self_service"
+	RolePrivacyAdmin  = "privacy_admin"
+	RoleConsentAdmin  = "consent_admin"
+	RoleConsentWriter = "consent_writer"
+	RoleConsentReader = "consent_reader"
+	RoleService       = "service"
+	RoleDeveloper     = "developer"
+)
+
+// DevHeadersAllowed reports whether development mode is explicitly enabled.
+func DevHeadersAllowed() bool {
+	return strings.EqualFold(os.Getenv("ALLOW_DEV_HEADERS"), "true")
+}
 
 // JWKS refresh budget (T-014). A provider performs at most one outbound fetch
 // per jwksMinRefreshInterval regardless of how many distinct unknown key IDs
@@ -303,6 +315,10 @@ func principalFromClaims(token *jwt.Token, claims *Claims, err error) (Principal
 	// customer subject; without it the subject boundary cannot be enforced.
 	if HasAnyRole(principal, RoleSelfService) && strings.TrimSpace(claims.SubjectID) == "" {
 		return Principal{}, errors.New("self_service token requires customer_subject_id")
+	}
+	// T-030: Explicitly reject the developer role in production environments.
+	if HasAnyRole(principal, RoleDeveloper) && !DevHeadersAllowed() {
+		return Principal{}, errors.New("developer role is not permitted in production")
 	}
 	return principal, nil
 }

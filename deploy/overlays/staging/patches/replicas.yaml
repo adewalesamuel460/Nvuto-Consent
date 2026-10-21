@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consent-api
+spec:
+  replicas: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consent-outbox-worker
+spec:
+  replicas: 1
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: consent-api
+spec:
+  minAvailable: 1
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: consent-api
+spec:
+  minReplicas: 2
+  maxReplicas: 5

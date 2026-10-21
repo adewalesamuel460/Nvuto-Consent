@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consent-outbox-worker
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: consent-outbox-worker
+  template:
+    metadata:
+      labels:
+        app: consent-outbox-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: consent-outbox-worker
+      containers:
+        - name: worker
+          image: consent-worker
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: consent-secrets
+                  key: database-url
+            - name: NATS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: consent-runtime
+                  key: nats-url
+            - name: NATS_STREAM
+              valueFrom:
+                configMapKeyRef:
+                  name: consent-runtime
+                  key: nats-stream
+            - name: NATS_SUBJECT_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: consent-runtime
+                  key: nats-subject-prefix
+            - name: NATS_REPLICAS
+              valueFrom:
+                configMapKeyRef:
+                  name: consent-runtime
+                  key: nats-replicas
+            - name: NATS_CREDS_FILE
+              value: /var/run/secrets/nvuto/nats/consent.creds
+          volumeMounts:
+            - name: nats-credentials
+              mountPath: /var/run/secrets/nvuto/nats
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: nats-credentials
+          secret:
+            secretName: consent-nats-credentials
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: consent-outbox-worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: consent-outbox-worker

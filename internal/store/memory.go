@@ -3,90 +3,12 @@ package store
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
 )
-
-// Store errors are the typed domain sentinels, so the HTTP layer maps them to
-// stable public statuses (T-013) and errors.Is keeps working everywhere.
-var (
-	ErrNotFound    = domain.ErrNotFound
-	ErrConflict    = domain.ErrConflict
-	ErrExpired     = domain.ErrExpired
-	ErrUnavailable = domain.ErrUnavailable
-)
-
-// ErrStaleGeneration is returned when a double-opt-in challenge is no longer
-// bound to the current preference generation because a later grant, denial,
-// withdrawal or challenge superseded it. It matches ErrConflict.
-var ErrStaleGeneration = domain.ErrConflict.Derive("challenge_superseded", "the double opt-in challenge was superseded by a newer preference")
-
-// contextError classifies a context error: an abandoned caller is a
-// cancellation, an exhausted deadline is a retryable unavailability.
-func contextError(err error) error {
-	if errors.Is(err, context.Canceled) {
-		return domain.ErrCanceled.Wrap(err)
-	}
-	return domain.ErrUnavailable.Wrap(err)
-}
-
-// live returns a classified error once ctx is done. Every memory-store method
-// checks it before touching state, so a cancelled request never mutates.
-func live(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return contextError(err)
-	}
-	return nil
-}
-
-// PolicyReader reads the policy registries. During ConfirmDoubleOptIn it is
-// bound to the confirmation transaction, so the policy observed is the policy
-// in force when the grant commits.
-type PolicyReader interface {
-	GetPurpose(ctx context.Context, tenantID, code string) (domain.Purpose, error)
-	GetLawfulBasis(ctx context.Context, tenantID, code string) (domain.LawfulBasis, error)
-	GetNotice(ctx context.Context, tenantID, jurisdiction, version string) (domain.PrivacyNotice, error)
-}
-
-// ConfirmFinalizer runs inside the confirmation transaction after the
-// challenge and its preference generation have been locked and verified as
-// pending, unexpired and current. It re-validates policy through the supplied
-// reader and builds the receipt, audit and outbox records from the locked
-// challenge. Returning an error aborts the confirmation with no mutation.
-// Implementations must not call back into the repository. A durable store may
-// invoke it more than once when it retries a transient transaction conflict;
-// each invocation's records belong to a transaction that is rolled back unless
-// it commits, so it must not have side effects outside its return values.
-type ConfirmFinalizer func(ctx context.Context, policy PolicyReader, pending domain.Consent, at time.Time) (domain.ConsentReceipt, domain.AuditEvent, domain.OutboxEvent, error)
-
-// Repository is the persistence boundary. Every method takes the caller's
-// context: cancellation or deadline expiry abandons pending work and leaves
-// no partial state (T-012).
-type Repository interface {
-	Get(ctx context.Context, tenantID, id string) (domain.Consent, error)
-	FindEffective(ctx context.Context, tenantID, subjectID, purpose, channel string) (domain.Consent, error)
-	PutPurpose(ctx context.Context, purpose domain.Purpose, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Purpose, error)
-	GetPurpose(ctx context.Context, tenantID, code string) (domain.Purpose, error)
-	PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.LawfulBasis, error)
-	GetLawfulBasis(ctx context.Context, tenantID, code string) (domain.LawfulBasis, error)
-	PutNotice(ctx context.Context, notice domain.PrivacyNotice, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.PrivacyNotice, error)
-	GetNotice(ctx context.Context, tenantID, jurisdiction, version string) (domain.PrivacyNotice, error)
-	RecordGoverned(ctx context.Context, consent domain.Consent, receipt domain.ConsentReceipt, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error)
-	Withdraw(ctx context.Context, consent domain.Consent, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error)
-	GetReceipt(ctx context.Context, tenantID, id string) (domain.ConsentReceipt, error)
-	SetSuppression(ctx context.Context, suppression domain.Suppression, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Suppression, error)
-	FindSuppression(ctx context.Context, tenantID, subjectID, purpose, channel string) (domain.Suppression, error)
-	StartDoubleOptIn(ctx context.Context, consent domain.Consent, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error)
-	FindPendingByToken(ctx context.Context, tenantID, tokenHash string) (domain.Consent, error)
-	ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash string, at time.Time, finalize ConfirmFinalizer) (domain.Consent, error)
-	AppendAudit(ctx context.Context, event domain.AuditEvent) error
-	AppendOutbox(ctx context.Context, event domain.OutboxEvent) error
-	Ping(ctx context.Context) error
-}
 
 // Memory-store typed composite keys (T-026). In-memory maps use distinct
 // structs as map keys rather than concatenated strings, preventing delimiter
@@ -132,32 +54,137 @@ type preferenceKey struct {
 	channel   string
 }
 
+type idempotencyKey struct {
+	tenantID       string
+	idempotencyKey string
+}
+
+type memoryIdempotencyEntry struct {
+	RequestHash      string
+	ConsentID        string
+	ResponseSnapshot domain.Consent
+}
+
+func cloneConsent(c domain.Consent) domain.Consent {
+	cp := c
+	if c.Scope != nil {
+		cp.Scope = make(map[string]string, len(c.Scope))
+		for k, v := range c.Scope {
+			cp.Scope[k] = v
+		}
+	}
+	if c.GrantedAt != nil {
+		t := *c.GrantedAt
+		cp.GrantedAt = &t
+	}
+	if c.DeniedAt != nil {
+		t := *c.DeniedAt
+		cp.DeniedAt = &t
+	}
+	if c.WithdrawnAt != nil {
+		t := *c.WithdrawnAt
+		cp.WithdrawnAt = &t
+	}
+	if c.ExpiresAt != nil {
+		t := *c.ExpiresAt
+		cp.ExpiresAt = &t
+	}
+	if c.ConfirmationExpiresAt != nil {
+		t := *c.ConfirmationExpiresAt
+		cp.ConfirmationExpiresAt = &t
+	}
+	if c.ConfirmedAt != nil {
+		t := *c.ConfirmedAt
+		cp.ConfirmedAt = &t
+	}
+	return cp
+}
+
+func clonePurpose(p domain.Purpose) domain.Purpose {
+	cp := p
+	if p.AllowedChannels != nil {
+		cp.AllowedChannels = make([]string, len(p.AllowedChannels))
+		copy(cp.AllowedChannels, p.AllowedChannels)
+	}
+	return cp
+}
+
+func cloneLawfulBasis(b domain.LawfulBasis) domain.LawfulBasis {
+	cp := b
+	if b.AllowedCategories != nil {
+		cp.AllowedCategories = make([]string, len(b.AllowedCategories))
+		copy(cp.AllowedCategories, b.AllowedCategories)
+	}
+	return cp
+}
+
+func cloneSuppression(s domain.Suppression) domain.Suppression {
+	return s
+}
+
+func cloneAuditEvent(e domain.AuditEvent) domain.AuditEvent {
+	cp := e
+	if e.Changes != nil {
+		cp.Changes = cloneMapAny(e.Changes)
+	}
+	return cp
+}
+
+func cloneOutboxEvent(e domain.OutboxEvent) domain.OutboxEvent {
+	cp := e
+	if e.Payload != nil {
+		cp.Payload = cloneMapAny(e.Payload)
+	}
+	return cp
+}
+
+func cloneMapAny(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]any, len(m))
+	for k, v := range m {
+		if subMap, ok := v.(map[string]any); ok {
+			cp[k] = cloneMapAny(subMap)
+		} else if subSlice, ok := v.([]string); ok {
+			s := make([]string, len(subSlice))
+			copy(s, subSlice)
+			cp[k] = s
+		} else {
+			cp[k] = v
+		}
+	}
+	return cp
+}
+
 type Memory struct {
-	mu           sync.RWMutex
-	consents     map[consentKey]domain.Consent
-	audit        []domain.AuditEvent
-	outbox       []domain.OutboxEvent
-	purposes     map[purposeKey]domain.Purpose
-	bases        map[lawfulBasisKey]domain.LawfulBasis
-	notices      map[noticeKey]domain.PrivacyNotice
-	receipts     map[receiptKey]domain.ConsentReceipt
-	suppressions map[suppressionKey]domain.Suppression
-	generations  map[preferenceKey]int64 // current preference generation by preferenceKey
-	outboxLeases map[string]*OutboxLeaseState
-	clock        func() time.Time
+	mu                sync.RWMutex
+	consents          map[consentKey]domain.Consent
+	audit             []domain.AuditEvent
+	outbox            []domain.OutboxEvent
+	purposes          map[purposeKey]domain.Purpose
+	bases             map[lawfulBasisKey]domain.LawfulBasis
+	notices           map[noticeKey]domain.PrivacyNotice
+	receipts          map[receiptKey]domain.ConsentReceipt
+	suppressions      map[suppressionKey]domain.Suppression
+	generations       map[preferenceKey]int64 // current preference generation by preferenceKey
+	idempotencyLedger map[idempotencyKey]memoryIdempotencyEntry
+	outboxLeases      map[string]*OutboxLeaseState
+	clock             func() time.Time
 }
 
 func NewMemory() *Memory {
 	return &Memory{
-		consents:     map[consentKey]domain.Consent{},
-		purposes:     map[purposeKey]domain.Purpose{},
-		bases:        map[lawfulBasisKey]domain.LawfulBasis{},
-		notices:      map[noticeKey]domain.PrivacyNotice{},
-		receipts:     map[receiptKey]domain.ConsentReceipt{},
-		suppressions: map[suppressionKey]domain.Suppression{},
-		generations:  map[preferenceKey]int64{},
-		outboxLeases: map[string]*OutboxLeaseState{},
-		clock:        time.Now,
+		consents:          map[consentKey]domain.Consent{},
+		purposes:          map[purposeKey]domain.Purpose{},
+		bases:             map[lawfulBasisKey]domain.LawfulBasis{},
+		notices:           map[noticeKey]domain.PrivacyNotice{},
+		receipts:          map[receiptKey]domain.ConsentReceipt{},
+		suppressions:      map[suppressionKey]domain.Suppression{},
+		generations:       map[preferenceKey]int64{},
+		idempotencyLedger: map[idempotencyKey]memoryIdempotencyEntry{},
+		outboxLeases:      map[string]*OutboxLeaseState{},
+		clock:             time.Now,
 	}
 }
 
@@ -199,11 +226,28 @@ func (m *Memory) Get(ctx context.Context, t, id string) (domain.Consent, error) 
 	if !ok {
 		return domain.Consent{}, ErrNotFound
 	}
-	return c, nil
+	return cloneConsent(c), nil
+}
+
+// SeedConsent inserts or overwrites a consent record directly for deterministic testing.
+func (m *Memory) SeedConsent(c domain.Consent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.consents[consentKey{tenantID: c.TenantID, consentID: c.ID}] = cloneConsent(c)
+}
+
+func consentIsBetter(c, best domain.Consent) bool {
+	if c.PreferenceGeneration != best.PreferenceGeneration {
+		return c.PreferenceGeneration > best.PreferenceGeneration
+	}
+	if !c.UpdatedAt.Equal(best.UpdatedAt) {
+		return c.UpdatedAt.After(best.UpdatedAt)
+	}
+	return c.ID > best.ID
 }
 
 // FindEffective returns the record carrying the highest preference generation;
-// updated_at only breaks ties (pre-generation records all have generation 0).
+// updated_at and id break ties (pre-generation records all have generation 0).
 func (m *Memory) FindEffective(ctx context.Context, t, s, p, ch string) (domain.Consent, error) {
 	if err := live(ctx); err != nil {
 		return domain.Consent{}, err
@@ -216,8 +260,7 @@ func (m *Memory) FindEffective(ctx context.Context, t, s, p, ch string) (domain.
 		if c.TenantID != t || c.SubjectID != s || c.Purpose != p || c.Channel != ch {
 			continue
 		}
-		if !found || c.PreferenceGeneration > best.PreferenceGeneration ||
-			(c.PreferenceGeneration == best.PreferenceGeneration && c.UpdatedAt.After(best.UpdatedAt)) {
+		if !found || consentIsBetter(c, best) {
 			best = c
 			found = true
 		}
@@ -225,7 +268,43 @@ func (m *Memory) FindEffective(ctx context.Context, t, s, p, ch string) (domain.
 	if !found {
 		return domain.Consent{}, ErrNotFound
 	}
-	return best, nil
+	return cloneConsent(best), nil
+}
+
+func (m *Memory) ListConsents(ctx context.Context, tenantID, subjectID string, limit, offset int) ([]domain.Consent, int, error) {
+	if err := live(ctx); err != nil {
+		return nil, 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var matches []domain.Consent
+	for _, c := range m.consents {
+		if c.TenantID == tenantID && c.SubjectID == subjectID {
+			matches = append(matches, c)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].PreferenceGeneration != matches[j].PreferenceGeneration {
+			return matches[i].PreferenceGeneration > matches[j].PreferenceGeneration
+		}
+		if !matches[i].UpdatedAt.Equal(matches[j].UpdatedAt) {
+			return matches[i].UpdatedAt.After(matches[j].UpdatedAt)
+		}
+		return matches[i].ID > matches[j].ID
+	})
+	total := len(matches)
+	if offset >= total {
+		return []domain.Consent{}, total, nil
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	res := make([]domain.Consent, end-offset)
+	for i, c := range matches[offset:end] {
+		res[i] = cloneConsent(c)
+	}
+	return res, total, nil
 }
 
 func (m *Memory) PutPurpose(ctx context.Context, purpose domain.Purpose, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Purpose, error) {
@@ -237,12 +316,13 @@ func (m *Memory) PutPurpose(ctx context.Context, purpose domain.Purpose, audit d
 	k := purposeKey{tenantID: purpose.TenantID, code: purpose.Code}
 	var before any
 	if current, ok := m.purposes[k]; ok {
-		before = current
+		before = clonePurpose(current)
 		purpose.Version = current.Version + 1
 	} else {
 		purpose.Version = 1
 	}
-	m.purposes[k] = purpose
+	clonedPurpose := clonePurpose(purpose)
+	m.purposes[k] = clonedPurpose
 	if audit.ResourceType == "" {
 		audit.ResourceType = "purpose"
 	}
@@ -250,10 +330,10 @@ func (m *Memory) PutPurpose(ctx context.Context, purpose domain.Purpose, audit d
 		audit.ConsentID = purpose.Code
 	}
 	audit.Revision = purpose.Version
-	audit.Changes = map[string]any{"before": before, "after": purpose}
-	m.audit = append(m.audit, audit)
-	m.outbox = append(m.outbox, outbox)
-	return purpose, nil
+	audit.Changes = map[string]any{"before": before, "after": clonedPurpose}
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
+	return clonePurpose(purpose), nil
 }
 
 func (m *Memory) GetPurpose(ctx context.Context, tenantID, code string) (domain.Purpose, error) {
@@ -270,7 +350,37 @@ func (m *Memory) getPurposeLocked(tenantID, code string) (domain.Purpose, error)
 	if !ok {
 		return domain.Purpose{}, ErrNotFound
 	}
-	return purpose, nil
+	return clonePurpose(purpose), nil
+}
+
+func (m *Memory) ListPurposes(ctx context.Context, tenantID string, limit, offset int) ([]domain.Purpose, int, error) {
+	if err := live(ctx); err != nil {
+		return nil, 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var matches []domain.Purpose
+	for _, p := range m.purposes {
+		if p.TenantID == tenantID {
+			matches = append(matches, p)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].Code < matches[j].Code
+	})
+	total := len(matches)
+	if offset >= total {
+		return []domain.Purpose{}, total, nil
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	res := make([]domain.Purpose, end-offset)
+	for i, p := range matches[offset:end] {
+		res[i] = clonePurpose(p)
+	}
+	return res, total, nil
 }
 
 func (m *Memory) PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.LawfulBasis, error) {
@@ -282,12 +392,13 @@ func (m *Memory) PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis, a
 	k := lawfulBasisKey{tenantID: basis.TenantID, code: basis.Code}
 	var before any
 	if current, ok := m.bases[k]; ok {
-		before = current
+		before = cloneLawfulBasis(current)
 		basis.Version = current.Version + 1
 	} else {
 		basis.Version = 1
 	}
-	m.bases[k] = basis
+	clonedBasis := cloneLawfulBasis(basis)
+	m.bases[k] = clonedBasis
 	if audit.ResourceType == "" {
 		audit.ResourceType = "lawful_basis"
 	}
@@ -295,10 +406,10 @@ func (m *Memory) PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis, a
 		audit.ConsentID = basis.Code
 	}
 	audit.Revision = basis.Version
-	audit.Changes = map[string]any{"before": before, "after": basis}
-	m.audit = append(m.audit, audit)
-	m.outbox = append(m.outbox, outbox)
-	return basis, nil
+	audit.Changes = map[string]any{"before": before, "after": clonedBasis}
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
+	return cloneLawfulBasis(basis), nil
 }
 
 func (m *Memory) GetLawfulBasis(ctx context.Context, tenantID, code string) (domain.LawfulBasis, error) {
@@ -315,7 +426,37 @@ func (m *Memory) getLawfulBasisLocked(tenantID, code string) (domain.LawfulBasis
 	if !ok {
 		return domain.LawfulBasis{}, ErrNotFound
 	}
-	return basis, nil
+	return cloneLawfulBasis(basis), nil
+}
+
+func (m *Memory) ListLawfulBases(ctx context.Context, tenantID string, limit, offset int) ([]domain.LawfulBasis, int, error) {
+	if err := live(ctx); err != nil {
+		return nil, 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var matches []domain.LawfulBasis
+	for _, b := range m.bases {
+		if b.TenantID == tenantID {
+			matches = append(matches, b)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].Code < matches[j].Code
+	})
+	total := len(matches)
+	if offset >= total {
+		return []domain.LawfulBasis{}, total, nil
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	res := make([]domain.LawfulBasis, end-offset)
+	for i, b := range matches[offset:end] {
+		res[i] = cloneLawfulBasis(b)
+	}
+	return res, total, nil
 }
 
 func (m *Memory) PutNotice(ctx context.Context, notice domain.PrivacyNotice, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.PrivacyNotice, error) {
@@ -339,8 +480,8 @@ func (m *Memory) PutNotice(ctx context.Context, notice domain.PrivacyNotice, aud
 		audit.Revision = 1
 	}
 	audit.Changes = map[string]any{"before": nil, "after": notice}
-	m.audit = append(m.audit, audit)
-	m.outbox = append(m.outbox, outbox)
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
 	return notice, nil
 }
 
@@ -359,6 +500,72 @@ func (m *Memory) getNoticeLocked(tenantID, jurisdiction, version string) (domain
 		return domain.PrivacyNotice{}, ErrNotFound
 	}
 	return notice, nil
+}
+
+func (m *Memory) ListNotices(ctx context.Context, tenantID string, limit, offset int) ([]domain.PrivacyNotice, int, error) {
+	if err := live(ctx); err != nil {
+		return nil, 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var matches []domain.PrivacyNotice
+	for _, n := range m.notices {
+		if n.TenantID == tenantID {
+			matches = append(matches, n)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if !matches[i].PublishedAt.Equal(matches[j].PublishedAt) {
+			return matches[i].PublishedAt.After(matches[j].PublishedAt)
+		}
+		if matches[i].Jurisdiction != matches[j].Jurisdiction {
+			return matches[i].Jurisdiction < matches[j].Jurisdiction
+		}
+		return matches[i].Version > matches[j].Version
+	})
+	total := len(matches)
+	if offset >= total {
+		return []domain.PrivacyNotice{}, total, nil
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	res := make([]domain.PrivacyNotice, end-offset)
+	copy(res, matches[offset:end])
+	return res, total, nil
+}
+
+func (m *Memory) RetireNotice(ctx context.Context, tenantID, jurisdiction, version, supersededBy string, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.PrivacyNotice, error) {
+	if err := live(ctx); err != nil {
+		return domain.PrivacyNotice{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := noticeKey{tenantID: tenantID, jurisdiction: jurisdiction, version: version}
+	current, ok := m.notices[k]
+	if !ok {
+		return domain.PrivacyNotice{}, ErrNotFound
+	}
+	before := current
+	current.Active = false
+	current.Retired = true
+	current.SupersededBy = supersededBy
+	m.notices[k] = current
+
+	if audit.ResourceType == "" {
+		audit.ResourceType = "privacy_notice"
+	}
+	if audit.ConsentID == "" {
+		audit.ConsentID = current.Jurisdiction + "/" + current.Version
+	}
+	if audit.Revision <= 0 {
+		audit.Revision = 2
+	}
+	audit.Changes = map[string]any{"before": before, "after": current}
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
+	return current, nil
 }
 
 // memoryPolicyReader reads the registries while the caller already holds m.mu,
@@ -399,7 +606,8 @@ func (m *Memory) RecordGoverned(ctx context.Context, consent domain.Consent, rec
 	if receipt.ID != "" {
 		m.receipts[receiptKey{tenantID: receipt.TenantID, receiptID: receipt.ID}] = receipt
 	}
-	m.consents[cKey] = consent
+	clonedConsent := cloneConsent(consent)
+	m.consents[cKey] = clonedConsent
 	if audit.ResourceType == "" {
 		audit.ResourceType = "consent"
 	}
@@ -407,11 +615,15 @@ func (m *Memory) RecordGoverned(ctx context.Context, consent domain.Consent, rec
 		audit.Revision = 1
 	}
 	if audit.Changes == nil {
-		audit.Changes = map[string]any{"before": nil, "after": consent}
+		audit.Changes = map[string]any{"before": nil, "after": clonedConsent}
 	}
-	m.audit = append(m.audit, audit)
-	m.outbox = append(m.outbox, outbox)
-	return consent, nil
+	if outbox.Payload != nil {
+		outbox.Payload["generation"] = consent.PreferenceGeneration
+		outbox.Payload["preference_generation"] = consent.PreferenceGeneration
+	}
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
+	return cloneConsent(consent), nil
 }
 
 // Withdraw records the newest intent for the consent's preference stream, so it
@@ -429,24 +641,25 @@ func (m *Memory) Withdraw(ctx context.Context, consent domain.Consent, audit dom
 		return domain.Consent{}, ErrNotFound
 	}
 	if current.Status == domain.StatusWithdrawn {
-		return current, nil
+		return cloneConsent(current), nil
 	}
-	var before any = current
+	before := cloneConsent(current)
 	generation := m.advanceGenerationLocked(current)
 	current = m.consents[k] // advanceGenerationLocked may have invalidated its token
 	consent.Version = current.Version + 1
 	consent.ConfirmationTokenHash = ""
 	consent.PreferenceGeneration = generation
-	m.consents[k] = consent
+	clonedConsent := cloneConsent(consent)
+	m.consents[k] = clonedConsent
 	if audit.ResourceType == "" {
 		audit.ResourceType = "consent"
 	}
 	audit.ConsentID = consent.ID
 	audit.Revision = consent.Version
-	audit.Changes = map[string]any{"before": before, "after": consent}
-	m.audit = append(m.audit, audit)
-	m.outbox = append(m.outbox, outbox)
-	return consent, nil
+	audit.Changes = map[string]any{"before": before, "after": clonedConsent}
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
+	return cloneConsent(consent), nil
 }
 
 func (m *Memory) GetReceipt(ctx context.Context, tenantID, id string) (domain.ConsentReceipt, error) {
@@ -477,22 +690,50 @@ func (m *Memory) SetSuppression(ctx context.Context, suppression domain.Suppress
 	}
 	var before any
 	if current, ok := m.suppressions[k]; ok {
-		before = current
+		before = cloneSuppression(current)
+		// T-030: Protect administrative suppressions from revocation by self_service.
+		if current.Active && !suppression.Active && domain.IsAdministrativeRole(current.CreatedByRole) && !domain.HasAdminAuthority(suppression.CreatedByRole) {
+			return domain.Suppression{}, domain.ErrSuppressionProtected
+		}
+		// T-026: Preserve the old ID and CreatedByRole matching durable postgres store.
 		suppression.ID = current.ID
+		if current.CreatedByRole != "" {
+			suppression.CreatedByRole = current.CreatedByRole
+		}
 		suppression.Version = current.Version + 1
 	} else {
 		suppression.Version = 1
 	}
-	m.suppressions[k] = suppression
+	clonedSuppression := cloneSuppression(suppression)
+	m.suppressions[k] = clonedSuppression
 	if audit.ResourceType == "" {
 		audit.ResourceType = "suppression"
 	}
 	audit.ConsentID = suppression.ID
 	audit.Revision = suppression.Version
-	audit.Changes = map[string]any{"before": before, "after": suppression}
-	m.audit = append(m.audit, audit)
-	m.outbox = append(m.outbox, outbox)
-	return suppression, nil
+	audit.Changes = map[string]any{"before": before, "after": clonedSuppression}
+	// T-026: Ensure outbox AggregateID references the preserved suppression ID.
+	outbox.AggregateID = suppression.ID
+	if outbox.Payload != nil {
+		clonedPayload := cloneMapAny(outbox.Payload)
+		if _, hasRole := clonedPayload["created_by_role"]; hasRole {
+			clonedPayload["created_by_role"] = suppression.CreatedByRole
+		}
+		outbox.Payload = clonedPayload
+	}
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
+	return cloneSuppression(suppression), nil
+}
+
+func suppressionIsBetter(s, best domain.Suppression, rank, bestRank int) bool {
+	if rank != bestRank {
+		return rank > bestRank
+	}
+	if !s.UpdatedAt.Equal(best.UpdatedAt) {
+		return s.UpdatedAt.After(best.UpdatedAt)
+	}
+	return s.ID > best.ID
 }
 
 func (m *Memory) FindSuppression(ctx context.Context, tenantID, subjectID, purpose, channel string) (domain.Suppression, error) {
@@ -503,6 +744,7 @@ func (m *Memory) FindSuppression(ctx context.Context, tenantID, subjectID, purpo
 	defer m.mu.RUnlock()
 	var best domain.Suppression
 	bestRank := 0
+	found := false
 	for _, suppression := range m.suppressions {
 		if suppression.TenantID != tenantID || suppression.SubjectID != subjectID || !suppression.Active {
 			continue
@@ -520,15 +762,49 @@ func (m *Memory) FindSuppression(ctx context.Context, tenantID, subjectID, purpo
 				rank = 1
 			}
 		}
-		if rank > bestRank {
+		if rank > 0 && (!found || suppressionIsBetter(suppression, best, rank, bestRank)) {
 			best = suppression
 			bestRank = rank
+			found = true
 		}
 	}
-	if bestRank == 0 {
+	if !found {
 		return domain.Suppression{}, ErrNotFound
 	}
-	return best, nil
+	return cloneSuppression(best), nil
+}
+
+func (m *Memory) ListSuppressions(ctx context.Context, tenantID, subjectID string, limit, offset int) ([]domain.Suppression, int, error) {
+	if err := live(ctx); err != nil {
+		return nil, 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var matches []domain.Suppression
+	for _, s := range m.suppressions {
+		if s.TenantID == tenantID && s.SubjectID == subjectID {
+			matches = append(matches, s)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if !matches[i].UpdatedAt.Equal(matches[j].UpdatedAt) {
+			return matches[i].UpdatedAt.After(matches[j].UpdatedAt)
+		}
+		return matches[i].ID > matches[j].ID
+	})
+	total := len(matches)
+	if offset >= total {
+		return []domain.Suppression{}, total, nil
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	res := make([]domain.Suppression, end-offset)
+	for i, s := range matches[offset:end] {
+		res[i] = cloneSuppression(s)
+	}
+	return res, total, nil
 }
 
 // StartDoubleOptIn inserts the pending challenge bound to a freshly advanced
@@ -548,7 +824,7 @@ func (m *Memory) FindPendingByToken(ctx context.Context, tenantID, tokenHash str
 	defer m.mu.RUnlock()
 	for _, consent := range m.consents {
 		if consent.TenantID == tenantID && consent.Status == domain.StatusPendingConfirmation && consent.ConfirmationTokenHash == tokenHash {
-			return consent, nil
+			return cloneConsent(consent), nil
 		}
 	}
 	return domain.Consent{}, ErrNotFound
@@ -603,7 +879,7 @@ func (m *Memory) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash str
 	if err := live(ctx); err != nil {
 		return domain.Consent{}, err
 	}
-	before := consent
+	before := cloneConsent(consent)
 	consent.Status = domain.StatusGranted
 	consent.ConfirmedAt = &at
 	consent.GrantedAt = &at
@@ -611,18 +887,20 @@ func (m *Memory) ConfirmDoubleOptIn(ctx context.Context, tenantID, tokenHash str
 	consent.Version++
 	consent.ConfirmationTokenHash = ""
 	consent.ReceiptID = receipt.ID
-	m.consents[k] = consent
+	clonedConsent := cloneConsent(consent)
+	m.consents[k] = clonedConsent
 	m.receipts[receiptKey{tenantID: tenantID, receiptID: receipt.ID}] = receipt
 	if audit.ResourceType == "" {
 		audit.ResourceType = "consent"
 	}
 	audit.ConsentID = consent.ID
 	audit.Revision = consent.Version
-	audit.Changes = map[string]any{"before": before, "after": consent}
-	m.audit = append(m.audit, audit)
-	m.outbox = append(m.outbox, outbox)
-	return consent, nil
+	audit.Changes = map[string]any{"before": before, "after": clonedConsent}
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
+	return cloneConsent(consent), nil
 }
+
 func (m *Memory) AppendAudit(ctx context.Context, e domain.AuditEvent) error {
 	if err := live(ctx); err != nil {
 		return err
@@ -638,28 +916,42 @@ func (m *Memory) AppendAudit(ctx context.Context, e domain.AuditEvent) error {
 	if e.Changes == nil {
 		e.Changes = map[string]any{}
 	}
-	m.audit = append(m.audit, e)
+	m.audit = append(m.audit, cloneAuditEvent(e))
 	return nil
 }
+
 func (m *Memory) AppendOutbox(ctx context.Context, e domain.OutboxEvent) error {
 	if err := live(ctx); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.outbox = append(m.outbox, e)
+	m.outbox = append(m.outbox, cloneOutboxEvent(e))
 	return nil
 }
+
 func (m *Memory) Ping(ctx context.Context) error { return live(ctx) }
+
+func (m *Memory) VerifySchema(ctx context.Context) error { return live(ctx) }
+
 func (m *Memory) Audit() []domain.AuditEvent {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return append([]domain.AuditEvent(nil), m.audit...)
+	res := make([]domain.AuditEvent, len(m.audit))
+	for i, a := range m.audit {
+		res[i] = cloneAuditEvent(a)
+	}
+	return res
 }
+
 func (m *Memory) Outbox() []domain.OutboxEvent {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return append([]domain.OutboxEvent(nil), m.outbox...)
+	res := make([]domain.OutboxEvent, len(m.outbox))
+	for i, o := range m.outbox {
+		res[i] = cloneOutboxEvent(o)
+	}
+	return res
 }
 
 // OutboxLeaseState is the lease/publication state the memory store tracks

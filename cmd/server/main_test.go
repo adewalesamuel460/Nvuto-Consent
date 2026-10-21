@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -294,5 +297,55 @@ func TestStructuredJSONLoggingAndSecurityRedaction(t *testing.T) {
 	}
 	if !foundRequestFailed {
 		t.Fatalf("did not find request_failed structured JSON log entry in: %s", logBuf.String())
+	}
+}
+
+type slowPingRepo struct {
+	store.Repository
+	aborted atomic.Bool
+}
+
+func (s *slowPingRepo) Ping(ctx context.Context) error {
+	select {
+	case <-time.After(1 * time.Second):
+		return nil
+	case <-ctx.Done():
+		s.aborted.Store(true)
+		return ctx.Err()
+	}
+}
+
+func TestAT012_TimeoutHandlerEnforcesDeadlineAndAbortsExecution(t *testing.T) {
+	t.Setenv("ALLOW_DEV_HEADERS", "true")
+	slowRepo := &slowPingRepo{Repository: store.NewMemory()}
+	svc := service.New(slowRepo)
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	handler := newHandler(svc, 40*time.Millisecond, logger)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if ct := resp.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("expected application/json Content-Type, got %s", ct)
+	}
+	if retryAfter := resp.Header().Get("Retry-After"); retryAfter != "1" {
+		t.Fatalf("expected Retry-After: 1, got %s", retryAfter)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatalf("expected valid JSON timeout response: %v", err)
+	}
+	if body["error"] != "unavailable" {
+		t.Fatalf("expected error: unavailable, got %v", body["error"])
+	}
+
+	// Give goroutine a moment to register context cancellation
+	time.Sleep(30 * time.Millisecond)
+	if !slowRepo.aborted.Load() {
+		t.Fatal("expected slow repository operation to be aborted by cancelled request context")
 	}
 }

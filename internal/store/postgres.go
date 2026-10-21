@@ -55,7 +55,15 @@ func (p *Postgres) SetOutboxLease(lease time.Duration) {
 	}
 }
 
+// SetTxRetry overrides the transaction retry policy for testing or tuning.
+func (p *Postgres) SetTxRetry(attempts int, base, max time.Duration) {
+	p.txRetry = retryPolicy{attempts: attempts, base: base, max: max}
+}
+
 func (p *Postgres) Close() { p.pool.Close() }
+
+// Pool exposes the underlying connection pool for database-level inspection and integration tests.
+func (p *Postgres) Pool() *pgxpool.Pool { return p.pool }
 
 // Ping checks database reachability within the caller's context, capped so
 // a readiness probe never hangs on a stalled server.
@@ -63,6 +71,23 @@ func (p *Postgres) Ping(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	return classify(p.pool.Ping(ctx))
+}
+
+// VerifySchema verifies that critical database tables from the migrations suite
+// (e.g. consent_suppressions and consents) exist and are accessible.
+func (p *Postgres) VerifySchema(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	var exists bool
+	err := p.pool.QueryRow(ctx, `SELECT to_regclass('consent_suppressions') IS NOT NULL AND to_regclass('consents') IS NOT NULL`).Scan(&exists)
+	if err != nil {
+		return classify(err)
+	}
+	if !exists {
+		return domain.ErrUnavailable.Derive("schema_uninitialized", "required database migrations have not been applied")
+	}
+	return nil
 }
 
 // inTx runs fn in one transaction on the caller's context. Cancellation or
@@ -204,7 +229,11 @@ func insertReceipt(ctx context.Context, tx pgx.Tx, receipt domain.ConsentReceipt
 	if hashVersion == 0 {
 		hashVersion = 1 // unversioned receipts are, by definition, legacy format
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO consent_receipts(id,tenant_id,consent_id,subject_id,purpose,channel,notice_version,jurisdiction,evidence,receipt_hash,issued_at,hash_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, receipt.ID, receipt.TenantID, receipt.ConsentID, receipt.SubjectID, receipt.Purpose, receipt.Channel, receipt.NoticeVersion, receipt.Jurisdiction, evidence, receipt.ReceiptHash, receipt.IssuedAt, hashVersion)
+	policyVersion := receipt.PolicyVersion
+	if policyVersion <= 0 {
+		policyVersion = 1
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO consent_receipts(id,tenant_id,consent_id,subject_id,purpose,channel,notice_version,jurisdiction,evidence,receipt_hash,issued_at,hash_version,actor_id,consent_status,legal_basis,notice_content_hash,policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, receipt.ID, receipt.TenantID, receipt.ConsentID, receipt.SubjectID, receipt.Purpose, receipt.Channel, receipt.NoticeVersion, receipt.Jurisdiction, evidence, receipt.ReceiptHash, receipt.IssuedAt, hashVersion, receipt.ActorID, string(receipt.ConsentStatus), receipt.LegalBasis, receipt.NoticeContentHash, policyVersion)
 	return classify(err)
 }
 
@@ -225,7 +254,35 @@ func (p *Postgres) Get(ctx context.Context, tenantID, id string) (domain.Consent
 // updated_at only breaks ties (pre-migration records all have generation 0), so
 // wall-clock skew between writers can no longer reorder intent.
 func (p *Postgres) FindEffective(ctx context.Context, tenantID, subjectID, purpose, channel string) (domain.Consent, error) {
-	return scanConsent(p.pool.QueryRow(ctx, `SELECT `+consentColumns+` FROM consents WHERE tenant_id=$1 AND subject_id=$2 AND purpose=$3 AND channel=$4 ORDER BY preference_generation DESC,updated_at DESC LIMIT 1`, tenantID, subjectID, purpose, channel))
+	return scanConsent(p.pool.QueryRow(ctx, `SELECT `+consentColumns+` FROM consents WHERE tenant_id=$1 AND subject_id=$2 AND purpose=$3 AND channel=$4 ORDER BY preference_generation DESC, updated_at DESC, id DESC LIMIT 1`, tenantID, subjectID, purpose, channel))
+}
+
+func (p *Postgres) ListConsents(ctx context.Context, tenantID, subjectID string, limit, offset int) ([]domain.Consent, int, error) {
+	var total int
+	err := p.pool.QueryRow(ctx, `SELECT count(*) FROM consents WHERE tenant_id=$1 AND subject_id=$2`, tenantID, subjectID).Scan(&total)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	if total == 0 || offset >= total {
+		return []domain.Consent{}, total, nil
+	}
+	rows, err := p.pool.Query(ctx, `SELECT `+consentColumns+` FROM consents WHERE tenant_id=$1 AND subject_id=$2 ORDER BY preference_generation DESC, updated_at DESC, id DESC LIMIT $3 OFFSET $4`, tenantID, subjectID, limit, offset)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	defer rows.Close()
+	items := make([]domain.Consent, 0, limit)
+	for rows.Next() {
+		item, err := scanConsent(rows)
+		if err != nil {
+			return nil, 0, classify(err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, classify(err)
+	}
+	return items, total, nil
 }
 
 func (p *Postgres) PutPurpose(ctx context.Context, purpose domain.Purpose, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Purpose, error) {
@@ -286,7 +343,7 @@ func getLawfulBasis(ctx context.Context, q querier, tenantID, code, lock string)
 
 func getNotice(ctx context.Context, q querier, tenantID, jurisdiction, version, lock string) (domain.PrivacyNotice, error) {
 	var notice domain.PrivacyNotice
-	err := q.QueryRow(ctx, `SELECT tenant_id,version,jurisdiction,published_at,active FROM consent_privacy_notices WHERE tenant_id=$1 AND jurisdiction=$2 AND version=$3`+lock, tenantID, jurisdiction, version).Scan(&notice.TenantID, &notice.Version, &notice.Jurisdiction, &notice.PublishedAt, &notice.Active)
+	err := q.QueryRow(ctx, `SELECT tenant_id,version,jurisdiction,published_at,active,content,content_hash,retired,superseded_by FROM consent_privacy_notices WHERE tenant_id=$1 AND jurisdiction=$2 AND version=$3`+lock, tenantID, jurisdiction, version).Scan(&notice.TenantID, &notice.Version, &notice.Jurisdiction, &notice.PublishedAt, &notice.Active, &notice.Content, &notice.ContentHash, &notice.Retired, &notice.SupersededBy)
 	if err != nil {
 		return domain.PrivacyNotice{}, classify(err)
 	}
@@ -295,6 +352,36 @@ func getNotice(ctx context.Context, q querier, tenantID, jurisdiction, version, 
 
 func (p *Postgres) GetPurpose(ctx context.Context, tenantID, code string) (domain.Purpose, error) {
 	return getPurpose(ctx, p.pool, tenantID, code, "")
+}
+
+func (p *Postgres) ListPurposes(ctx context.Context, tenantID string, limit, offset int) ([]domain.Purpose, int, error) {
+	var total int
+	err := p.pool.QueryRow(ctx, `SELECT count(*) FROM consent_purposes WHERE tenant_id=$1`, tenantID).Scan(&total)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	if total == 0 || offset >= total {
+		return []domain.Purpose{}, total, nil
+	}
+	rows, err := p.pool.Query(ctx, `SELECT tenant_id,code,category,allowed_channels,requires_affirmative_consent,requires_double_opt_in,active,version,updated_at FROM consent_purposes WHERE tenant_id=$1 ORDER BY code ASC LIMIT $2 OFFSET $3`, tenantID, limit, offset)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	defer rows.Close()
+	items := make([]domain.Purpose, 0, limit)
+	for rows.Next() {
+		var purpose domain.Purpose
+		var channels []byte
+		if err := rows.Scan(&purpose.TenantID, &purpose.Code, &purpose.Category, &channels, &purpose.RequiresAffirmativeConsent, &purpose.RequiresDoubleOptIn, &purpose.Active, &purpose.Version, &purpose.UpdatedAt); err != nil {
+			return nil, 0, classify(err)
+		}
+		_ = json.Unmarshal(channels, &purpose.AllowedChannels)
+		items = append(items, purpose)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, classify(err)
+	}
+	return items, total, nil
 }
 
 func (p *Postgres) PutLawfulBasis(ctx context.Context, basis domain.LawfulBasis, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.LawfulBasis, error) {
@@ -332,9 +419,39 @@ func (p *Postgres) GetLawfulBasis(ctx context.Context, tenantID, code string) (d
 	return getLawfulBasis(ctx, p.pool, tenantID, code, "")
 }
 
+func (p *Postgres) ListLawfulBases(ctx context.Context, tenantID string, limit, offset int) ([]domain.LawfulBasis, int, error) {
+	var total int
+	err := p.pool.QueryRow(ctx, `SELECT count(*) FROM consent_lawful_bases WHERE tenant_id=$1`, tenantID).Scan(&total)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	if total == 0 || offset >= total {
+		return []domain.LawfulBasis{}, total, nil
+	}
+	rows, err := p.pool.Query(ctx, `SELECT tenant_id,code,allowed_categories,requires_evidence,active,version,updated_at FROM consent_lawful_bases WHERE tenant_id=$1 ORDER BY code ASC LIMIT $2 OFFSET $3`, tenantID, limit, offset)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	defer rows.Close()
+	items := make([]domain.LawfulBasis, 0, limit)
+	for rows.Next() {
+		var basis domain.LawfulBasis
+		var categories []byte
+		if err := rows.Scan(&basis.TenantID, &basis.Code, &categories, &basis.RequiresEvidence, &basis.Active, &basis.Version, &basis.UpdatedAt); err != nil {
+			return nil, 0, classify(err)
+		}
+		_ = json.Unmarshal(categories, &basis.AllowedCategories)
+		items = append(items, basis)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, classify(err)
+	}
+	return items, total, nil
+}
+
 func (p *Postgres) PutNotice(ctx context.Context, notice domain.PrivacyNotice, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.PrivacyNotice, error) {
 	err := p.inTx(ctx, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO consent_privacy_notices(tenant_id,jurisdiction,version,published_at,active) VALUES($1,$2,$3,$4,$5)`, notice.TenantID, notice.Jurisdiction, notice.Version, notice.PublishedAt, notice.Active); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO consent_privacy_notices(tenant_id,jurisdiction,version,published_at,active,content,content_hash,retired,superseded_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, notice.TenantID, notice.Jurisdiction, notice.Version, notice.PublishedAt, notice.Active, notice.Content, notice.ContentHash, notice.Retired, notice.SupersededBy); err != nil {
 			return classify(err)
 		}
 		if audit.ResourceType == "" {
@@ -357,6 +474,71 @@ func (p *Postgres) PutNotice(ctx context.Context, notice domain.PrivacyNotice, a
 
 func (p *Postgres) GetNotice(ctx context.Context, tenantID, jurisdiction, version string) (domain.PrivacyNotice, error) {
 	return getNotice(ctx, p.pool, tenantID, jurisdiction, version, "")
+}
+
+func (p *Postgres) ListNotices(ctx context.Context, tenantID string, limit, offset int) ([]domain.PrivacyNotice, int, error) {
+	var total int
+	err := p.pool.QueryRow(ctx, `SELECT count(*) FROM consent_privacy_notices WHERE tenant_id=$1`, tenantID).Scan(&total)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	if total == 0 || offset >= total {
+		return []domain.PrivacyNotice{}, total, nil
+	}
+	rows, err := p.pool.Query(ctx, `SELECT tenant_id,version,jurisdiction,published_at,active,content,content_hash,retired,superseded_by FROM consent_privacy_notices WHERE tenant_id=$1 ORDER BY published_at DESC, jurisdiction ASC, version DESC LIMIT $2 OFFSET $3`, tenantID, limit, offset)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	defer rows.Close()
+	items := make([]domain.PrivacyNotice, 0, limit)
+	for rows.Next() {
+		var notice domain.PrivacyNotice
+		if err := rows.Scan(&notice.TenantID, &notice.Version, &notice.Jurisdiction, &notice.PublishedAt, &notice.Active, &notice.Content, &notice.ContentHash, &notice.Retired, &notice.SupersededBy); err != nil {
+			return nil, 0, classify(err)
+		}
+		items = append(items, notice)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, classify(err)
+	}
+	return items, total, nil
+}
+
+func (p *Postgres) RetireNotice(ctx context.Context, tenantID, jurisdiction, version, supersededBy string, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.PrivacyNotice, error) {
+	var notice domain.PrivacyNotice
+	err := p.inTx(ctx, func(tx pgx.Tx) error {
+		var before domain.PrivacyNotice
+		err := tx.QueryRow(ctx, `SELECT tenant_id,version,jurisdiction,published_at,active,content,content_hash,retired,superseded_by FROM consent_privacy_notices WHERE tenant_id=$1 AND jurisdiction=$2 AND version=$3 FOR UPDATE`, tenantID, jurisdiction, version).Scan(&before.TenantID, &before.Version, &before.Jurisdiction, &before.PublishedAt, &before.Active, &before.Content, &before.ContentHash, &before.Retired, &before.SupersededBy)
+		if err != nil {
+			return classify(err)
+		}
+		notice = before
+		notice.Active = false
+		notice.Retired = true
+		notice.SupersededBy = supersededBy
+		tag, err := tx.Exec(ctx, `UPDATE consent_privacy_notices SET active=false, retired=true, superseded_by=$4 WHERE tenant_id=$1 AND jurisdiction=$2 AND version=$3`, tenantID, jurisdiction, version, supersededBy)
+		if err != nil {
+			return classify(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		if audit.ResourceType == "" {
+			audit.ResourceType = "privacy_notice"
+		}
+		if audit.ConsentID == "" {
+			audit.ConsentID = notice.Jurisdiction + "/" + notice.Version
+		}
+		if audit.Revision <= 0 {
+			audit.Revision = 2
+		}
+		audit.Changes = map[string]any{"before": before, "after": notice}
+		return appendEffectsTx(ctx, tx, audit, outbox)
+	})
+	if err != nil {
+		return domain.PrivacyNotice{}, err
+	}
+	return notice, nil
 }
 
 // pgPolicyReader reads policy inside the confirmation transaction with shared
@@ -399,6 +581,10 @@ func recordGovernedTx(ctx context.Context, tx pgx.Tx, consent domain.Consent, re
 	}
 	if audit.Changes == nil {
 		audit.Changes = map[string]any{"before": nil, "after": consent}
+	}
+	if outbox.Payload != nil {
+		outbox.Payload["generation"] = generation
+		outbox.Payload["preference_generation"] = generation
 	}
 	if err := appendEffectsTx(ctx, tx, audit, outbox); err != nil {
 		return domain.Consent{}, err
@@ -472,11 +658,13 @@ func (p *Postgres) GetReceipt(ctx context.Context, tenantID, id string) (domain.
 	var receipt domain.ConsentReceipt
 	var evidence []byte
 	var hashVersion int16
-	err := p.pool.QueryRow(ctx, `SELECT id,tenant_id,consent_id,subject_id,purpose,channel,notice_version,jurisdiction,evidence,receipt_hash,issued_at,hash_version FROM consent_receipts WHERE tenant_id=$1 AND id=$2`, tenantID, id).Scan(&receipt.ID, &receipt.TenantID, &receipt.ConsentID, &receipt.SubjectID, &receipt.Purpose, &receipt.Channel, &receipt.NoticeVersion, &receipt.Jurisdiction, &evidence, &receipt.ReceiptHash, &receipt.IssuedAt, &hashVersion)
+	var consentStatus string
+	err := p.pool.QueryRow(ctx, `SELECT id,tenant_id,consent_id,subject_id,purpose,channel,notice_version,jurisdiction,evidence,receipt_hash,issued_at,hash_version,actor_id,consent_status,legal_basis,notice_content_hash,policy_version FROM consent_receipts WHERE tenant_id=$1 AND id=$2`, tenantID, id).Scan(&receipt.ID, &receipt.TenantID, &receipt.ConsentID, &receipt.SubjectID, &receipt.Purpose, &receipt.Channel, &receipt.NoticeVersion, &receipt.Jurisdiction, &evidence, &receipt.ReceiptHash, &receipt.IssuedAt, &hashVersion, &receipt.ActorID, &consentStatus, &receipt.LegalBasis, &receipt.NoticeContentHash, &receipt.PolicyVersion)
 	if err != nil {
 		return domain.ConsentReceipt{}, classify(err)
 	}
 	_ = json.Unmarshal(evidence, &receipt.Evidence)
+	receipt.ConsentStatus = domain.Status(consentStatus)
 	receipt.HashVersion = int(hashVersion)
 	receipt.IssuedAt = receipt.IssuedAt.UTC()
 	return receipt, nil
@@ -488,17 +676,27 @@ func (p *Postgres) SetSuppression(ctx context.Context, suppression domain.Suppre
 		var before any
 		var prev domain.Suppression
 		var prevScope string
-		err := tx.QueryRow(ctx, `SELECT id,tenant_id,subject_id,scope,purpose,channel,reason,active,version,updated_at FROM consent_suppressions WHERE tenant_id=$1 AND subject_id=$2 AND scope=$3 AND purpose=$4 AND channel=$5 FOR UPDATE`, suppression.TenantID, suppression.SubjectID, string(suppression.Scope), suppression.Purpose, suppression.Channel).Scan(&prev.ID, &prev.TenantID, &prev.SubjectID, &prevScope, &prev.Purpose, &prev.Channel, &prev.Reason, &prev.Active, &prev.Version, &prev.UpdatedAt)
+		err := tx.QueryRow(ctx, `SELECT id,tenant_id,subject_id,scope,purpose,channel,reason,active,created_by_role,version,updated_at FROM consent_suppressions WHERE tenant_id=$1 AND subject_id=$2 AND scope=$3 AND purpose=$4 AND channel=$5 FOR UPDATE`, suppression.TenantID, suppression.SubjectID, string(suppression.Scope), suppression.Purpose, suppression.Channel).Scan(&prev.ID, &prev.TenantID, &prev.SubjectID, &prevScope, &prev.Purpose, &prev.Channel, &prev.Reason, &prev.Active, &prev.CreatedByRole, &prev.Version, &prev.UpdatedAt)
 		if err == nil {
 			prev.Scope = domain.SuppressionScope(prevScope)
 			before = prev
+			// T-030: Protect administrative suppressions from revocation by self_service.
+			if prev.Active && !suppression.Active && domain.IsAdministrativeRole(prev.CreatedByRole) && !domain.HasAdminAuthority(suppression.CreatedByRole) {
+				return domain.ErrSuppressionProtected
+			}
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return classify(err)
 		}
 
 		stored = suppression
-		err = tx.QueryRow(ctx, `INSERT INTO consent_suppressions(id,tenant_id,subject_id,scope,purpose,channel,reason,active,version,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,1,$9)
-		ON CONFLICT(tenant_id,subject_id,scope,purpose,channel) DO UPDATE SET reason=excluded.reason,active=excluded.active,version=consent_suppressions.version+1,updated_at=excluded.updated_at RETURNING id,version`, suppression.ID, suppression.TenantID, suppression.SubjectID, string(suppression.Scope), suppression.Purpose, suppression.Channel, suppression.Reason, suppression.Active, suppression.UpdatedAt).Scan(&stored.ID, &stored.Version)
+		err = tx.QueryRow(ctx, `INSERT INTO consent_suppressions(id,tenant_id,subject_id,scope,purpose,channel,reason,active,created_by_role,version,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,1,$10)
+		ON CONFLICT(tenant_id,subject_id,scope,purpose,channel) DO UPDATE SET
+			reason=excluded.reason,
+			active=excluded.active,
+			created_by_role=CASE WHEN consent_suppressions.created_by_role <> '' THEN consent_suppressions.created_by_role ELSE excluded.created_by_role END,
+			version=consent_suppressions.version+1,
+			updated_at=excluded.updated_at
+		RETURNING id,created_by_role,version`, suppression.ID, suppression.TenantID, suppression.SubjectID, string(suppression.Scope), suppression.Purpose, suppression.Channel, suppression.Reason, suppression.Active, suppression.CreatedByRole, suppression.UpdatedAt).Scan(&stored.ID, &stored.CreatedByRole, &stored.Version)
 		if err != nil {
 			return classify(err)
 		}
@@ -521,14 +719,44 @@ func (p *Postgres) SetSuppression(ctx context.Context, suppression domain.Suppre
 func (p *Postgres) FindSuppression(ctx context.Context, tenantID, subjectID, purpose, channel string) (domain.Suppression, error) {
 	var suppression domain.Suppression
 	var scope string
-	err := p.pool.QueryRow(ctx, `SELECT id,tenant_id,subject_id,scope,purpose,channel,reason,active,version,updated_at FROM consent_suppressions
+	err := p.pool.QueryRow(ctx, `SELECT id,tenant_id,subject_id,scope,purpose,channel,reason,active,created_by_role,version,updated_at FROM consent_suppressions
 		WHERE tenant_id=$1 AND subject_id=$2 AND active=true AND (scope='global' OR (scope='channel' AND channel=$4) OR (scope='purpose_channel' AND purpose=$3 AND channel=$4))
-		ORDER BY CASE scope WHEN 'global' THEN 3 WHEN 'channel' THEN 2 ELSE 1 END DESC,updated_at DESC LIMIT 1`, tenantID, subjectID, purpose, channel).Scan(&suppression.ID, &suppression.TenantID, &suppression.SubjectID, &scope, &suppression.Purpose, &suppression.Channel, &suppression.Reason, &suppression.Active, &suppression.Version, &suppression.UpdatedAt)
+		ORDER BY CASE scope WHEN 'global' THEN 3 WHEN 'channel' THEN 2 ELSE 1 END DESC, updated_at DESC, id DESC LIMIT 1`, tenantID, subjectID, purpose, channel).Scan(&suppression.ID, &suppression.TenantID, &suppression.SubjectID, &scope, &suppression.Purpose, &suppression.Channel, &suppression.Reason, &suppression.Active, &suppression.CreatedByRole, &suppression.Version, &suppression.UpdatedAt)
 	if err != nil {
 		return domain.Suppression{}, classify(err)
 	}
 	suppression.Scope = domain.SuppressionScope(scope)
 	return suppression, nil
+}
+
+func (p *Postgres) ListSuppressions(ctx context.Context, tenantID, subjectID string, limit, offset int) ([]domain.Suppression, int, error) {
+	var total int
+	err := p.pool.QueryRow(ctx, `SELECT count(*) FROM consent_suppressions WHERE tenant_id=$1 AND subject_id=$2`, tenantID, subjectID).Scan(&total)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	if total == 0 || offset >= total {
+		return []domain.Suppression{}, total, nil
+	}
+	rows, err := p.pool.Query(ctx, `SELECT id,tenant_id,subject_id,scope,purpose,channel,reason,active,created_by_role,version,updated_at FROM consent_suppressions WHERE tenant_id=$1 AND subject_id=$2 ORDER BY updated_at DESC, id DESC LIMIT $3 OFFSET $4`, tenantID, subjectID, limit, offset)
+	if err != nil {
+		return nil, 0, classify(err)
+	}
+	defer rows.Close()
+	items := make([]domain.Suppression, 0, limit)
+	for rows.Next() {
+		var sup domain.Suppression
+		var scope string
+		if err := rows.Scan(&sup.ID, &sup.TenantID, &sup.SubjectID, &scope, &sup.Purpose, &sup.Channel, &sup.Reason, &sup.Active, &sup.CreatedByRole, &sup.Version, &sup.UpdatedAt); err != nil {
+			return nil, 0, classify(err)
+		}
+		sup.Scope = domain.SuppressionScope(scope)
+		items = append(items, sup)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, classify(err)
+	}
+	return items, total, nil
 }
 
 // StartDoubleOptIn inserts the pending challenge bound to a freshly advanced

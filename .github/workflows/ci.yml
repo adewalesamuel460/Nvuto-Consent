@@ -3,6 +3,7 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -44,6 +45,32 @@ jobs:
       - run: go build ./cmd/outbox-worker
       - run: docker build -t nvuto-consent:test .
       - run: docker build -f Dockerfile.worker -t nvuto-consent-worker:test .
+      - name: Verify Kustomize manifests and missing secret detection
+        run: |
+          # 1. Base manifests must render cleanly
+          kustomize build deploy/base > /dev/null
+
+          # 2. Overlays must fail-closed if required secrets are unconfigured (AT-018)
+          if kustomize build deploy/overlays/staging > /dev/null 2>&1; then
+            echo "ERROR: Staging overlay unexpectedly rendered without secrets.env!"
+            exit 1
+          fi
+
+          if kustomize build deploy/overlays/production > /dev/null 2>&1; then
+            echo "ERROR: Production overlay unexpectedly rendered without secrets.env!"
+            exit 1
+          fi
+
+          # 3. Overlays must build cleanly when provided environment secrets
+          cp deploy/overlays/staging/secrets.env.example deploy/overlays/staging/secrets.env
+          cp deploy/overlays/staging/nats.creds.example deploy/overlays/staging/nats.creds
+          kustomize build deploy/overlays/staging > /dev/null
+          rm deploy/overlays/staging/secrets.env deploy/overlays/staging/nats.creds
+
+          cp deploy/overlays/production/secrets.env.example deploy/overlays/production/secrets.env
+          cp deploy/overlays/production/nats.creds.example deploy/overlays/production/nats.creds
+          kustomize build deploy/overlays/production > /dev/null
+          rm deploy/overlays/production/secrets.env deploy/overlays/production/nats.creds
 
   yugabytedb-functional:
     runs-on: ubuntu-latest
@@ -69,7 +96,7 @@ jobs:
         run: bash scripts/ci/start-yugabytedb.sh consent
       - name: Apply YSQL schema
         run: |
-          for migration in migrations/[0-9][0-9][0-9]_*.sql; do
+          for migration in $(ls -1 migrations/[0-9][0-9][0-9]_*.sql | sort); do
             docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -v ON_ERROR_STOP=1 < "$migration"
           done
       - name: Prove upgrade from 001 through every migration on YugabyteDB
@@ -86,36 +113,41 @@ jobs:
           q "INSERT INTO consent_receipts(id,tenant_id,consent_id,subject_id,purpose,channel,notice_version,jurisdiction,evidence,receipt_hash,issued_at) VALUES('legacy-receipt','tenant-upgrade','legacy','subject-upgrade','service_updates','email','','','{}','legacy-v1-hash',now())"
           ysql -d consent_upgrade < migrations/003_governed_idempotency.sql
           q "INSERT INTO consent_idempotency(tenant_id,idempotency_key,request_hash,consent_id,created_at) VALUES('tenant-upgrade','legacy-key','legacy-request-hash','legacy',now())"
-          # Every later migration, including ones added in future, in order.
-          for migration in migrations/[0-9][0-9][0-9]_*.sql; do
+          # Every later migration (004 through latest 008), in sorted order.
+          for migration in $(ls -1 migrations/[0-9][0-9][0-9]_*.sql | sort); do
             case "$(basename "$migration")" in 001_*|002_*|003_*) continue ;; esac
             ysql -d consent_upgrade < "$migration"
           done
           # Re-applying the full chain must be a no-op.
-          for migration in migrations/[0-9][0-9][0-9]_*.sql; do
+          for migration in $(ls -1 migrations/[0-9][0-9][0-9]_*.sql | sort); do
             ysql -d consent_upgrade < "$migration"
           done
           test "$(q "SELECT status || ':' || notice_version || ':' || preference_generation FROM consents WHERE id='legacy'")" = "granted::0"
           test "$(q "SELECT receipt_hash || ':' || hash_version FROM consent_receipts WHERE id='legacy-receipt'")" = "legacy-v1-hash:1"
           test "$(q "SELECT request_hash || ':' || consent_id FROM consent_idempotency WHERE tenant_id='tenant-upgrade' AND idempotency_key='legacy-key'")" = "legacy-request-hash:legacy"
           test "$(q "SELECT locked_by || ':' || attempts || ':' || coalesce(claim_token,'none') || ':' || (published_at IS NULL) FROM consent_outbox_events WHERE id='legacy-outbox'")" = "legacy-worker:1:none:true"
-      - name: Prove idempotent replay/conflict and outbox fencing on the upgraded schema
+          test "$(q "SELECT coalesce(response_snapshot::text,'none') FROM consent_idempotency WHERE tenant_id='tenant-upgrade' AND idempotency_key='legacy-key'")" = "{}"
+          test "$(q "SELECT count(*) FROM pg_constraint WHERE conname='fk_consent_idempotency_consent'")" = "1"
+          test "$(q "SELECT count(*) FROM pg_constraint WHERE conname='fk_consent_receipts_consent'")" = "1"
+          test "$(q "SELECT count(*) FROM pg_constraint WHERE conname='uq_consents_tenant_id'")" = "1"
+          test "$(q "SELECT count(*) FROM information_schema.columns WHERE table_name='consent_suppressions' AND column_name='created_by_role'")" = "1"
+      - name: Prove idempotent replay/conflict, outbox fencing, and protected suppressions on the upgraded schema
         run: |
           set -o pipefail
           TEST_DATABASE_URL="$UPGRADE_DATABASE_URL" DATABASE_URL="$UPGRADE_DATABASE_URL" \
             go test -race -count=1 -json ./internal/store \
-              -run '^(TestPostgresGovernedIdempotencyConcurrentReplay|TestPostgresOutboxLeaseFencing)$' \
+              -run '^(TestPostgresGovernedIdempotencyConcurrentReplay|TestPostgresOutboxLeaseFencing|TestPostgresProtectedAdministrativeSuppression)$' \
             | tee test-results/store-upgraded.jsonl
           python3 scripts/ci/assert-go-test-json.py test-results/store-upgraded.jsonl \
-            TestPostgresGovernedIdempotencyConcurrentReplay=1 TestPostgresOutboxLeaseFencing=1
-      - name: Prove durable idempotency and outbox fencing on YSQL, run twice against one database
+            TestPostgresGovernedIdempotencyConcurrentReplay=1 TestPostgresOutboxLeaseFencing=1 TestPostgresProtectedAdministrativeSuppression=1
+      - name: Prove durable idempotency, outbox fencing, and protected suppressions on YSQL, run twice against one database
         run: |
           set -o pipefail
           go test -race -count=2 -json ./internal/store \
-              -run '^(TestPostgresGovernedIdempotencyConcurrentReplay|TestPostgresOutboxLeaseFencing)$' \
+              -run '^(TestPostgresGovernedIdempotencyConcurrentReplay|TestPostgresOutboxLeaseFencing|TestPostgresProtectedAdministrativeSuppression)$' \
             | tee test-results/store-fresh.jsonl
           python3 scripts/ci/assert-go-test-json.py test-results/store-fresh.jsonl \
-            TestPostgresGovernedIdempotencyConcurrentReplay=2 TestPostgresOutboxLeaseFencing=2
+            TestPostgresGovernedIdempotencyConcurrentReplay=2 TestPostgresOutboxLeaseFencing=2 TestPostgresProtectedAdministrativeSuppression=2
       - name: Prove YSQL policy transactions and confirmation concurrency
         run: |
           set -o pipefail
@@ -192,3 +224,87 @@ jobs:
           name: ysql-test-results
           path: test-results/
           if-no-files-found: warn
+
+  release-packaging:
+    name: Release Packaging & Immutable Promotion (T-018)
+    runs-on: ubuntu-latest
+    needs: [go, yugabytedb-functional]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Kustomize
+        uses: imranismail/setup-kustomize@v3
+      - name: Build and push API container image
+        id: push-api
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-api:${{ github.sha }}
+            ghcr.io/${{ github.repository }}-api:latest
+      - name: Build and push Worker container image
+        id: push-worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-worker:${{ github.sha }}
+            ghcr.io/${{ github.repository }}-worker:latest
+      - name: Extract immutable SHA256 image digests
+        id: extract-digests
+        run: |
+          API_DIGEST="${{ steps.push-api.outputs.digest }}"
+          WORKER_DIGEST="${{ steps.push-worker.outputs.digest }}"
+          echo "API Digest: ${API_DIGEST}"
+          echo "Worker Digest: ${WORKER_DIGEST}"
+          echo "api_digest=${API_DIGEST}" >> $GITHUB_OUTPUT
+          echo "worker_digest=${WORKER_DIGEST}" >> $GITHUB_OUTPUT
+      - name: Pin immutable digests in Staging Overlay via kustomize edit set image
+        run: |
+          cd deploy/overlays/staging
+          kustomize edit set image consent-api=ghcr.io/${{ github.repository }}-api@${{ steps.extract-digests.outputs.api_digest }}
+          kustomize edit set image consent-worker=ghcr.io/${{ github.repository }}-worker@${{ steps.extract-digests.outputs.worker_digest }}
+          git diff kustomization.yaml
+      - name: Pin immutable digests in Production Overlay via kustomize edit set image
+        run: |
+          cd deploy/overlays/production
+          kustomize edit set image consent-api=ghcr.io/${{ github.repository }}-api@${{ steps.extract-digests.outputs.api_digest }}
+          kustomize edit set image consent-worker=ghcr.io/${{ github.repository }}-worker@${{ steps.extract-digests.outputs.worker_digest }}
+          git diff kustomization.yaml
+      - name: Validate rendered release manifests with simulated environment secrets
+        run: |
+          mkdir -p release-manifests
+          cp deploy/overlays/staging/secrets.env.example deploy/overlays/staging/secrets.env
+          cp deploy/overlays/staging/nats.creds.example deploy/overlays/staging/nats.creds
+          kustomize build deploy/overlays/staging > release-manifests/staging.yaml
+
+          cp deploy/overlays/production/secrets.env.example deploy/overlays/production/secrets.env
+          cp deploy/overlays/production/nats.creds.example deploy/overlays/production/nats.creds
+          kustomize build deploy/overlays/production > release-manifests/production.yaml
+
+          # Verify no :latest mutable tags leaked into production manifests
+          if grep -E 'image:.*:latest' release-manifests/*.yaml; then
+            echo "ERROR: :latest tag found in release manifests!"
+            exit 1
+          fi
+          echo "Manifests successfully rendered with immutable digests."
+      - name: Upload reproducible release manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifests-${{ github.sha }}
+          path: release-manifests/

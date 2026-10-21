@@ -1,0 +1,1585 @@
+openapi: 3.1.0
+info:
+  title: Nvuto Consent Engine API
+  version: 1.0.0
+  description: |
+    Nvuto Consent is a high-throughput, distributed consent and preference management engine
+    designed for strict policy governance, multi-tenant boundary isolation, cryptographic receipts,
+    idempotent state mutations, and authorized preference discovery.
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: /
+    description: Current server environment
+
+security:
+  - BearerAuth: []
+  - DevHeaders: []
+
+paths:
+  /healthz:
+    get:
+      summary: Health check probe
+      description: Returns service liveness status. Requires no authentication.
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /readyz:
+    get:
+      summary: Readiness check probe
+      description: Returns service readiness by testing database connectivity and auth configuration.
+      security: []
+      responses:
+        '200':
+          description: Service is ready to serve traffic
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                properties:
+                  status:
+                    type: string
+                    example: ready
+        '503':
+          description: Service is not ready (storage unavailable or auth misconfigured)
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                properties:
+                  status:
+                    type: string
+                    example: not_ready
+
+  /v1/purposes:
+    get:
+      summary: List registered consent purposes
+      description: Retrieves a bounded, paginated list of consent purposes registered for the caller's tenant.
+      parameters:
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: Paginated list of registered consent purposes
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PurposeListResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+    post:
+      summary: Register or update a consent purpose
+      description: Registers or updates a purpose within the caller's tenant. Requires administrative authority (privacy_admin, consent_admin, developer).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurposeRequest'
+      responses:
+        '201':
+          description: Purpose successfully registered or updated
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Purpose'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/lawful-bases:
+    get:
+      summary: List registered lawful bases
+      description: Retrieves a bounded, paginated list of lawful bases registered for the caller's tenant.
+      parameters:
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: Paginated list of registered lawful bases
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LawfulBasisListResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+    post:
+      summary: Register or update a lawful basis
+      description: Registers or updates a lawful basis rule in the policy registry. Requires administrative authority.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LawfulBasisRequest'
+      responses:
+        '201':
+          description: Lawful basis registered successfully
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LawfulBasis'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/notices:
+    get:
+      summary: List published privacy notices
+      description: Retrieves a bounded, paginated list of published privacy notices for the caller's tenant.
+      parameters:
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: Paginated list of privacy notices
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoticeListResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+    post:
+      summary: Publish a privacy notice
+      description: Publishes an immutable privacy notice version for a given jurisdiction. Notice versions cannot be overwritten.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NoticeRequest'
+      responses:
+        '201':
+          description: Privacy notice successfully published
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyNotice'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/consents:
+    get:
+      summary: Discover preferences and list consents for a subject
+      description: |
+        Discovers preferences and returns a bounded, paginated list of consent records for a specific subject_id.
+        SubjectScope authorization is strictly enforced: callers with `self_service` role can strictly only access
+        their own canonical `subject_id`. Read-authorized service/admin callers can query tenant-wide subjects.
+      parameters:
+        - $ref: '#/components/parameters/SubjectIdQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: Paginated list of consent records matching the subject
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsentListResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+    post:
+      summary: Record governed consent decision
+      description: |
+        Records an admitted consent decision (granted or denied). Validates all requirements against the active
+        purpose, lawful basis, and published privacy notice policies.
+        Supports durable idempotency via `Idempotency-Key` and optional `X-Request-Hash` headers.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/RequestHashHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordConsentRequest'
+      responses:
+        '201':
+          description: Consent decision recorded and cryptographic receipt issued
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Consent'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/consents/{id}/withdraw:
+    post:
+      summary: Withdraw an existing consent
+      description: |
+        Withdraws an active consent by its identifier. Opt-out is unconditionally honored even if policy
+        registries are retired or unavailable. Strict subject boundary checks apply.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Consent identifier to withdraw
+          schema:
+            type: string
+            example: con_0123456789abcdef
+      responses:
+        '200':
+          description: Consent withdrawn successfully
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Consent'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/suppressions:
+    get:
+      summary: Discover active suppressions for a subject
+      description: |
+        Discovers suppression preferences and returns a bounded, paginated list of suppressions for a subject_id.
+        SubjectScope authorization is strictly enforced: `self_service` callers are restricted to their own `subject_id`.
+      parameters:
+        - $ref: '#/components/parameters/SubjectIdQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: Paginated list of suppressions for the subject
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuppressionListResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+    post:
+      summary: Set or revoke a suppression rule
+      description: |
+        Creates or updates a suppression rule (global, channel, or purpose_channel).
+        Administrative suppressions created by privacy_admin, consent_admin, or developer are protected and
+        cannot be deactivated by self_service principals.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuppressionRequest'
+      responses:
+        '201':
+          description: Suppression successfully applied or updated
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Suppression'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/evaluate:
+    post:
+      summary: Evaluate consent and suppression for an interaction
+      description: |
+        Evaluates whether a communication or processing activity is permitted for a subject, purpose, and channel.
+        Suppression overrides consent (strict safety deny). Returns decision and rationale.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvaluateRequest'
+      responses:
+        '200':
+          description: Evaluation decision computed
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuppressionDecision'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/evaluate:batch:
+    post:
+      summary: Batch evaluate consent and suppression requests
+      description: Evaluates up to 100 evaluation requests in a single round-trip.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchEvaluateRequest'
+      responses:
+        '200':
+          description: Batch decisions computed
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEvaluateResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/double-opt-in:
+    post:
+      summary: Start a double opt-in verification flow
+      description: |
+        Initiates a double opt-in challenge for purposes requiring confirmed affirmative consent.
+        Generates a secure confirmation token and creates a consent record in `pending_confirmation` status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DoubleOptInRequest'
+      responses:
+        '201':
+          description: Double opt-in challenge initiated
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DoubleOptInChallengeResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/double-opt-in/confirm:
+    post:
+      summary: Confirm a double opt-in verification token
+      description: |
+        Redeems the confirmation token to promote a `pending_confirmation` consent into `granted` status.
+        Re-validates registry policies within the confirmation transaction and creates the audit, receipt, and outbox records.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmRequest'
+      responses:
+        '200':
+          description: Double opt-in confirmed and consent granted
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Consent'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /v1/receipts/{id}:
+    get:
+      summary: Retrieve consent receipt by ID
+      description: Retrieves the immutable cryptographic receipt issued when a consent was granted.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique receipt identifier
+          schema:
+            type: string
+            example: rcp_0123456789abcdef
+      responses:
+        '200':
+          description: Cryptographic consent receipt
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsentReceipt'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT Bearer authentication validated against identity provider JWKS or configured HMAC secret.
+    DevHeaders:
+      type: apiKey
+      in: header
+      name: X-Nvuto-Tenant-ID
+      description: |
+        Header-based identity injection used exclusively when ALLOW_DEV_HEADERS=true.
+        Supported headers include X-Nvuto-Tenant-ID, X-Nvuto-Actor-ID, X-Nvuto-Roles, and X-Nvuto-Subject-ID.
+
+  parameters:
+    SubjectIdQuery:
+      name: subject_id
+      in: query
+      required: true
+      description: Canonical subject identifier for preference discovery.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+        example: cus-1001
+
+    LimitQuery:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of records to return (1-100, default 20).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+        example: 20
+
+    OffsetQuery:
+      name: offset
+      in: query
+      required: false
+      description: Number of records to skip before beginning pagination (non-negative, default 0).
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+        example: 0
+
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Client-supplied unique token to guarantee idempotent execution across retries.
+      schema:
+        type: string
+        maxLength: 200
+        example: 8e50b73c-bf5c-42cb-b1b7-9e0c6533dd09
+
+    RequestHashHeader:
+      name: X-Request-Hash
+      in: header
+      required: false
+      description: Optional SHA-256 fingerprint of the request payload to verify payload integrity on replay.
+      schema:
+        type: string
+        pattern: '^sha256:[0-9a-f]{64}$'
+        example: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+
+  headers:
+    CorrelationId:
+      description: Request correlation identifier assigned by server and returned in all responses.
+      schema:
+        type: string
+        example: 8e9c61e4f4d2243d548325a7a726ea61
+    RetryAfter:
+      description: Suggested wait time in seconds before retrying after a 503 transient outage.
+      schema:
+        type: string
+        example: "1"
+
+  schemas:
+    ConsentStatus:
+      type: string
+      enum:
+        - granted
+        - denied
+        - withdrawn
+        - expired
+        - pending_confirmation
+
+    SuppressionScope:
+      type: string
+      enum:
+        - global
+        - channel
+        - purpose_channel
+
+    Evidence:
+      type: object
+      required:
+        - method
+        - artifact_hash
+        - collected_at
+      properties:
+        method:
+          type: string
+          description: Evidence collection mechanism or channel (e.g., ci, web_form, api).
+          maxLength: 64
+          example: ci
+        artifact_hash:
+          type: string
+          description: Cryptographic hash of proof artifact (sha256, sha384, or sha512 prefix).
+          example: sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+        collected_at:
+          type: string
+          format: date-time
+          description: Timestamp when collection evidence was gathered (RFC 3339).
+          example: '2026-08-14T00:00:00Z'
+
+    Consent:
+      type: object
+      required:
+        - id
+        - tenant_id
+        - subject_id
+        - purpose
+        - channel
+        - legal_basis
+        - status
+        - source
+        - version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          description: Unique consent record identifier.
+          example: con_7df32a101b9a
+        tenant_id:
+          type: string
+          description: Tenant identifier.
+          example: tenant-prod
+        subject_id:
+          type: string
+          description: Canonical subject identifier.
+          example: cus-1001
+        purpose:
+          type: string
+          description: Purpose code.
+          example: marketing
+        channel:
+          type: string
+          description: Communication channel code.
+          example: email
+        legal_basis:
+          type: string
+          description: Lawful basis code applied.
+          example: consent
+        status:
+          $ref: '#/components/schemas/ConsentStatus'
+        source:
+          type: string
+          description: Origin system or application where preference was expressed.
+          example: preference_portal
+        scope:
+          type: object
+          additionalProperties:
+            type: string
+          description: Contextual attributes (e.g. region, brand).
+          example:
+            region: emea
+        jurisdiction:
+          type: string
+          description: Legal jurisdiction code.
+          example: NG
+        notice_version:
+          type: string
+          description: Version of privacy notice accepted.
+          example: '2026-08'
+        receipt_id:
+          type: string
+          description: Identifier of issued cryptographic receipt.
+          example: rcp_0894ac38e12d
+        version:
+          type: integer
+          description: Monotonic sequence version.
+          example: 1
+        granted_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-14T10:00:00Z'
+        denied_at:
+          type: string
+          format: date-time
+          nullable: true
+        withdrawn_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2027-08-14T10:00:00Z'
+        confirmation_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T10:00:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T10:00:00Z'
+
+    ConsentListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Consent'
+        total:
+          type: integer
+          description: Total matching records across the tenant and subject.
+          example: 1
+        limit:
+          type: integer
+          description: Bounded pagination limit requested or defaulted.
+          example: 20
+        offset:
+          type: integer
+          description: Pagination offset requested.
+          example: 0
+
+    Suppression:
+      type: object
+      required:
+        - id
+        - tenant_id
+        - subject_id
+        - scope
+        - reason
+        - active
+        - version
+        - updated_at
+      properties:
+        id:
+          type: string
+          description: Suppression rule identifier.
+          example: sup_3a4b5c6d7e8f
+        tenant_id:
+          type: string
+          description: Tenant identifier.
+          example: tenant-prod
+        subject_id:
+          type: string
+          description: Canonical subject identifier.
+          example: cus-1001
+        scope:
+          $ref: '#/components/schemas/SuppressionScope'
+        purpose:
+          type: string
+          description: Purpose code (when scope is purpose_channel).
+          example: marketing
+        channel:
+          type: string
+          description: Channel code (when scope is channel or purpose_channel).
+          example: email
+        reason:
+          type: string
+          description: Business or regulatory reason for suppression.
+          example: customer_unsubscribed
+        active:
+          type: boolean
+          description: Whether suppression is currently in effect.
+          example: true
+        created_by_role:
+          type: string
+          description: Role of the authority that created the suppression.
+          example: privacy_admin
+        version:
+          type: integer
+          description: Monotonic sequence revision.
+          example: 1
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T10:00:00Z'
+
+    SuppressionListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Suppression'
+        total:
+          type: integer
+          description: Total matching suppressions for subject.
+          example: 1
+        limit:
+          type: integer
+          description: Bounded page limit.
+          example: 20
+        offset:
+          type: integer
+          description: Pagination offset.
+          example: 0
+
+    Purpose:
+      type: object
+      required:
+        - tenant_id
+        - code
+        - category
+        - allowed_channels
+        - requires_affirmative_consent
+        - requires_double_opt_in
+        - active
+        - version
+        - updated_at
+      properties:
+        tenant_id:
+          type: string
+          example: tenant-prod
+        code:
+          type: string
+          example: marketing
+        category:
+          type: string
+          example: marketing
+        allowed_channels:
+          type: array
+          items:
+            type: string
+          example: [email, sms]
+        requires_affirmative_consent:
+          type: boolean
+          example: true
+        requires_double_opt_in:
+          type: boolean
+          example: false
+        active:
+          type: boolean
+          example: true
+        version:
+          type: integer
+          example: 1
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T10:00:00Z'
+
+    PurposeListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Purpose'
+        total:
+          type: integer
+          example: 3
+        limit:
+          type: integer
+          example: 20
+        offset:
+          type: integer
+          example: 0
+
+    LawfulBasis:
+      type: object
+      required:
+        - tenant_id
+        - code
+        - allowed_categories
+        - requires_evidence
+        - active
+        - version
+        - updated_at
+      properties:
+        tenant_id:
+          type: string
+          example: tenant-prod
+        code:
+          type: string
+          example: consent
+        allowed_categories:
+          type: array
+          items:
+            type: string
+          example: [marketing, analytics]
+        requires_evidence:
+          type: boolean
+          example: true
+        active:
+          type: boolean
+          example: true
+        version:
+          type: integer
+          example: 1
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T10:00:00Z'
+
+    LawfulBasisListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LawfulBasis'
+        total:
+          type: integer
+          example: 2
+        limit:
+          type: integer
+          example: 20
+        offset:
+          type: integer
+          example: 0
+
+    PrivacyNotice:
+      type: object
+      required:
+        - tenant_id
+        - version
+        - jurisdiction
+        - published_at
+        - active
+      properties:
+        tenant_id:
+          type: string
+          example: tenant-prod
+        version:
+          type: string
+          example: '2026-08'
+        jurisdiction:
+          type: string
+          example: NG
+        published_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T00:00:00Z'
+        active:
+          type: boolean
+          example: true
+        content:
+          type: string
+          example: 'Terms and Privacy Notice 2026-08: Complete consent policy.'
+        content_hash:
+          type: string
+          example: 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'
+        retired:
+          type: boolean
+          example: false
+        superseded_by:
+          type: string
+          example: '2026-09'
+
+    NoticeListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrivacyNotice'
+        total:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 20
+        offset:
+          type: integer
+          example: 0
+
+    ConsentReceipt:
+      type: object
+      required:
+        - id
+        - tenant_id
+        - consent_id
+        - subject_id
+        - purpose
+        - channel
+        - notice_version
+        - jurisdiction
+        - evidence
+        - receipt_hash
+        - issued_at
+      properties:
+        id:
+          type: string
+          example: rcp_0894ac38e12d
+        tenant_id:
+          type: string
+          example: tenant-prod
+        consent_id:
+          type: string
+          example: con_7df32a101b9a
+        subject_id:
+          type: string
+          example: cus-1001
+        purpose:
+          type: string
+          example: marketing
+        channel:
+          type: string
+          example: email
+        notice_version:
+          type: string
+          example: '2026-08'
+        jurisdiction:
+          type: string
+          example: NG
+        evidence:
+          $ref: '#/components/schemas/Evidence'
+        receipt_hash:
+          type: string
+          description: Cryptographic sha256 hash over canonical receipt serialization.
+          example: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+        issued_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T10:00:00Z'
+        hash_version:
+          type: integer
+          example: 3
+        actor_id:
+          type: string
+          example: actor-admin-01
+        consent_status:
+          type: string
+          example: granted
+        legal_basis:
+          type: string
+          example: consent
+        notice_content_hash:
+          type: string
+          example: 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'
+        policy_version:
+          type: integer
+          example: 1
+
+    SuppressionDecision:
+      type: object
+      required:
+        - allowed
+        - reason
+        - evaluated_at
+      properties:
+        allowed:
+          type: boolean
+          description: Whether communication is permitted.
+          example: true
+        reason:
+          type: string
+          description: Reason explaining the decision (e.g., granted, global_suppression, no_consent).
+          example: granted
+        consent_id:
+          type: string
+          nullable: true
+          example: con_7df32a101b9a
+        receipt_id:
+          type: string
+          nullable: true
+          example: rcp_0894ac38e12d
+        evaluated_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T10:00:00Z'
+
+    PurposeRequest:
+      type: object
+      required:
+        - code
+        - category
+        - allowed_channels
+        - requires_affirmative_consent
+        - requires_double_opt_in
+        - active
+      properties:
+        code:
+          type: string
+          example: marketing
+        category:
+          type: string
+          example: marketing
+        allowed_channels:
+          type: array
+          items:
+            type: string
+          example: [email, sms]
+        requires_affirmative_consent:
+          type: boolean
+          example: true
+        requires_double_opt_in:
+          type: boolean
+          example: false
+        active:
+          type: boolean
+          example: true
+
+    LawfulBasisRequest:
+      type: object
+      required:
+        - code
+        - allowed_categories
+        - requires_evidence
+        - active
+      properties:
+        code:
+          type: string
+          example: consent
+        allowed_categories:
+          type: array
+          items:
+            type: string
+          example: [marketing, analytics]
+        requires_evidence:
+          type: boolean
+          example: true
+        active:
+          type: boolean
+          example: true
+
+    NoticeRequest:
+      type: object
+      required:
+        - version
+        - jurisdiction
+        - published_at
+        - active
+      properties:
+        version:
+          type: string
+          example: '2026-08'
+        jurisdiction:
+          type: string
+          example: NG
+        published_at:
+          type: string
+          format: date-time
+          example: '2026-08-14T00:00:00Z'
+        active:
+          type: boolean
+          example: true
+        content:
+          type: string
+          example: 'Terms and Privacy Notice 2026-08: Complete consent policy.'
+        content_hash:
+          type: string
+          example: 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'
+
+    RecordConsentRequest:
+      type: object
+      required:
+        - subject_id
+        - purpose
+        - channel
+        - legal_basis
+        - status
+        - source
+        - jurisdiction
+        - notice_version
+      properties:
+        subject_id:
+          type: string
+          example: cus-1001
+        purpose:
+          type: string
+          example: marketing
+        channel:
+          type: string
+          example: email
+        legal_basis:
+          type: string
+          example: consent
+        status:
+          type: string
+          enum: [granted, denied]
+          example: granted
+        source:
+          type: string
+          example: portal
+        scope:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            region: emea
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2027-08-14T00:00:00Z'
+        jurisdiction:
+          type: string
+          example: NG
+        notice_version:
+          type: string
+          example: '2026-08'
+        evidence:
+          $ref: '#/components/schemas/Evidence'
+
+    SuppressionRequest:
+      type: object
+      required:
+        - subject_id
+        - scope
+        - reason
+        - active
+      properties:
+        subject_id:
+          type: string
+          example: cus-1001
+        scope:
+          $ref: '#/components/schemas/SuppressionScope'
+        purpose:
+          type: string
+          example: marketing
+        channel:
+          type: string
+          example: email
+        reason:
+          type: string
+          example: requested_opt_out
+        active:
+          type: boolean
+          example: true
+
+    EvaluateRequest:
+      type: object
+      required:
+        - subject_id
+        - purpose
+        - channel
+      properties:
+        subject_id:
+          type: string
+          example: cus-1001
+        purpose:
+          type: string
+          example: marketing
+        channel:
+          type: string
+          example: email
+        at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-14T10:00:00Z'
+
+    BatchEvaluateRequest:
+      type: object
+      required:
+        - requests
+      properties:
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/EvaluateRequest'
+
+    BatchEvaluateResponse:
+      type: object
+      required:
+        - decisions
+      properties:
+        decisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SuppressionDecision'
+
+    DoubleOptInRequest:
+      type: object
+      required:
+        - subject_id
+        - purpose
+        - channel
+        - source
+        - jurisdiction
+        - notice_version
+        - expires_at
+      properties:
+        subject_id:
+          type: string
+          example: cus-1001
+        purpose:
+          type: string
+          example: marketing
+        channel:
+          type: string
+          example: email
+        source:
+          type: string
+          example: signup_form
+        jurisdiction:
+          type: string
+          example: NG
+        notice_version:
+          type: string
+          example: '2026-08'
+        evidence:
+          $ref: '#/components/schemas/Evidence'
+        expires_at:
+          type: string
+          format: date-time
+          example: '2026-08-15T10:00:00Z'
+
+    DoubleOptInChallengeResponse:
+      type: object
+      required:
+        - challenge_id
+        - status
+        - consent
+      properties:
+        challenge_id:
+          type: string
+          example: con_7df32a101b9a
+        status:
+          type: string
+          example: pending_confirmation
+        expires_at:
+          type: string
+          format: date-time
+          example: '2026-08-15T10:00:00Z'
+        consent:
+          $ref: '#/components/schemas/Consent'
+
+    ConfirmRequest:
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          type: string
+          description: Secret token issued with the double opt-in challenge.
+          example: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+        - correlation_id
+      properties:
+        error:
+          type: string
+          description: Stable public machine-readable error code.
+          example: invalid_json
+        message:
+          type: string
+          description: Human-readable error description.
+          example: the request body must be a single valid JSON object
+        field:
+          type: string
+          description: The field that triggered validation or policy failure, if applicable.
+          example: subject_id
+        correlation_id:
+          type: string
+          description: Correlation identifier matching the X-Correlation-ID response header.
+          example: 8e9c61e4f4d2243d548325a7a726ea61
+
+  responses:
+    400BadRequest:
+      description: Malformed syntax, unknown field, invalid types, or missing required parameter
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    401Unauthorized:
+      description: Authentication credential missing, malformed, or signature verification failed
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    403Forbidden:
+      description: Principal role not authorized for action or subject outside caller scope
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    404NotFound:
+      description: Requested resource was not found within caller tenant scope
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    409Conflict:
+      description: State conflict, duplicate entity version, or stale challenge generation
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    422UnprocessableEntity:
+      description: Syntactically valid request refused by active policy registries
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    500InternalServerError:
+      description: Unexpected internal server fault; implementation details safely redacted
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    503ServiceUnavailable:
+      description: Transient database outage, statement timeout, or connection contention
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'

@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +27,7 @@ import (
 	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/service"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/store"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -35,7 +39,7 @@ const (
 	// defaultRequestTimeout bounds the work of a single request, including
 	// all database calls, and stays below the server WriteTimeout so the
 	// client receives a typed 503 rather than a dropped connection.
-	defaultRequestTimeout = 10 * time.Second
+	defaultRequestTimeout = 5 * time.Second
 	// maxLoggedCause bounds the operator log line for one failure.
 	maxLoggedCause = 512
 	// statusClientClosedRequest (nginx convention) records requests the client
@@ -75,6 +79,14 @@ type noticeRequest struct {
 	Jurisdiction string    `json:"jurisdiction"`
 	PublishedAt  time.Time `json:"published_at"`
 	Active       *bool     `json:"active"`
+	Content      string    `json:"content,omitempty"`
+	ContentHash  string    `json:"content_hash,omitempty"`
+}
+
+type retireNoticeRequest struct {
+	Jurisdiction string `json:"jurisdiction"`
+	Version      string `json:"version"`
+	SupersededBy string `json:"superseded_by,omitempty"`
 }
 
 type suppressionRequest struct {
@@ -145,44 +157,80 @@ func (in purposeRequest) toDomain() (domain.Purpose, error) {
 	if err := requireBools(
 		boolField{"requires_affirmative_consent", in.RequiresAffirmativeConsent},
 		boolField{"requires_double_opt_in", in.RequiresDoubleOptIn},
-		boolField{"active", in.Active},
 	); err != nil {
 		return domain.Purpose{}, err
 	}
-	return domain.Purpose{Code: in.Code, Category: in.Category, AllowedChannels: in.AllowedChannels, RequiresAffirmativeConsent: *in.RequiresAffirmativeConsent, RequiresDoubleOptIn: *in.RequiresDoubleOptIn, Active: *in.Active}, nil
+	active := true
+	if in.Active != nil {
+		active = *in.Active
+	}
+	return domain.Purpose{
+		Code:                       in.Code,
+		Category:                   in.Category,
+		AllowedChannels:            in.AllowedChannels,
+		RequiresAffirmativeConsent: *in.RequiresAffirmativeConsent,
+		RequiresDoubleOptIn:        *in.RequiresDoubleOptIn,
+		Active:                     active,
+	}, nil
 }
 
 func (in lawfulBasisRequest) toDomain() (domain.LawfulBasis, error) {
-	if err := requireBools(boolField{"requires_evidence", in.RequiresEvidence}, boolField{"active", in.Active}); err != nil {
+	if err := requireBools(boolField{"requires_evidence", in.RequiresEvidence}); err != nil {
 		return domain.LawfulBasis{}, err
 	}
-	return domain.LawfulBasis{Code: in.Code, AllowedCategories: in.AllowedCategories, RequiresEvidence: *in.RequiresEvidence, Active: *in.Active}, nil
+	active := true
+	if in.Active != nil {
+		active = *in.Active
+	}
+	return domain.LawfulBasis{
+		Code:              in.Code,
+		AllowedCategories: in.AllowedCategories,
+		RequiresEvidence:  *in.RequiresEvidence,
+		Active:            active,
+	}, nil
 }
 
 func (in noticeRequest) toDomain() (domain.PrivacyNotice, error) {
-	if err := requireBools(boolField{"active", in.Active}); err != nil {
-		return domain.PrivacyNotice{}, err
+	active := true
+	if in.Active != nil {
+		active = *in.Active
 	}
-	return domain.PrivacyNotice{Version: in.Version, Jurisdiction: in.Jurisdiction, PublishedAt: in.PublishedAt, Active: *in.Active}, nil
+	return domain.PrivacyNotice{
+		Version:      in.Version,
+		Jurisdiction: in.Jurisdiction,
+		PublishedAt:  in.PublishedAt,
+		Active:       active,
+		Content:      in.Content,
+		ContentHash:  in.ContentHash,
+	}, nil
 }
 
 func (in suppressionRequest) toDomain() (domain.Suppression, error) {
-	if err := requireBools(boolField{"active", in.Active}); err != nil {
-		return domain.Suppression{}, err
+	active := true
+	if in.Active != nil {
+		active = *in.Active
 	}
-	return domain.Suppression{SubjectID: in.SubjectID, Scope: in.Scope, Purpose: in.Purpose, Channel: in.Channel, Reason: in.Reason, Active: *in.Active}, nil
+	return domain.Suppression{
+		SubjectID: in.SubjectID,
+		Scope:     in.Scope,
+		Purpose:   in.Purpose,
+		Channel:   in.Channel,
+		Reason:    in.Reason,
+		Active:    active,
+	}, nil
 }
 
 // Stable public error codes produced by the HTTP layer itself.
 var (
-	errInvalidJSON      = domain.ErrValidation.Derive("invalid_json", "the request body must be a single valid JSON object")
-	errTrailingData     = domain.ErrValidation.Derive("trailing_data", "the request body must contain exactly one JSON object and nothing after it")
-	errUnknownField     = domain.ErrValidation.Derive("unknown_field", "the request contains an unrecognized field")
-	errDuplicateField   = domain.ErrValidation.Derive("duplicate_field", "the request repeats a field")
-	errInvalidType      = domain.ErrValidation.Derive("invalid_type", "a field has the wrong JSON type")
-	errRequiredField    = domain.ErrValidation.Derive("required_field", "a required field is missing")
-	errRoleForbidden    = domain.ErrForbidden.Derive("role_not_authorized", "role not authorized")
-	errSubjectForbidden = domain.ErrForbidden.Derive("subject_not_authorized", "subject not authorized")
+	errInvalidJSON          = domain.ErrValidation.Derive("invalid_json", "the request body must be a single valid JSON object")
+	errTrailingData         = domain.ErrValidation.Derive("trailing_data", "the request body must contain exactly one JSON object and nothing after it")
+	errUnknownField         = domain.ErrValidation.Derive("unknown_field", "the request contains an unrecognized field")
+	errDuplicateField       = domain.ErrValidation.Derive("duplicate_field", "the request repeats a field")
+	errInvalidType          = domain.ErrValidation.Derive("invalid_type", "a field has the wrong JSON type")
+	errRequiredField        = domain.ErrValidation.Derive("required_field", "a required field is missing")
+	errRoleForbidden        = domain.ErrForbidden.Derive("role_not_authorized", "role not authorized")
+	errSubjectForbidden     = domain.ErrForbidden.Derive("subject_not_authorized", "subject not authorized")
+	errUnsupportedMediaType = domain.ErrUnsupportedMediaType
 )
 
 type errorBody struct {
@@ -198,6 +246,36 @@ func write(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+type listResponse[T any] struct {
+	Items  []T `json:"items"`
+	Total  int `json:"total"`
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+}
+
+func parsePagination(r *http.Request) (int, int, error) {
+	limit := service.DefaultPaginationLimit
+	offset := 0
+
+	if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+		val, err := strconv.Atoi(rawLimit)
+		if err != nil || val < 1 || val > service.MaxPaginationLimit {
+			return 0, 0, errInvalidType.WithField("limit", fmt.Sprintf("must be an integer between 1 and %d", service.MaxPaginationLimit))
+		}
+		limit = val
+	}
+
+	if rawOffset := strings.TrimSpace(r.URL.Query().Get("offset")); rawOffset != "" {
+		val, err := strconv.Atoi(rawOffset)
+		if err != nil || val < 0 {
+			return 0, 0, errInvalidType.WithField("offset", "must be a non-negative integer")
+		}
+		offset = val
+	}
+
+	return limit, offset, nil
+}
+
 type correlationKey struct{}
 
 func newCorrelationID() string {
@@ -206,6 +284,19 @@ func newCorrelationID() string {
 		return fmt.Sprintf("t%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+func sanitizeCorrelationID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 128 {
+		return newCorrelationID()
+	}
+	for _, ch := range raw {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.') {
+			return newCorrelationID()
+		}
+	}
+	return raw
 }
 
 func correlationID(ctx context.Context) string {
@@ -222,7 +313,7 @@ func httpStatus(kind domain.ErrorKind) int {
 		return http.StatusUnprocessableEntity
 	case domain.KindUnauthenticated:
 		return http.StatusUnauthorized
-	case domain.KindForbidden:
+	case domain.KindForbidden, domain.KindAuthorization:
 		return http.StatusForbidden
 	case domain.KindNotFound:
 		return http.StatusNotFound
@@ -236,24 +327,40 @@ func httpStatus(kind domain.ErrorKind) int {
 		return http.StatusServiceUnavailable
 	case domain.KindCanceled:
 		return statusClientClosedRequest
+	case domain.KindUnsupportedMediaType:
+		return http.StatusUnsupportedMediaType
 	default:
 		return http.StatusInternalServerError
 	}
 }
 
+var (
+	bearerTokenPattern       = regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9_\-\.]+`)
+	confirmationTokenPattern = regexp.MustCompile(`(?i)(token["':\s=]+)[A-Za-z0-9_\-\.]{8,}`)
+	dsnPasswordPattern       = regexp.MustCompile(`(?i)(postgres(?:ql)?:\/\/[^:]+:)[^@]+(@)`)
+)
+
+func redactSecrets(s string) string {
+	s = bearerTokenPattern.ReplaceAllString(s, "${1}[REDACTED]")
+	s = confirmationTokenPattern.ReplaceAllString(s, "${1}[REDACTED]")
+	s = dsnPasswordPattern.ReplaceAllString(s, "${1}[REDACTED]${2}")
+	return s
+}
+
 // sanitizeCause renders an internal error for the operator log: control
-// characters are replaced and the text is bounded. It is never sent to the
-// client.
+// characters are replaced, secrets are redacted, and the text is bounded.
+// It is never sent to the client.
 func sanitizeCause(err error) string {
 	if err == nil {
 		return ""
 	}
+	cleaned := redactSecrets(err.Error())
 	cause := strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return ' '
 		}
 		return r
-	}, err.Error())
+	}, cleaned)
 	if len(cause) > maxLoggedCause {
 		cut := maxLoggedCause
 		for cut > 0 && !utf8.RuneStart(cause[cut]) {
@@ -279,6 +386,9 @@ func (a api) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	status := httpStatus(kind)
 	cid := correlationID(r.Context())
+	if cid == "" {
+		cid = sanitizeCorrelationID(r.Header.Get(correlationHeader))
+	}
 	cause := sanitizeCause(err)
 	if status >= 500 && status != statusClientClosedRequest {
 		a.log.ErrorContext(r.Context(), "request_failed",
@@ -305,13 +415,52 @@ func (a api) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		w.Header().Set("Retry-After", "1")
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	write(w, status, errorBody{Error: public.Code(), Message: public.Message(), Field: public.Field(), CorrelationID: cid})
+	w.Header().Set(correlationHeader, cid)
+
+	message := public.Message()
+	field := public.Field()
+	if status >= 500 {
+		field = "" // Never leak field or internal details on 5xx
+		if status == http.StatusInternalServerError {
+			message = "an internal error occurred"
+		} else if status == http.StatusServiceUnavailable {
+			if public.Code() == "contention" {
+				message = "the request conflicted with concurrent updates; retry later"
+			} else {
+				message = "the service is temporarily unavailable; retry later"
+			}
+		}
+	}
+	write(w, status, errorBody{Error: public.Code(), Message: message, Field: field, CorrelationID: cid})
 }
 
 func (a api) writeMethodNotAllowed(w http.ResponseWriter, r *http.Request, allowed string) {
 	cid := correlationID(r.Context())
+	if cid == "" {
+		cid = sanitizeCorrelationID(r.Header.Get(correlationHeader))
+	}
+	w.Header().Set(correlationHeader, cid)
 	w.Header().Set("Allow", allowed)
 	write(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed", Message: "method not allowed", CorrelationID: cid})
+}
+
+func isMutationPath(path string) bool {
+	switch {
+	case strings.HasPrefix(path, "/v1/purposes"):
+		return true
+	case strings.HasPrefix(path, "/v1/lawful-bases"):
+		return true
+	case strings.HasPrefix(path, "/v1/notices"):
+		return true
+	case strings.HasPrefix(path, "/v1/consents"):
+		return true
+	case strings.HasPrefix(path, "/v1/suppressions"):
+		return true
+	case strings.HasPrefix(path, "/v1/double-opt-in"):
+		return true
+	default:
+		return false
+	}
 }
 
 // decodeRequest reads exactly one JSON object into dst (T-027). It rejects:
@@ -319,7 +468,20 @@ func (a api) writeMethodNotAllowed(w http.ResponseWriter, r *http.Request, allow
 // including a top-level null; duplicate member names, including the
 // case-variant duplicates encoding/json would silently merge; unknown fields;
 // wrong JSON types; excessive nesting; and any data after the first object.
+// It strictly enforces Content-Type: application/json on all mutation endpoints.
 func decodeRequest(w http.ResponseWriter, r *http.Request, dst any) error {
+	ct := r.Header.Get("Content-Type")
+	if isMutationPath(r.URL.Path) {
+		mediaType, _, err := mime.ParseMediaType(ct)
+		if err != nil || mediaType != "application/json" {
+			return errUnsupportedMediaType
+		}
+	} else if ct != "" {
+		mediaType, _, err := mime.ParseMediaType(ct)
+		if err != nil || mediaType != "application/json" {
+			return errUnsupportedMediaType
+		}
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
@@ -503,6 +665,11 @@ func (a api) principal(w http.ResponseWriter, r *http.Request, roles ...string) 
 		a.writeError(w, r, domain.ErrUnauthenticated.Wrap(err))
 		return auth.Principal{}, false
 	}
+	// T-030: Explicitly reject the developer role in production environments.
+	if auth.HasAnyRole(principal, auth.RoleDeveloper) && !auth.DevHeadersAllowed() {
+		a.writeError(w, r, errRoleForbidden)
+		return auth.Principal{}, false
+	}
 	if len(roles) > 0 && !auth.HasAnyRole(principal, roles...) {
 		a.writeError(w, r, errRoleForbidden)
 		return auth.Principal{}, false
@@ -558,9 +725,40 @@ func subjectAuthorized(p auth.Principal, act action, subjectID string) bool {
 }
 
 func (a api) purposes(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMethod(w, r, http.MethodPost) {
+	switch r.Method {
+	case http.MethodGet:
+		a.listPurposes(w, r)
+	case http.MethodPost:
+		a.createPurpose(w, r)
+	default:
+		a.writeMethodNotAllowed(w, r, "GET, POST")
+	}
+}
+
+func (a api) listPurposes(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.principal(w, r, readerRoles...)
+	if !ok {
 		return
 	}
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	items, total, err := a.svc.ListPurposes(r.Context(), p.TenantID, limit, offset)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	write(w, http.StatusOK, listResponse[domain.Purpose]{
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
+}
+
+func (a api) createPurpose(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.principal(w, r, adminRoles...)
 	if !ok {
 		return
@@ -583,9 +781,40 @@ func (a api) purposes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a api) lawfulBases(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMethod(w, r, http.MethodPost) {
+	switch r.Method {
+	case http.MethodGet:
+		a.listLawfulBases(w, r)
+	case http.MethodPost:
+		a.createLawfulBasis(w, r)
+	default:
+		a.writeMethodNotAllowed(w, r, "GET, POST")
+	}
+}
+
+func (a api) listLawfulBases(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.principal(w, r, readerRoles...)
+	if !ok {
 		return
 	}
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	items, total, err := a.svc.ListLawfulBases(r.Context(), p.TenantID, limit, offset)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	write(w, http.StatusOK, listResponse[domain.LawfulBasis]{
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
+}
+
+func (a api) createLawfulBasis(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.principal(w, r, adminRoles...)
 	if !ok {
 		return
@@ -608,9 +837,40 @@ func (a api) lawfulBases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a api) notices(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMethod(w, r, http.MethodPost) {
+	switch r.Method {
+	case http.MethodGet:
+		a.listNotices(w, r)
+	case http.MethodPost:
+		a.createNotice(w, r)
+	default:
+		a.writeMethodNotAllowed(w, r, "GET, POST")
+	}
+}
+
+func (a api) listNotices(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.principal(w, r, readerRoles...)
+	if !ok {
 		return
 	}
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	items, total, err := a.svc.ListNotices(r.Context(), p.TenantID, limit, offset)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	write(w, http.StatusOK, listResponse[domain.PrivacyNotice]{
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
+}
+
+func (a api) createNotice(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.principal(w, r, adminRoles...)
 	if !ok {
 		return
@@ -632,10 +892,70 @@ func (a api) notices(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusCreated, output)
 }
 
-func (a api) consents(w http.ResponseWriter, r *http.Request) {
+func (a api) retireNotice(w http.ResponseWriter, r *http.Request) {
 	if !a.requireMethod(w, r, http.MethodPost) {
 		return
 	}
+	p, ok := a.principal(w, r, adminRoles...)
+	if !ok {
+		return
+	}
+	var input retireNoticeRequest
+	if !a.decode(w, r, &input) {
+		return
+	}
+	output, err := a.svc.RetireNotice(r.Context(), p.TenantID, p.ActorID, input.Jurisdiction, input.Version, input.SupersededBy)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	write(w, http.StatusOK, output)
+}
+
+func (a api) consents(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.listConsents(w, r)
+	case http.MethodPost:
+		a.createConsent(w, r)
+	default:
+		a.writeMethodNotAllowed(w, r, "GET, POST")
+	}
+}
+
+func (a api) listConsents(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.principal(w, r, readerRoles...)
+	if !ok {
+		return
+	}
+	subjectID := strings.TrimSpace(r.URL.Query().Get("subject_id"))
+	if subjectID == "" {
+		a.writeError(w, r, errRequiredField.WithField("subject_id", "is required"))
+		return
+	}
+	if !subjectAuthorized(p, actionRead, subjectID) {
+		a.writeError(w, r, errSubjectForbidden)
+		return
+	}
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	items, total, err := a.svc.ListConsents(r.Context(), p.TenantID, subjectID, limit, offset)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	write(w, http.StatusOK, listResponse[domain.Consent]{
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
+}
+
+func (a api) createConsent(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.principal(w, r, writerRoles...)
 	if !ok {
 		return
@@ -695,9 +1015,49 @@ func (a api) consent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a api) suppressions(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMethod(w, r, http.MethodPost) {
+	switch r.Method {
+	case http.MethodGet:
+		a.listSuppressions(w, r)
+	case http.MethodPost:
+		a.createSuppression(w, r)
+	default:
+		a.writeMethodNotAllowed(w, r, "GET, POST")
+	}
+}
+
+func (a api) listSuppressions(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.principal(w, r, readerRoles...)
+	if !ok {
 		return
 	}
+	subjectID := strings.TrimSpace(r.URL.Query().Get("subject_id"))
+	if subjectID == "" {
+		a.writeError(w, r, errRequiredField.WithField("subject_id", "is required"))
+		return
+	}
+	if !subjectAuthorized(p, actionRead, subjectID) {
+		a.writeError(w, r, errSubjectForbidden)
+		return
+	}
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	items, total, err := a.svc.ListSuppressions(r.Context(), p.TenantID, subjectID, limit, offset)
+	if err != nil {
+		a.writeError(w, r, err)
+		return
+	}
+	write(w, http.StatusOK, listResponse[domain.Suppression]{
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
+}
+
+func (a api) createSuppression(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.principal(w, r, writerRoles...)
 	if !ok {
 		return
@@ -715,7 +1075,7 @@ func (a api) suppressions(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, r, err)
 		return
 	}
-	output, err := a.svc.SetSuppression(r.Context(), p.TenantID, p.ActorID, suppression)
+	output, err := a.svc.SetSuppression(r.Context(), p.TenantID, p.ActorID, suppression, p.Roles...)
 	if err != nil {
 		a.writeError(w, r, err)
 		return
@@ -798,11 +1158,7 @@ func (a api) startDoubleOptIn(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, r, err)
 		return
 	}
-	write(w, http.StatusCreated, map[string]any{
-		"challenge_id": output.Consent.ID,
-		"status":       output.Consent.Status,
-		"consent":      output.Consent,
-	})
+	write(w, http.StatusCreated, output.ToResponse())
 }
 
 func (a api) confirmDoubleOptIn(w http.ResponseWriter, r *http.Request) {
@@ -858,7 +1214,19 @@ func ValidateAuthConfig() error {
 	return auth.ValidateConfig()
 }
 
+func (a api) healthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeMethodNotAllowed(w, r, http.MethodGet)
+		return
+	}
+	write(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (a api) ready(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.writeMethodNotAllowed(w, r, http.MethodGet)
+		return
+	}
 	if err := a.svc.Ready(r.Context()); err != nil {
 		a.log.WarnContext(r.Context(), "readiness_failed",
 			slog.String("correlation_id", correlationID(r.Context())),
@@ -879,21 +1247,37 @@ func (a api) ready(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
+// timeoutHeaderWriter ensures that when http.TimeoutHandler writes 503 Service Unavailable,
+// proper JSON content-type and Retry-After headers are included.
+type timeoutHeaderWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *timeoutHeaderWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		if code == http.StatusServiceUnavailable {
+			if w.Header().Get("Content-Type") == "" {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			}
+			if w.Header().Get("Retry-After") == "" {
+				w.Header().Set("Retry-After", "1")
+			}
+		}
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
 // withRequestContext assigns a server-generated correlation ID (returned in
-// X-Correlation-ID and in every error body), bounds the request with timeout
-// and converts handler panics into a correlated 500. The request context is
-// derived from the client connection, so a disconnect cancels database work
-// (T-012).
-func (a api) withRequestContext(next http.Handler, timeout time.Duration) http.Handler {
+// X-Correlation-ID and in every error body) and converts handler panics into a
+// correlated 500. The request context is derived from the client connection, so
+// a disconnect cancels database work (T-012).
+func (a api) withRequestContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cid := newCorrelationID()
+		cid := sanitizeCorrelationID(r.Header.Get(correlationHeader))
 		w.Header().Set(correlationHeader, cid)
 		ctx := context.WithValue(r.Context(), correlationKey{}, cid)
-		if timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, timeout)
-			defer cancel()
-		}
 		r = r.WithContext(ctx)
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -926,13 +1310,12 @@ func newHandler(svc *service.Service, timeout time.Duration, logger *slog.Logger
 	}
 	a := api{svc: svc, log: logger}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		write(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	mux.HandleFunc("/healthz", a.healthz)
 	mux.HandleFunc("/readyz", a.ready)
 	mux.HandleFunc("/v1/purposes", a.purposes)
 	mux.HandleFunc("/v1/lawful-bases", a.lawfulBases)
 	mux.HandleFunc("/v1/notices", a.notices)
+	mux.HandleFunc("/v1/notices/retire", a.retireNotice)
 	mux.HandleFunc("/v1/consents", a.consents)
 	mux.HandleFunc("/v1/consents/", a.consent)
 	mux.HandleFunc("/v1/suppressions", a.suppressions)
@@ -941,7 +1324,20 @@ func newHandler(svc *service.Service, timeout time.Duration, logger *slog.Logger
 	mux.HandleFunc("/v1/double-opt-in", a.startDoubleOptIn)
 	mux.HandleFunc("/v1/double-opt-in/confirm", a.confirmDoubleOptIn)
 	mux.HandleFunc("/v1/receipts/", a.receipt)
-	return a.withRequestContext(mux, timeout)
+
+	var h http.Handler = mux
+	if timeout > 0 {
+		timeoutJSON := `{"error":"unavailable","message":"the request could not be completed within the allocated deadline"}`
+		th := http.TimeoutHandler(mux, timeout, timeoutJSON)
+		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Context().Err() != nil {
+				mux.ServeHTTP(w, r)
+				return
+			}
+			th.ServeHTTP(&timeoutHeaderWriter{ResponseWriter: w}, r)
+		})
+	}
+	return a.withRequestContext(h)
 }
 
 // requestTimeout reads REQUEST_TIMEOUT (a Go duration). Invalid or
@@ -961,10 +1357,55 @@ func requestTimeout(logger *slog.Logger) time.Duration {
 	return value
 }
 
+// validateStorageConfig validates storage-related configuration. It strictly
+// prohibits the use of non-durable in-memory storage in production configurations
+// (e.g. when ALLOW_DEV_HEADERS is not true, or when ENVIRONMENT/APP_ENV/NVUTO_ENV is production).
+func validateStorageConfig() error {
+	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	allowMemory := strings.EqualFold(os.Getenv("ALLOW_MEMORY_STORE"), "true")
+	allowDev := strings.EqualFold(os.Getenv("ALLOW_DEV_HEADERS"), "true")
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("ENVIRONMENT")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+	}
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("NVUTO_ENV")))
+	}
+	isProduction := env == "production" || env == "prod"
+
+	if databaseURL != "" {
+		if _, err := pgxpool.ParseConfig(databaseURL); err != nil {
+			return fmt.Errorf("malformed DATABASE_URL: %w", err)
+		}
+		if allowMemory && (isProduction || !allowDev) {
+			return errors.New("ALLOW_MEMORY_STORE=true is prohibited in production configuration")
+		}
+		return nil
+	}
+
+	if !allowMemory {
+		return errors.New("DATABASE_URL is required unless ALLOW_MEMORY_STORE=true")
+	}
+
+	if isProduction || !allowDev {
+		return errors.New("ALLOW_MEMORY_STORE=true is prohibited in production configuration (requires ALLOW_DEV_HEADERS=true)")
+	}
+
+	return nil
+}
+
 func main() {
 	logger := newJSONLogger()
 	if err := auth.ValidateConfig(); err != nil {
 		logger.Error("auth_configuration_invalid", slog.String("cause", sanitizeCause(err)))
+		os.Exit(1)
+	}
+	if err := validateStorageConfig(); err != nil {
+		if err.Error() == "DATABASE_URL is required unless ALLOW_MEMORY_STORE=true" {
+			logger.Error("database_url_required", slog.String("message", err.Error()))
+		} else {
+			logger.Error("storage_configuration_invalid", slog.String("cause", sanitizeCause(err)))
+		}
 		os.Exit(1)
 	}
 
@@ -982,10 +1423,6 @@ func main() {
 		closeStore = postgres.Close
 		logger.Info("using_postgresql_storage")
 	} else {
-		if !strings.EqualFold(os.Getenv("ALLOW_MEMORY_STORE"), "true") {
-			logger.Error("database_url_required", slog.String("message", "DATABASE_URL is required unless ALLOW_MEMORY_STORE=true"))
-			os.Exit(1)
-		}
 		repo = store.NewMemory()
 		logger.Warn("using_non_durable_memory_storage")
 	}

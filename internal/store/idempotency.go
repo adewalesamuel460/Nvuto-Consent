@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
@@ -16,24 +15,6 @@ type GovernedIdempotencyRepository interface {
 	FindIdempotencySnapshot(ctx context.Context, tenantID, idempotencyKey string) (domain.Consent, string, bool, error)
 }
 
-type idempotencyKey struct {
-	tenantID       string
-	idempotencyKey string
-}
-
-type memoryIdempotencyEntry struct {
-	RequestHash      string
-	ConsentID        string
-	ResponseSnapshot domain.Consent
-}
-
-var memoryIdempotency sync.Map // map[*Memory]map[idempotencyKey]memoryIdempotencyEntry; guarded by Memory.mu
-
-func memoryLedger(m *Memory) map[idempotencyKey]memoryIdempotencyEntry {
-	ledger, _ := memoryIdempotency.LoadOrStore(m, map[idempotencyKey]memoryIdempotencyEntry{})
-	return ledger.(map[idempotencyKey]memoryIdempotencyEntry)
-}
-
 func (m *Memory) FindIdempotencySnapshot(ctx context.Context, tenantID, idempKey string) (domain.Consent, string, bool, error) {
 	if err := live(ctx); err != nil {
 		return domain.Consent{}, "", false, err
@@ -41,13 +22,12 @@ func (m *Memory) FindIdempotencySnapshot(ctx context.Context, tenantID, idempKey
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	ledger := memoryLedger(m)
 	lKey := idempotencyKey{tenantID: tenantID, idempotencyKey: idempKey}
-	entry, ok := ledger[lKey]
+	entry, ok := m.idempotencyLedger[lKey]
 	if !ok {
 		return domain.Consent{}, "", false, nil
 	}
-	return entry.ResponseSnapshot, entry.RequestHash, true, nil
+	return cloneConsent(entry.ResponseSnapshot), entry.RequestHash, true, nil
 }
 
 func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempKey, requestHash string, consent domain.Consent, receipt domain.ConsentReceipt, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error) {
@@ -57,13 +37,12 @@ func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempKey, request
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ledger := memoryLedger(m)
 	lKey := idempotencyKey{tenantID: consent.TenantID, idempotencyKey: idempKey}
-	if existing, ok := ledger[lKey]; ok {
+	if existing, ok := m.idempotencyLedger[lKey]; ok {
 		if existing.RequestHash != requestHash {
 			return domain.Consent{}, ErrConflict
 		}
-		return existing.ResponseSnapshot, nil
+		return cloneConsent(existing.ResponseSnapshot), nil
 	}
 	cKey := consentKey{tenantID: consent.TenantID, consentID: consent.ID}
 	if _, exists := m.consents[cKey]; exists {
@@ -79,15 +58,16 @@ func (m *Memory) RecordGovernedIdempotent(ctx context.Context, idempKey, request
 	if receipt.ID != "" {
 		m.receipts[receiptKey{tenantID: receipt.TenantID, receiptID: receipt.ID}] = receipt
 	}
-	m.consents[cKey] = consent
-	m.audit = append(m.audit, audit)
-	m.outbox = append(m.outbox, outbox)
-	ledger[lKey] = memoryIdempotencyEntry{
+	clonedConsent := cloneConsent(consent)
+	m.consents[cKey] = clonedConsent
+	m.audit = append(m.audit, cloneAuditEvent(audit))
+	m.outbox = append(m.outbox, cloneOutboxEvent(outbox))
+	m.idempotencyLedger[lKey] = memoryIdempotencyEntry{
 		RequestHash:      requestHash,
 		ConsentID:        consent.ID,
-		ResponseSnapshot: consent,
+		ResponseSnapshot: clonedConsent,
 	}
-	return consent, nil
+	return cloneConsent(consent), nil
 }
 
 func (p *Postgres) FindIdempotencySnapshot(ctx context.Context, tenantID, idempKey string) (domain.Consent, string, bool, error) {

@@ -96,10 +96,11 @@ func (s *Service) RecordGovernedIdempotent(ctx context.Context, idempotencyKey, 
 		return snapshot, nil
 	}
 
-	if err := s.admitGoverned(ctx, in, checkedAt); err != nil {
+	purpose, notice, err := s.admitGoverned(ctx, in, checkedAt)
+	if err != nil {
 		return domain.Consent{}, err
 	}
-	consent, receipt, audit, outbox, err := governedRecords(in, normalizeReceiptTime(time.Now()))
+	consent, receipt, audit, outbox, err := governedRecords(in, normalizeReceiptTime(time.Now()), purpose, notice)
 	if err != nil {
 		return domain.Consent{}, err
 	}

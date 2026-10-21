@@ -99,40 +99,59 @@ The outbox worker logs critical batch and lifecycle events in structured JSON:
 
 ## Release Packaging & Deployment (T-018)
 
+Nvuto-Consent provides declarative **Kustomize** deployment overlays with **immutable container image digests** (`@sha256:...`) pushed to GitHub Container Registry (GHCR).
+
+Detailed deployment, rollback, and platform dependency operations are documented in the [Deployment and Rollback Runbook](docs/operations/03_deployment_and_rollback.md).
+
+### Kustomize Directory Layout
+
+```
+deploy/
+├── base/                              # Shared base manifests
+│   ├── kustomization.yaml
+│   ├── namespace.yaml
+│   ├── api.yaml                       # API Deployment, Service, PDB, HPA
+│   └── worker.yaml                    # Worker Deployment, PDB
+└── overlays/                          # Environment-specific overlays
+    ├── staging/
+    │   ├── kustomization.yaml
+    │   ├── config.env                 # Non-sensitive runtime configuration
+    │   ├── secrets.env.example        # Secret template (DATABASE_URL, JWT secret)
+    │   ├── nats.creds.example         # NATS user credentials template
+    │   └── patches/replicas.yaml      # Staging scaling limits (API: 2, Worker: 1)
+    └── production/
+        ├── kustomization.yaml
+        ├── config.env                 # Production runtime configuration
+        ├── secrets.env.example
+        ├── nats.creds.example
+        └── patches/replicas.yaml      # Production scaling limits (API: 3, Worker: 2)
+```
+
 ### Immutable Image Digests (Mandatory for Production)
 
 Production deployments **must** specify immutable image digests (SHA-256) rather than mutable `:latest` or floating release tags. 
 
 Using mutable tags in production introduces deployment drift, indeterminate rollback states, inconsistent image versions across horizontally autoscaled nodes, and container supply-chain vulnerabilities.
 
-#### Manifest Reference (`deploy/k8s.yaml` & `deploy/outbox-worker.yaml`)
+#### Pinned Overlays & Automated CI Promotion
 
-Specify container images using the `@sha256:` digest pin:
+During CI release builds, `kustomize edit set image` updates the target overlay with the immutable SHA256 digest:
 
-```yaml
-# API Container (deploy/k8s.yaml)
-containers:
-  - name: api
-    image: ghcr.io/atlasfsp/nvuto-consent@sha256:baae473c914d7cfec25e5cfad7e1e6951feef869151523ea397a6598c1ea993f
-    ...
-
-# Worker Container (deploy/outbox-worker.yaml)
-containers:
-  - name: worker
-    image: ghcr.io/atlasfsp/nvuto-consent@sha256:ca50785f29910d634cb9e4a3b81177699479e19d7d2238cfae4f8d5789d6e80b
-    ...
+```bash
+cd deploy/overlays/staging
+kustomize edit set image consent-api=ghcr.io/atlasfsp/nvuto-consent-api@sha256:${API_DIGEST}
+kustomize edit set image consent-worker=ghcr.io/atlasfsp/nvuto-consent-worker@sha256:${WORKER_DIGEST}
 ```
 
-#### Generating Release Digests
-When promoting a container image from CI build to staging or production:
-```bash
-# 1. Build and push image
-docker build -t ghcr.io/atlasfsp/nvuto-consent:${RELEASE_TAG} -f Dockerfile .
-docker push ghcr.io/atlasfsp/nvuto-consent:${RELEASE_TAG}
+#### Validating Manifests Locally
 
-# 2. Extract immutable digest
-DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/atlasfsp/nvuto-consent:${RELEASE_TAG})
-echo "Pinned release image: ${DIGEST}"
+```bash
+# 1. Provide environment credentials from templates (fail-closed if missing)
+cp deploy/overlays/staging/secrets.env.example deploy/overlays/staging/secrets.env
+cp deploy/overlays/staging/nats.creds.example deploy/overlays/staging/nats.creds
+
+# 2. Render and inspect validated manifests
+kustomize build deploy/overlays/staging
 ```
 
 ## Database Migrations

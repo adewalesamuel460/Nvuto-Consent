@@ -25,11 +25,28 @@ const (
 	maxIdempotencyKey  = 200
 	maxBatchRequests   = 100
 
+	// DefaultPaginationLimit is the default page size when limit is unspecified.
+	DefaultPaginationLimit = 20
+	// MaxPaginationLimit bounds the maximum entries per page to prevent unbounded queries.
+	MaxPaginationLimit = 100
+
 	// MaxConsentLifetime bounds expires_at on a recorded consent.
 	MaxConsentLifetime = 10 * 365 * 24 * time.Hour
 	// MaxConfirmationLifetime bounds expires_at on a double opt-in challenge.
 	MaxConfirmationLifetime = 30 * 24 * time.Hour
 )
+
+func sanitizePagination(limit, offset int) (int, int) {
+	if limit <= 0 {
+		limit = DefaultPaginationLimit
+	} else if limit > MaxPaginationLimit {
+		limit = MaxPaginationLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
 
 var (
 	codePattern         = regexp.MustCompile(`^[a-z0-9][a-z0-9_.:-]{0,63}$`)
@@ -236,7 +253,18 @@ func normalizeGoverned(tenantID, actorID, subjectID, purposeCode, channel, legal
 		func() error { return checkConsentExpiry(in.ExpiresAt, now) },
 		func() error { return checkJurisdiction("jurisdiction", in.Jurisdiction) },
 		func() error { return checkNoticeVersion("notice_version", in.NoticeVersion) },
-		func() error { return checkEvidenceFormat(in.Evidence, now) },
+		func() error {
+			if in.Status == domain.StatusDenied {
+				if !utf8.ValidString(in.Evidence.Method) {
+					return invalid("evidence.method", "must be valid UTF-8")
+				}
+				if !utf8.ValidString(in.Evidence.ArtifactHash) {
+					return invalid("evidence.artifact_hash", "must be valid UTF-8")
+				}
+				return nil
+			}
+			return checkEvidenceFormat(in.Evidence, now)
+		},
 	}
 	for _, check := range checks {
 		if err := check(); err != nil {

@@ -1,0 +1,10 @@
+-----BEGIN NATS USER JWT-----
+eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.example_production_jwt_payload
+------END NATS USER JWT------
+
+************************* IMPORTANT *************************
+NKEY Seed - Certificate for NATS user authentication
+*************************************************************
+-----BEGIN USER NKEY SEED-----
+SUAEXAMPLEPRODUCTIONSEEDKEYDONOTUSEINANYOTHERENV1234567890ABCDEF
+------END USER NKEY SEED------

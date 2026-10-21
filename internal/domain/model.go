@@ -51,6 +51,23 @@ type SuppressionDecision struct {
 	EvaluatedAt time.Time `json:"evaluated_at"`
 }
 
+// Evaluation decision reason codes (T-007).
+const (
+	DecisionReasonGranted                    = "granted"
+	DecisionReasonNoConsent                  = "no_consent"
+	DecisionReasonExpired                    = "expired"
+	DecisionReasonNotYetGranted              = "not_yet_granted"
+	DecisionReasonPolicyUnavailable          = "policy_unavailable"
+	DecisionReasonPolicyRequirementUnmet     = "policy_requirement_unmet"
+	DecisionReasonPurposeInactive            = "purpose_inactive"
+	DecisionReasonChannelNotAllowed          = "channel_not_allowed"
+	DecisionReasonAffirmativeConsentRequired = "affirmative_consent_required"
+	DecisionReasonDoubleOptInRequired        = "double_opt_in_required"
+	DecisionReasonEvidenceRequired           = "evidence_required"
+	DecisionReasonLawfulBasisInactive        = "lawful_basis_inactive"
+	DecisionReasonNoticeInactive             = "notice_inactive"
+)
+
 type Purpose struct {
 	TenantID                   string    `json:"tenant_id"`
 	Code                       string    `json:"code"`
@@ -79,6 +96,10 @@ type PrivacyNotice struct {
 	Jurisdiction string    `json:"jurisdiction"`
 	PublishedAt  time.Time `json:"published_at"`
 	Active       bool      `json:"active"`
+	Content      string    `json:"content,omitempty"`
+	ContentHash  string    `json:"content_hash,omitempty"`
+	Retired      bool      `json:"retired,omitempty"`
+	SupersededBy string    `json:"superseded_by,omitempty"`
 }
 
 // Evidence is the collection proof attached to a consent decision. Input
@@ -103,19 +124,25 @@ func (e Evidence) IsZero() bool {
 }
 
 type ConsentReceipt struct {
-	ID            string    `json:"id"`
-	TenantID      string    `json:"tenant_id"`
-	ConsentID     string    `json:"consent_id"`
-	SubjectID     string    `json:"subject_id"`
-	Purpose       string    `json:"purpose"`
-	Channel       string    `json:"channel"`
-	NoticeVersion string    `json:"notice_version"`
-	Jurisdiction  string    `json:"jurisdiction"`
-	Evidence      Evidence  `json:"evidence"`
-	ReceiptHash   string    `json:"receipt_hash"`
-	IssuedAt      time.Time `json:"issued_at"`
+	ID                string    `json:"id"`
+	TenantID          string    `json:"tenant_id"`
+	ConsentID         string    `json:"consent_id"`
+	SubjectID         string    `json:"subject_id"`
+	ActorID           string    `json:"actor_id,omitempty"`
+	Purpose           string    `json:"purpose"`
+	Channel           string    `json:"channel"`
+	ConsentStatus     Status    `json:"consent_status,omitempty"`
+	LegalBasis        string    `json:"legal_basis,omitempty"`
+	NoticeVersion     string    `json:"notice_version"`
+	NoticeContentHash string    `json:"notice_content_hash,omitempty"`
+	PolicyVersion     int64     `json:"policy_version,omitempty"`
+	Jurisdiction      string    `json:"jurisdiction"`
+	Evidence          Evidence  `json:"evidence"`
+	ReceiptHash       string    `json:"receipt_hash"`
+	IssuedAt          time.Time `json:"issued_at"`
 	// HashVersion identifies the canonical serialization ReceiptHash was
-	// computed over. 0 or 1 is the legacy format; 2 is the canonical v2 format.
+	// computed over. 0 or 1 is the legacy format; 2 is the canonical v2 format;
+	// 3 is the canonical v3 format with full decision metadata and notice content hash.
 	HashVersion int `json:"hash_version,omitempty"`
 }
 
@@ -128,16 +155,17 @@ const (
 )
 
 type Suppression struct {
-	ID        string           `json:"id"`
-	TenantID  string           `json:"tenant_id"`
-	SubjectID string           `json:"subject_id"`
-	Scope     SuppressionScope `json:"scope"`
-	Purpose   string           `json:"purpose,omitempty"`
-	Channel   string           `json:"channel,omitempty"`
-	Reason    string           `json:"reason"`
-	Active    bool             `json:"active"`
-	Version   int64            `json:"version"`
-	UpdatedAt time.Time        `json:"updated_at"`
+	ID            string           `json:"id"`
+	TenantID      string           `json:"tenant_id"`
+	SubjectID     string           `json:"subject_id"`
+	Scope         SuppressionScope `json:"scope"`
+	Purpose       string           `json:"purpose,omitempty"`
+	Channel       string           `json:"channel,omitempty"`
+	Reason        string           `json:"reason"`
+	Active        bool             `json:"active"`
+	CreatedByRole string           `json:"created_by_role,omitempty"`
+	Version       int64            `json:"version"`
+	UpdatedAt     time.Time        `json:"updated_at"`
 }
 
 type EvaluationRequest struct {
@@ -150,6 +178,27 @@ type EvaluationRequest struct {
 type DoubleOptInChallenge struct {
 	Consent           Consent `json:"consent"`
 	ConfirmationToken string  `json:"-"`
+}
+
+// DoubleOptInResponse is the opaque API response returned when a
+// double opt-in challenge is initiated (T-003). It strictly omits the
+// confirmation token so callers cannot echo it immediately to bypass verification.
+type DoubleOptInResponse struct {
+	ChallengeID string     `json:"challenge_id"`
+	Status      Status     `json:"status"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	Consent     Consent    `json:"consent"`
+}
+
+// ToResponse converts the internal challenge representation to the opaque
+// public API response DTO.
+func (c DoubleOptInChallenge) ToResponse() DoubleOptInResponse {
+	return DoubleOptInResponse{
+		ChallengeID: c.Consent.ID,
+		Status:      c.Consent.Status,
+		ExpiresAt:   c.Consent.ConfirmationExpiresAt,
+		Consent:     c.Consent,
+	}
 }
 
 type AuditEvent struct {
@@ -175,4 +224,54 @@ type OutboxEvent struct {
 	Payload       map[string]any `json:"payload"`
 	OccurredAt    time.Time      `json:"occurred_at"`
 	ClaimToken    string         `json:"claim_token,omitempty"`
+}
+
+// T-030: Role authority and protection helpers.
+
+// IsAdministrativeRole reports whether role is an administrative authority
+// (privacy_admin, consent_admin, or developer).
+func IsAdministrativeRole(role string) bool {
+	switch role {
+	case "privacy_admin", "consent_admin", "developer":
+		return true
+	default:
+		return false
+	}
+}
+
+// HasAdminAuthority reports whether role has administrative write authority,
+// allowing it to manage or revoke administrative suppressions.
+func HasAdminAuthority(role string) bool {
+	switch role {
+	case "privacy_admin", "consent_admin", "developer", "consent_writer":
+		return true
+	default:
+		return false
+	}
+}
+
+// HighestPrivilegedRole ranks roles by write authority and selects the highest.
+func HighestPrivilegedRole(roles []string) string {
+	roleRank := map[string]int{
+		"privacy_admin":  100,
+		"consent_admin":  90,
+		"developer":      80,
+		"consent_writer": 70,
+		"self_service":   50,
+		"service":        20,
+		"consent_reader": 10,
+	}
+	bestRole := ""
+	bestRank := 0
+	for _, r := range roles {
+		rank := roleRank[r]
+		if rank > bestRank {
+			bestRank = rank
+			bestRole = r
+		}
+	}
+	if bestRole == "" && len(roles) > 0 {
+		return roles[0]
+	}
+	return bestRole
 }
