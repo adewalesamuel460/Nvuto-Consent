@@ -20,13 +20,13 @@ import (
 // mockFaultRepo wraps store.Repository to inject precise faults into individual storage methods.
 type mockFaultRepo struct {
 	store.Repository
-	recordGovernedErr error
-	getPurposeErr     error
-	getNoticeErr      error
-	getLawfulBasisErr error
-	findEffectiveErr  error
+	recordGovernedErr  error
+	getPurposeErr      error
+	getNoticeErr       error
+	getLawfulBasisErr  error
+	findEffectiveErr   error
 	findSuppressionErr error
-	getErr            error
+	getErr             error
 }
 
 func (m *mockFaultRepo) RecordGoverned(ctx context.Context, consent domain.Consent, receipt domain.ConsentReceipt, audit domain.AuditEvent, outbox domain.OutboxEvent) (domain.Consent, error) {
