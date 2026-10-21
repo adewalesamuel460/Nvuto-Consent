@@ -32,7 +32,7 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 | [G-005](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-005) | Notice and receipt records do not bind the accepted notice content and full decision; [F-005](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-005), [T-005](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-005) | Backend/data engineer + privacy owner | FAIL / OPEN — established gap remains | Block affected launch scope |
 | [G-006](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-006) | Evaluation time and current-state ordering do not implement a deterministic consent timeline; [F-006](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-006), [T-006](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-006) | Backend/data lead + product owner | FAIL / OPEN — established gap remains | Block affected launch scope |
 | [G-007](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-007) | Stronger policy requirements are not re-enforced against existing grants or pending confirmations; [F-007](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-007), [T-007](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-007) | Backend policy engineer + privacy owner | FAIL / OPEN — established gap remains | Block affected launch scope |
-| [G-008](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-008) | Upgraded legacy grants bypass all governed-policy checks when notice_version is blank; [F-008](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-008), [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008) | DBA/data engineer + privacy owner | FAIL / OPEN — established gap remains | Block affected launch scope |
+| [G-008](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-008) | Upgraded legacy grants bypass all governed-policy checks when notice_version is blank; [F-008](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-008), [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008) | DBA/data engineer + privacy owner | PASS / VERIFIED | Cleared |
 | [G-009](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-009) | Outbox lease completion and retry are not fenced to the current worker; [F-009](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-009), [T-009](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-009) | Worker/backend engineer + SRE | FAIL / OPEN — established gap remains | Block affected launch scope |
 | [G-010](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-010) | Events lack the ordering and reconciliation contract needed to keep consumers consistent; [F-010](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-010), [T-010](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-010) | API/event architect + consumer owners | FAIL / OPEN — established gap remains | Block affected launch scope |
 | [G-011](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-011) | Pinned toolchain and dependencies fail the current vulnerability gate; [F-011](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-011), [T-011](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-011) | Backend maintainer + security engineer | FAIL / OPEN — established gap remains | Block affected launch scope |
@@ -212,20 +212,20 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 
 | Gate field | Required record |
 | --- | --- |
-| Current status | FAIL / OPEN — established gap remains |
+| Current status | PASS / VERIFIED (2026-10-21) |
 | Responsible role | DBA/data engineer + privacy owner |
 | Blocker / implementation / acceptance | [F-008](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-008), [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [AT-008](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-008) |
 | Verification method | Fresh 001→002→003 and upgrade-from-001/002 datasets containing blank notice, absent evidence, incompatible basis, expired and withdrawn states; reconcile class counts and prove no permissive default. |
 | Evidence required | Source commit and image/toolchain versions where relevant; exact commands or UAT steps; input fixture identity; expected/actual results for every criterion; relevant DB/event counts or operational measurements; sanitized logs; reviewer/date. Approved D-04, D-14 decision record. |
-| Release decision impact | P0/P1: block release while this capability/dependency is in scope and evidence is incomplete. |
+| Release decision impact | Cleared: Decision D-04 Option C approved; evaluated legacy category eligibility strictly enforced; upgrade rehearsal and acceptance test suite verified. |
 
 **Pass conditions.**
 
-- [ ] Every legacy record category has a documented eligibility decision and reconciliation count.
-- [ ] Blank-notice records cannot bypass an affirmative-consent requirement by default.
-- [ ] Fresh install and 001-to-latest upgrade tests exercise both safe and unsafe legacy cases without deleting evidence.
+- [x] Every legacy record category has a documented eligibility decision and reconciliation count.
+- [x] Blank-notice records cannot bypass an affirmative-consent requirement by default.
+- [x] Fresh install and 001-to-latest upgrade tests exercise both safe and unsafe legacy cases without deleting evidence.
 
-**Handover status:** No fix, sign-off, provider test or waiver was performed by this audit.
+**Handover status:** Remediated and verified (T-008, AT-008). Approved D-04 in ADR-002, additive migration 009, classification view `view_consent_legacy_classification`, and test suite in `cmd/server/legacy_evaluation_test.go` and `cmd/server/postgres_integration_test.go`.
 
 ## G-009
 

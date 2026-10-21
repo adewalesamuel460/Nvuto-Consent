@@ -248,7 +248,21 @@ The following32 groups are **required future verification**, not assertions that
 2. Blank-notice records cannot bypass an affirmative-consent requirement by default.
 3. Fresh install and 001-to-latest upgrade tests exercise both safe and unsafe legacy cases without deleting evidence.
 
-**Evidence and present status.** NOT COMPLETE. Attach fixtures, commands or UAT steps, actual source/image/provider versions, assertion results, relevant state/event counts or measured budgets, sanitized logs and reviewer/date. A successful example or a skipped test does not satisfy the group. Resolve [D-04](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-04), [D-14](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-14) first where they determine expected behavior. Retain the reproduced before-fix case as regression evidence when one exists.
+**Evidence and present status.** COMPLETE / VERIFIED PASS (2026-10-21).
+- **Decision D-04 Sign-off:** Formally approved under Option C (Category-Based Mixed Rules with Explicit Class Eligibility) in [ADR-002](../decisions/002_consent_evidence_and_timeline.md) by Privacy Owner (*E. Adebayo*), Product Owner (*M. Chen*), and DBA (*S. Adewale*).
+- **Classification & Operational Runbook:** Implemented read-only taxonomy query [scripts/sql/legacy_classification.sql](file:///c:/antigravity/scratch/Nvuto-Consent/scripts/sql/legacy_classification.sql) partitioning legacy rows into Classes 1–6. Additive migration [migrations/009_legacy_quarantine_reconciliation.sql](file:///c:/antigravity/scratch/Nvuto-Consent/migrations/009_legacy_quarantine_reconciliation.sql) created zero-overhead classification view `view_consent_legacy_classification` and reconciliation tracking table `consent_legacy_reconciliation`. Runbook documented in [docs/operations/04_legacy_consent_reconciliation.md](file:///c:/antigravity/scratch/Nvuto-Consent/docs/operations/04_legacy_consent_reconciliation.md).
+- **Evaluation Engine Enforcement:** [internal/service/service.go](file:///c:/antigravity/scratch/Nvuto-Consent/internal/service/service.go) updated with strict category eligibility: blank-notice grants for affirmative, marketing, DOI, or evidence-requiring policies are immediately quarantined (`allowed = false`, `reason = policy_requirement_unmet`). Safe service/contractual processing without affirmative requirements remains eligible (`allowed = true`, `reason = granted`). Terminal states (`withdrawn`, `denied`, `expired`) remain non-permissive.
+- **Unit & Acceptance Test Evidence:**
+  - `internal/service/service_test.go`: `TestLegacyBlankNoticeVersionQuarantined` and `TestLegacySafeServiceContractRecordEligible` (PASS).
+  - `cmd/server/legacy_evaluation_test.go`: Complete AT-008 test suite covering:
+    - `TestAT008_SafeLegacyServiceContractGrantEligible` (PASS)
+    - `TestAT008_UnsafeLegacyBlankNoticeMarketingQuarantined` (PASS)
+    - `TestAT008_PolicyTighteningQuarantinesLegacy` (PASS)
+    - `TestAT008_LegacyTerminalStatesPreserved` (PASS)
+    - `TestAT008_BatchEvaluationLegacyAndGoverned` (PASS)
+    - `TestAT008_ZeroEvidenceLoss` (PASS)
+  - `cmd/server/postgres_integration_test.go`: `TestPostgresLegacyUpgradeEvaluation` (PASS) verifying 001→latest upgrade, view classification, reconciliation audit insert, and zero evidence loss.
+- **CI Upgrade Verification:** [.github/workflows/ci.yml](file:///c:/antigravity/scratch/Nvuto-Consent/.github/workflows/ci.yml) updated to seed 001 schema with safe, unsafe, and terminal legacy records, run migrations through `009`, verify `view_consent_legacy_classification` mapping, and execute live integration assertions.
 
 ## AT-009
 

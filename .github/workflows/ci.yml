@@ -106,6 +106,8 @@ jobs:
           ysql -d yugabyte -c 'CREATE DATABASE consent_upgrade'
           ysql -d consent_upgrade < migrations/001_init.sql
           q "INSERT INTO consents(id,tenant_id,subject_id,purpose,channel,legal_basis,status,source,created_at,updated_at) VALUES('legacy','tenant-upgrade','subject-upgrade','service_updates','email','contract','granted','legacy',now(),now())"
+          q "INSERT INTO consents(id,tenant_id,subject_id,purpose,channel,legal_basis,status,source,created_at,updated_at) VALUES('legacy-unsafe','tenant-upgrade','subject-unsafe','marketing','email','consent','granted','legacy',now(),now())"
+          q "INSERT INTO consents(id,tenant_id,subject_id,purpose,channel,legal_basis,status,source,created_at,updated_at) VALUES('legacy-withdrawn','tenant-upgrade','subject-withdrawn','marketing','email','consent','withdrawn','legacy',now(),now())"
           # Row locked by a pre-005 worker at upgrade time.
           q "INSERT INTO consent_outbox_events(id,tenant_id,event_type,aggregate_id,occurred_at,attempts,locked_at,locked_by) VALUES('legacy-outbox','tenant-upgrade','consent.granted','legacy',now(),1,now(),'legacy-worker')"
           ysql -d consent_upgrade < migrations/002_policy_governance.sql
@@ -113,7 +115,7 @@ jobs:
           q "INSERT INTO consent_receipts(id,tenant_id,consent_id,subject_id,purpose,channel,notice_version,jurisdiction,evidence,receipt_hash,issued_at) VALUES('legacy-receipt','tenant-upgrade','legacy','subject-upgrade','service_updates','email','','','{}','legacy-v1-hash',now())"
           ysql -d consent_upgrade < migrations/003_governed_idempotency.sql
           q "INSERT INTO consent_idempotency(tenant_id,idempotency_key,request_hash,consent_id,created_at) VALUES('tenant-upgrade','legacy-key','legacy-request-hash','legacy',now())"
-          # Every later migration (004 through latest 008), in sorted order.
+          # Every later migration (004 through latest 009), in sorted order.
           for migration in $(ls -1 migrations/[0-9][0-9][0-9]_*.sql | sort); do
             case "$(basename "$migration")" in 001_*|002_*|003_*) continue ;; esac
             ysql -d consent_upgrade < "$migration"
@@ -131,6 +133,11 @@ jobs:
           test "$(q "SELECT count(*) FROM pg_constraint WHERE conname='fk_consent_receipts_consent'")" = "1"
           test "$(q "SELECT count(*) FROM pg_constraint WHERE conname='uq_consents_tenant_id'")" = "1"
           test "$(q "SELECT count(*) FROM information_schema.columns WHERE table_name='consent_suppressions' AND column_name='created_by_role'")" = "1"
+          test "$(q "SELECT count(*) FROM information_schema.tables WHERE table_name='consent_legacy_reconciliation'")" = "1"
+          test "$(q "SELECT count(*) FROM view_consent_legacy_classification WHERE tenant_id='tenant-upgrade'")" = "3"
+          test "$(q "SELECT classification FROM view_consent_legacy_classification WHERE consent_id='legacy'")" = "CLASS_1_SERVICE_CONTRACT_ELIGIBLE"
+          test "$(q "SELECT classification FROM view_consent_legacy_classification WHERE consent_id='legacy-unsafe'")" = "CLASS_2_MARKETING_AFFIRMATIVE_QUARANTINED"
+          test "$(q "SELECT classification FROM view_consent_legacy_classification WHERE consent_id='legacy-withdrawn'")" = "CLASS_5_TERMINAL_NON_GRANTED"
       - name: Prove idempotent replay/conflict, outbox fencing, and protected suppressions on the upgraded schema
         run: |
           set -o pipefail
@@ -151,10 +158,10 @@ jobs:
       - name: Prove YSQL policy transactions and confirmation concurrency
         run: |
           set -o pipefail
-          go test -race -count=1 -json ./cmd/server -run '^TestPostgresPolicyTransactionsAndSingleUseConfirmation$' \
+          go test -race -count=1 -json ./cmd/server -run '^(TestPostgresPolicyTransactionsAndSingleUseConfirmation|TestPostgresLegacyUpgradeEvaluation)$' \
             | tee test-results/server.jsonl
           python3 scripts/ci/assert-go-test-json.py test-results/server.jsonl \
-            TestPostgresPolicyTransactionsAndSingleUseConfirmation=1
+            TestPostgresPolicyTransactionsAndSingleUseConfirmation=1 TestPostgresLegacyUpgradeEvaluation=1
       - name: Prove HA-safe fenced JetStream outbox publication on YugabyteDB
         run: |
           set -o pipefail

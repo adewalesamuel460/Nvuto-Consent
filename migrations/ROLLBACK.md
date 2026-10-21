@@ -14,4 +14,6 @@ Do not drop the added tables or columns during an incident rollback. Doing so wo
 
 `008_receipt_evidence_binding.sql` is additive (`consent_privacy_notices` content/content_hash/retired/superseded_by columns and `consent_receipts` actor_id/consent_status/legal_basis/notice_content_hash/policy_version columns, with triggers protecting notice and receipt immutability). Rolling back application code to a pre-008 image is schema-safe: older binaries continue to query and insert rows safely using default column values. Do not drop columns or triggers during an incident rollback; keep the schema and roll forward if fixes are required.
 
+`009_legacy_quarantine_reconciliation.sql` is additive (`consent_legacy_reconciliation` audit table and `view_consent_legacy_classification` view). Rolling back application code to a pre-009 image is schema-safe: older binaries do not reference the reconciliation table or view. Do not drop the table or view during an incident rollback; retain reconciliation audit records and roll forward if fixes are required.
+
 

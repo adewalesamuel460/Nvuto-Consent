@@ -378,8 +378,71 @@ func TestLegacyBlankNoticeVersionQuarantined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Allowed || decision.Reason != "policy_unavailable" {
-		t.Fatalf("expected policy_unavailable for blank notice_version, got %+v", decision)
+	if decision.Allowed || decision.Reason != domain.DecisionReasonPolicyRequirementUnmet {
+		t.Fatalf("expected policy_requirement_unmet for blank notice_version on marketing grant, got %+v", decision)
+	}
+}
+
+// TestLegacySafeServiceContractRecordEligible (T-008) verifies that legacy rows
+// with a blank notice_version under the service category and contract legal basis
+// (where affirmative consent and evidence are not required) are eligible and allowed
+// under the D-04 Option C grandfathering rule.
+func TestLegacySafeServiceContractRecordEligible(t *testing.T) {
+	repo := store.NewMemory()
+	svc := New(repo)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// 1. Install service_updates purpose (category: service, requires_affirmative_consent: false, requires_double_opt_in: false)
+	_, err := svc.RegisterPurpose(ctx, "tenant-safe", "admin", domain.Purpose{
+		Code:                       "service_updates",
+		Category:                   "service",
+		AllowedChannels:            []string{"email"},
+		RequiresAffirmativeConsent: false,
+		RequiresDoubleOptIn:        false,
+		Active:                     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Install contract lawful basis (allowed_categories: ["service"], requires_evidence: false)
+	_, err = svc.RegisterLawfulBasis(ctx, "tenant-safe", "admin", domain.LawfulBasis{
+		Code:              "contract",
+		AllowedCategories: []string{"service"},
+		RequiresEvidence:  false,
+		Active:            true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Create a legacy consent record directly with blank NoticeVersion
+	legacyGrant := domain.Consent{
+		ID:            "con-legacy-safe",
+		TenantID:      "tenant-safe",
+		SubjectID:     "subj-safe-1",
+		Purpose:       "service_updates",
+		Channel:       "email",
+		LegalBasis:    "contract",
+		Status:        domain.StatusGranted,
+		Source:        "legacy",
+		NoticeVersion: "", // Blank notice version from pre-002 schema
+		Version:       1,
+		CreatedAt:     now.Add(-24 * time.Hour),
+		UpdatedAt:     now.Add(-24 * time.Hour),
+	}
+
+	stub := &legacyConsentRepo{Repository: repo, consent: legacyGrant}
+	legacySvc := New(stub)
+
+	// 4. Evaluate must return allowed=true, reason=granted for safe legacy service contract
+	decision, err := legacySvc.Evaluate(ctx, "tenant-safe", "subj-safe-1", "service_updates", "email", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Allowed || decision.Reason != domain.DecisionReasonGranted {
+		t.Fatalf("expected allowed=true, reason=granted for safe legacy service contract, got %+v", decision)
 	}
 }
 

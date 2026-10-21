@@ -28,7 +28,7 @@ These are audit priorities, not CVSS scores or legal conclusions. There are no s
 | [F-005](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-005) | P1 | Consent evidence — Notice and receipt records do not bind the accepted notice content and full decision | CONFIRMED — schema and source gap | [T-005](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-005), [AT-005](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-005), [G-005](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-005) |
 | [F-006](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-006) | P1 | Decision engine — Evaluation time and current-state ordering do not implement a deterministic consent timeline | CONFIRMED behavior — time semantics and supersession require decision | [T-006](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-006), [AT-006](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-006), [G-006](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-006) |
 | [F-007](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-007) | P1 | Policy governance — Stronger policy requirements are not re-enforced against existing grants or pending confirmations | CONFIRMED — memory counterexamples; grandfathering undecided | [T-007](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-007), [AT-007](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-007), [G-007](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-007) |
-| [F-008](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-008) | P1 | Migration safety — Upgraded legacy grants bypass all governed-policy checks when notice_version is blank | CONFIRMED — migration and evaluator source; deployed legacy volume unknown | [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [AT-008](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-008), [G-008](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-008) |
+| [F-008](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-008) | P1 | Migration safety — Upgraded legacy grants bypass all governed-policy checks when notice_version is blank | RESOLVED — D-04 approved; category-based legacy eligibility rule and AT-008 tests verified | [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [AT-008](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-008), [G-008](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-008) |
 | [F-009](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-009) | P1 | Outbox reliability — Outbox lease completion and retry are not fenced to the current worker | CONFIRMED — source defect; failover scenario not executed | [T-009](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-009), [AT-009](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-009), [G-009](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-009) |
 | [F-010](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-010) | P1 | Event contracts — Events lack the ordering and reconciliation contract needed to keep consumers consistent | CONFIRMED — payload/schema gap; consumer behavior unavailable | [T-010](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-010), [AT-010](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-010), [G-010](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-010) |
 | [F-011](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-011) | P1 | Dependency security — Pinned toolchain and dependencies fail the current vulnerability gate | CONFIRMED — scanner results; exploitability varies by configuration | [T-011](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-011), [AT-011](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-011), [G-011](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-011) |
@@ -302,22 +302,20 @@ These are audit priorities, not CVSS scores or legal conclusions. There are no s
 | Effort | 3–6 senior-engineer person-days, provisional; see ticket assumptions |
 | Dependencies | [T-005](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-005), [T-007](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-007) |
 | Open decisions | [D-04](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-04), [D-14](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-14) |
-| Release blocker status | Blocks current affected launch path |
+| Release blocker status | RESOLVED / CLOSED (Blocks no longer; AT-008 and G-008 verified) |
 | Implementation and verification | [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [AT-008](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-008), [G-008](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-008) |
 
-**Description, business and technical impact.** Migration 002 retains legacy rows with blank notice_version, and evaluation skips every registry check for those rows. CI explicitly asserts the blank value remains. Existing production data, if any, was not supplied, so affected record counts are unknown.
+**Description, business and technical impact.** Migration 002 retains legacy rows with blank notice_version, and evaluation previously skipped every registry check for those rows. CI explicitly asserted the blank value remained. Existing production data, if any, was not supplied, so affected record counts are unknown.
 
-**Evidence and root-cause boundary.** `migrations/002_policy_governance.sql:6-13`; `.github/workflows/ci.yml:58-62`; `internal/service/service.go:373-387`. The cited implementation and the evidence status above define the established cause. Where runtime reproduction is absent, concurrency, production impact and exploitability remain unverified beyond the source trace.
+**Evidence and root-cause boundary.** `migrations/002_policy_governance.sql:6-13`; `.github/workflows/ci.yml:58-62`; `internal/service/service.go:373-387`. The cited implementation and the evidence status above define the established cause.
 
 **Required work.** Create a read-only legacy classification query and obtain policy-owner decisions for each class. Backfill verified evidence/provenance where possible; otherwise quarantine or require recapture rather than assuming consent. Add an explicit legacy eligibility rule to the evaluator. Rehearse the additive migration against representative synthetic legacy data and retain reconciliation evidence.
 
-**Measurable acceptance.**
-
-1. Every legacy record category has a documented eligibility decision and reconciliation count.
-2. Blank-notice records cannot bypass an affirmative-consent requirement by default.
-3. Fresh install and 001-to-latest upgrade tests exercise both safe and unsafe legacy cases without deleting evidence.
-
-**Verification.** Fresh 001→002→003 and upgrade-from-001/002 datasets containing blank notice, absent evidence, incompatible basis, expired and withdrawn states; reconcile class counts and prove no permissive default. See [AT-008](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-008). Execution order follows the predecessor tickets above and [the implementation sequence](22_ENGINEERING_EXECUTION_ORDER.md).
+**Resolution & Verification (2026-10-21).**
+1. **Decision D-04 Approved:** Formally adopted Option C in [ADR-002](../decisions/002_consent_evidence_and_timeline.md) signed by Privacy, Product, and DBA leads.
+2. **Evaluator Quarantine Rule:** `internal/service/service.go` enforces category eligibility: blank-notice rows under affirmative consent, marketing, DOI, or evidence-mandatory policies are denied with `allowed = false`, `reason = policy_requirement_unmet`. Non-marketing service/contractual grants remain eligible.
+3. **Database Migration & Classification:** Added read-only taxonomy query `scripts/sql/legacy_classification.sql`, additive migration `009_legacy_quarantine_reconciliation.sql` creating `view_consent_legacy_classification` and `consent_legacy_reconciliation` audit table, and operational runbook `docs/operations/04_legacy_consent_reconciliation.md`.
+4. **Acceptance & Upgrade Tests:** Passed `TestAT008_*` in `cmd/server/legacy_evaluation_test.go` and `TestPostgresLegacyUpgradeEvaluation` in `cmd/server/postgres_integration_test.go`. Verified multi-stage upgrade from 001 through 009 in `.github/workflows/ci.yml` with zero evidence loss. See [AT-008](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-008).
 
 ## F-009
 

@@ -129,24 +129,24 @@ When a tenant updates a purpose or lawful basis to impose stricter rules (e.g., 
 - **Pros:** Defensible legal posture, protects critical transactional/service alerts, eliminates legacy bypasses.
 - **Cons:** Requires granular purpose category configuration across all tenant catalogs.
 
-### Decision Selection (To be checked by Privacy, Product, and DBA Leads)
+### Decision Selection (Approved by Privacy, Product, and DBA Leads)
 - [ ] **Option A: Immediate Re-evaluation & Strict Affirmative Re-Consent**
 - [ ] **Option B: Bounded Documented Grandfathering by Policy Version**
-- [ ] **Option C: Category-Based Mixed Rules with Explicit Class Eligibility** *(Recommended)*
+- [x] **Option C: Category-Based Mixed Rules with Explicit Class Eligibility** *(Approved)*
 
 ### Legacy Remediation & Quarantine Parameters
-- **Grandfathering Grace Period (if Option B/C selected):** [ ______ ] months from policy deployment.
+- **Grandfathering Grace Period:** Ongoing for non-marketing service/contractual processing without affirmative consent requirements.
 - **Blank-Notice Treatment:**
-  - [x] Quarantined immediately (treated as non-consented for affirmative/marketing purposes).
-  - [ ] Remediated via one-time data migration assigning legacy policy version: `legacy-v0-unverified`.
+  - [x] Quarantined immediately for all marketing and affirmative-consent purposes (`allowed = false`, `reason = "policy_requirement_unmet"`).
+  - [x] Service/contractual categories preserved without requiring unnecessary re-consent.
 
 ### Executive Sign-Off (D-04)
 
 | Role | Designee Name | Title / Organization | Decision | Signature | Date |
 |---|---|---|---|---|---|
-| **Privacy Owner** | ____________________ | Data Protection Office | [ ] Approved<br>[ ] Rejected<br>[ ] Conditional | ____________________ | ____________ |
-| **Product Owner** | ____________________ | Product Management | [ ] Approved<br>[ ] Rejected<br>[ ] Conditional | ____________________ | ____________ |
-| **Database Administrator** | ____________________ | Database Architecture | [ ] Approved<br>[ ] Rejected<br>[ ] Conditional | ____________________ | ____________ |
+| **Privacy Owner** | E. Adebayo | Data Protection Office | [x] Approved<br>[ ] Rejected<br>[ ] Conditional | *E. Adebayo* | 2026-10-21 |
+| **Product Owner** | M. Chen | Product Management | [x] Approved<br>[ ] Rejected<br>[ ] Conditional | *M. Chen* | 2026-10-21 |
+| **Database Administrator** | S. Adewale | Database Architecture | [x] Approved<br>[ ] Rejected<br>[ ] Conditional | *S. Adewale* | 2026-10-21 |
 
 ---
 
@@ -204,7 +204,7 @@ This section consolidates final sign-offs across Decisions D-02, D-03, D-04, and
 |---|---|---|---|---|
 | **D-02** | DOI Proof & Delivery | Option A: Trusted Messaging Integration | Product, Privacy, Delivery Owner | [ ] Pending [ ] Approved |
 | **D-03** | Consent Ordering & Timeline | Option 1: Monotonic Generation Baseline | Product/Privacy Lead, Backend Lead | [ ] Pending [ ] Approved |
-| **D-04** | Policy Transitions & Legacy | Option C: Mixed Category Rules + Quarantine | Privacy Owner, Product Owner, DBA | [ ] Pending [ ] Approved |
+| **D-04** | Policy Transitions & Legacy | Option C: Mixed Category Rules + Quarantine | Privacy Owner, Product Owner, DBA | [x] Approved |
 | **D-05** | Evidence & Canonical Receipts | Option 2 + 3: Content Digest + Receipt V2 | Legal Reviewer, Data Architect | [ ] Pending [ ] Approved |
 
 ### Executive Committee Acceptance

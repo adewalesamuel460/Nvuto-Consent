@@ -668,11 +668,6 @@ func (s *Service) Evaluate(ctx context.Context, tenantID, subjectID, purpose, ch
 	if c.GrantedAt != nil && c.GrantedAt.After(at) {
 		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonNotYetGranted, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
-	// Legacy rows with a blank notice_version must no longer bypass governed
-	// policy checks; reject/quarantine them explicitly (T-008).
-	if c.NoticeVersion == "" {
-		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyUnavailable, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
-	}
 	registeredPurpose, err := s.repo.GetPurpose(ctx, tenantID, purpose)
 	if deny, failure := policyDecision(err); failure != nil {
 		return domain.SuppressionDecision{}, failure
@@ -703,6 +698,26 @@ func (s *Service) Evaluate(ctx context.Context, tenantID, subjectID, purpose, ch
 	if basis.RequiresEvidence && (c.Evidence.IsZero() || strings.TrimSpace(c.Evidence.ArtifactHash) == "") {
 		return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyRequirementUnmet, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
 	}
+
+	// Legacy Record Eligibility Rule (T-008 / D-04 Option C):
+	// Blank-notice records cannot bypass an affirmative-consent requirement by default.
+	// When notice_version is empty:
+	// If the purpose requires affirmative consent, requires DOI, is in the marketing category,
+	// or the legal basis requires evidence or is "consent", the legacy record is quarantined (denied).
+	// Only grandfathered non-marketing service/contractual processing (e.g. contract or legitimate_interest)
+	// that does not require affirmative consent or evidence is considered eligible without a published notice.
+	if c.NoticeVersion == "" {
+		if registeredPurpose.RequiresAffirmativeConsent ||
+			registeredPurpose.RequiresDoubleOptIn ||
+			registeredPurpose.Category == "marketing" ||
+			basis.RequiresEvidence ||
+			c.LegalBasis == "consent" {
+			return domain.SuppressionDecision{Allowed: false, Reason: domain.DecisionReasonPolicyRequirementUnmet, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+		}
+		// Eligible legacy service/contractual grant
+		return domain.SuppressionDecision{Allowed: true, Reason: domain.DecisionReasonGranted, ConsentID: c.ID, ReceiptID: c.ReceiptID, EvaluatedAt: at}, nil
+	}
+
 	notice, err := s.repo.GetNotice(ctx, tenantID, c.Jurisdiction, c.NoticeVersion)
 	if deny, failure := policyDecision(err); failure != nil {
 		return domain.SuppressionDecision{}, failure

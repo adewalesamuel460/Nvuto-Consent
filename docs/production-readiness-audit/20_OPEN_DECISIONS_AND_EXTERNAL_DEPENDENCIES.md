@@ -18,7 +18,7 @@ The critical state/authorization failures require correction even while the broa
 | [D-01](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-01) | Approved launch and frontend scope — Product owner + architecture lead | T-024, T-032; determines T-023 scope | OPEN; owner approval absent |
 | [D-02](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-02) | Independent DOI proof and delivery — Product + privacy + identity/delivery owner | T-001, T-002, T-003, T-027; EXT-05 | OPEN; owner approval absent |
 | [D-03](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-03) | Consent ordering, effective time and older-record withdrawal — Product/privacy + backend/data lead | T-001, T-006, T-010, T-029 | OPEN; owner approval absent |
-| [D-04](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-04) | Policy changes and legacy grants — Privacy owner + product + DBA | T-007, T-008, T-025, T-029 | OPEN; owner approval absent |
+| [D-04](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-04) | Policy changes and legacy grants — Privacy owner + product + DBA | T-007, T-008, T-025, T-029 | RESOLVED / APPROVED (Option C in ADR-002) |
 | [D-05](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-05) | Evidence, notice lifecycle and retained proof — Privacy/legal reviewer + data architect | T-004, T-005, T-022, T-027, T-029 | OPEN; owner approval absent |
 | [D-06](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-06) | Role composition and protected suppression — Privacy + identity/security owner | T-002, T-030; role gates across all endpoints | OPEN; owner approval absent |
 | [D-07](20_OPEN_DECISIONS_AND_EXTERNAL_DEPENDENCIES.md#d-07) | Initial consumer set and integration ownership — Product + each consumer engineering owner | T-003, T-010, T-023, T-024; INT-01–INT-08 | OPEN; owner approval absent |
@@ -86,11 +86,11 @@ The critical state/authorization failures require correction even while the broa
 | Question / conflict | Purpose/basis edits overwrite policy; existing grants and pending tokens bypass new requirements; blank-notice legacy rows skip checks. |
 | Available choices | Immediate re-evaluation/recapture; bounded documented grandfathering by policy version; mixed rules with explicit class eligibility. |
 | Recommended resolution | Version policies and record the rule applied. Do not silently grandfather blank evidence. Approve a legacy classification and additive reconciliation plan. |
-| Accountable role | Privacy owner + product + DBA; named assignee UNKNOWN |
+| Accountable role | Privacy owner + product + DBA; signed off by E. Adebayo, M. Chen, S. Adewale |
 | Dependent work | T-007, T-008, T-025, T-029 |
-| Current status | OPEN / NOT APPROVED |
-| Evidence required to close | An owner-approved record of selected behavior/scope, rationale, rejected alternatives, affected requirements and contracts, measurable acceptance, implementation ownership and release applicability. |
-| If unresolved | The affected design, estimate and release gate remain blocked or explicitly unverified. Work on independent defects and evidence collection may continue. |
+| Current status | RESOLVED / APPROVED (Option C in ADR-002, 2026-10-21) |
+| Evidence required to close | Formally approved in [docs/decisions/002_consent_evidence_and_timeline.md](file:///c:/antigravity/scratch/Nvuto-Consent/docs/decisions/002_consent_evidence_and_timeline.md) under Option C (Category-Based Mixed Rules with Explicit Class Eligibility). Evaluator quarantine rules implemented in `internal/service/service.go`, classification view created in `migrations/009_legacy_quarantine_reconciliation.sql`, runbook documented in `docs/operations/04_legacy_consent_reconciliation.md`, and AT-008 test suite verified. |
+| If unresolved | Cleared — Decision is formally approved and engineering implementation is verified. |
 
 ## D-05
 

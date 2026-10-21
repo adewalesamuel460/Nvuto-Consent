@@ -205,3 +205,189 @@ func TestPostgresPolicyTransactionsAndSingleUseConfirmation(t *testing.T) {
 		}
 	}
 }
+
+// TestPostgresLegacyUpgradeEvaluation (AT-008) verifies against PostgreSQL/YugabyteDB
+// that upgraded legacy records with blank notice_version are properly handled:
+//  1. Safe legacy service/contractual grants evaluate to allowed=true, reason=granted.
+//  2. Unsafe legacy affirmative/marketing grants evaluate to allowed=false, reason=policy_requirement_unmet.
+//  3. Terminal states (withdrawn) evaluate to allowed=false, reason=withdrawn.
+//  4. view_consent_legacy_classification correctly categorizes legacy rows.
+//  5. No records or evidence are deleted or mutated.
+func TestPostgresLegacyUpgradeEvaluation(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = os.Getenv("DATABASE_URL")
+	}
+	if databaseURL == "" {
+		if os.Getenv("NVUTO_REQUIRE_INTEGRATION") == "true" {
+			t.Fatal("TEST_DATABASE_URL (or DATABASE_URL) is required when NVUTO_REQUIRE_INTEGRATION=true")
+		}
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+
+	ctx := context.Background()
+	repo, err := store.NewPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	svc := service.New(repo)
+	tenantID := fmt.Sprintf("tenant-legacy-pg-%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+
+	// 1. Configure purpose registries
+	_, err = svc.RegisterPurpose(ctx, tenantID, "admin", domain.Purpose{
+		Code:                       "service_updates",
+		Category:                   "service",
+		AllowedChannels:            []string{"email"},
+		RequiresAffirmativeConsent: false,
+		RequiresDoubleOptIn:        false,
+		Active:                     true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register service purpose: %v", err)
+	}
+	_, err = svc.RegisterPurpose(ctx, tenantID, "admin", domain.Purpose{
+		Code:                       "marketing",
+		Category:                   "marketing",
+		AllowedChannels:            []string{"email"},
+		RequiresAffirmativeConsent: true,
+		RequiresDoubleOptIn:        false,
+		Active:                     true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register marketing purpose: %v", err)
+	}
+
+	// 2. Configure lawful bases
+	_, err = svc.RegisterLawfulBasis(ctx, tenantID, "admin", domain.LawfulBasis{
+		Code:              "contract",
+		AllowedCategories: []string{"service"},
+		RequiresEvidence:  false,
+		Active:            true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register contract basis: %v", err)
+	}
+	_, err = svc.RegisterLawfulBasis(ctx, tenantID, "admin", domain.LawfulBasis{
+		Code:              "consent",
+		AllowedCategories: []string{"marketing"},
+		RequiresEvidence:  true,
+		Active:            true,
+	})
+	if err != nil {
+		t.Fatalf("failed to register consent basis: %v", err)
+	}
+
+	// 3. Insert synthetic pre-002 legacy records into PostgreSQL (notice_version='')
+	safeID := fmt.Sprintf("con-safe-%d", time.Now().UnixNano())
+	unsafeID := fmt.Sprintf("con-unsafe-%d", time.Now().UnixNano())
+	withdrawnID := fmt.Sprintf("con-withdrawn-%d", time.Now().UnixNano())
+
+	// Safe legacy: service_updates / contract / status=granted / notice_version=''
+	_, err = repo.Pool().Exec(ctx, `
+		INSERT INTO consents(id, tenant_id, subject_id, purpose, channel, legal_basis, status, source, notice_version, created_at, updated_at)
+		VALUES($1, $2, 'cust-safe-pg', 'service_updates', 'email', 'contract', 'granted', 'legacy', '', $3, $3)
+	`, safeID, tenantID, now.Add(-48*time.Hour))
+	if err != nil {
+		t.Fatalf("failed to insert safe legacy record: %v", err)
+	}
+
+	// Unsafe legacy: marketing / consent / status=granted / notice_version='' / empty evidence
+	_, err = repo.Pool().Exec(ctx, `
+		INSERT INTO consents(id, tenant_id, subject_id, purpose, channel, legal_basis, status, source, notice_version, evidence, created_at, updated_at)
+		VALUES($1, $2, 'cust-unsafe-pg', 'marketing', 'email', 'consent', 'granted', 'legacy', '', '{}'::jsonb, $3, $3)
+	`, unsafeID, tenantID, now.Add(-48*time.Hour))
+	if err != nil {
+		t.Fatalf("failed to insert unsafe legacy record: %v", err)
+	}
+
+	// Terminal legacy: service_updates / contract / status=withdrawn / notice_version=''
+	_, err = repo.Pool().Exec(ctx, `
+		INSERT INTO consents(id, tenant_id, subject_id, purpose, channel, legal_basis, status, source, notice_version, created_at, updated_at, withdrawn_at)
+		VALUES($1, $2, 'cust-withdrawn-pg', 'service_updates', 'email', 'contract', 'withdrawn', 'legacy', '', $3, $3, $3)
+	`, withdrawnID, tenantID, now.Add(-48*time.Hour))
+	if err != nil {
+		t.Fatalf("failed to insert withdrawn legacy record: %v", err)
+	}
+
+	// 4. Evaluate safe legacy record: must be allowed=true, reason=granted
+	safeDec, err := svc.Evaluate(ctx, tenantID, "cust-safe-pg", "service_updates", "email", now)
+	if err != nil {
+		t.Fatalf("Evaluate safe legacy returned error: %v", err)
+	}
+	if !safeDec.Allowed || safeDec.Reason != domain.DecisionReasonGranted {
+		t.Fatalf("expected safe legacy grant allowed=true, reason=granted; got %+v", safeDec)
+	}
+
+	// 5. Evaluate unsafe legacy record: must be allowed=false, reason=policy_requirement_unmet
+	unsafeDec, err := svc.Evaluate(ctx, tenantID, "cust-unsafe-pg", "marketing", "email", now)
+	if err != nil {
+		t.Fatalf("Evaluate unsafe legacy returned error: %v", err)
+	}
+	if unsafeDec.Allowed || unsafeDec.Reason != domain.DecisionReasonPolicyRequirementUnmet {
+		t.Fatalf("expected unsafe legacy grant allowed=false, reason=policy_requirement_unmet; got %+v", unsafeDec)
+	}
+
+	// 6. Evaluate withdrawn legacy record: must be allowed=false, reason=withdrawn
+	withdrawnDec, err := svc.Evaluate(ctx, tenantID, "cust-withdrawn-pg", "service_updates", "email", now)
+	if err != nil {
+		t.Fatalf("Evaluate withdrawn legacy returned error: %v", err)
+	}
+	if withdrawnDec.Allowed || withdrawnDec.Reason != "withdrawn" {
+		t.Fatalf("expected withdrawn legacy grant allowed=false, reason=withdrawn; got %+v", withdrawnDec)
+	}
+
+	// 7. Verify view_consent_legacy_classification view in DB
+	rows, err := repo.Pool().Query(ctx, `
+		SELECT consent_id, classification FROM view_consent_legacy_classification
+		WHERE tenant_id = $1 ORDER BY consent_id
+	`, tenantID)
+	if err != nil {
+		t.Fatalf("querying view_consent_legacy_classification failed: %v", err)
+	}
+	defer rows.Close()
+
+	classifications := make(map[string]string)
+	for rows.Next() {
+		var cid, class string
+		if err := rows.Scan(&cid, &class); err != nil {
+			t.Fatal(err)
+		}
+		classifications[cid] = class
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if classifications[safeID] != "CLASS_1_SERVICE_CONTRACT_ELIGIBLE" {
+		t.Errorf("expected safeID classification CLASS_1_SERVICE_CONTRACT_ELIGIBLE, got %s", classifications[safeID])
+	}
+	if classifications[unsafeID] != "CLASS_2_MARKETING_AFFIRMATIVE_QUARANTINED" {
+		t.Errorf("expected unsafeID classification CLASS_2_MARKETING_AFFIRMATIVE_QUARANTINED, got %s", classifications[unsafeID])
+	}
+	if classifications[withdrawnID] != "CLASS_5_TERMINAL_NON_GRANTED" {
+		t.Errorf("expected withdrawnID classification CLASS_5_TERMINAL_NON_GRANTED, got %s", classifications[withdrawnID])
+	}
+
+	// 8. Record audit reconciliation in consent_legacy_reconciliation
+	_, err = repo.Pool().Exec(ctx, `
+		INSERT INTO consent_legacy_reconciliation(tenant_id, class_code, category, eligibility_decision, rationale, record_count, approved_by)
+		VALUES($1, 'CLASS_1', 'service', 'eligible', 'Grandfathered contractual service notifications under D-04', 1, 'ci-audit')
+		ON CONFLICT (tenant_id, class_code) DO NOTHING
+	`, tenantID)
+	if err != nil {
+		t.Fatalf("failed to insert reconciliation record: %v", err)
+	}
+
+	// 9. Verify zero evidence loss / row count unchanged
+	var count int
+	err = repo.Pool().QueryRow(ctx, "SELECT count(*) FROM consents WHERE tenant_id = $1", tenantID).Scan(&count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("expected exactly 3 records in consents (zero deletion), got %d", count)
+	}
+}
