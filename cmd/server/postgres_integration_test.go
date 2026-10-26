@@ -1,19 +1,26 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Atlasfsp/Nvuto-Consent/internal/auth"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/domain"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/service"
 	"github.com/Atlasfsp/Nvuto-Consent/internal/store"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -390,4 +397,273 @@ func TestPostgresLegacyUpgradeEvaluation(t *testing.T) {
 	if count != 3 {
 		t.Fatalf("expected exactly 3 records in consents (zero deletion), got %d", count)
 	}
+}
+
+// TestIntegration_PostgresAuthenticatedHTTPWorkflows proves end-to-end HTTP-to-YSQL
+// workflows against the real PostgreSQL / YugabyteDB backend (T-016 / AT-016).
+// It tests authenticated HTTP requests (POST /v1/consents, GET /v1/consents, POST /v1/evaluate,
+// GET /v1/receipts, POST /v1/consents/{id}/withdraw) using valid HMAC JWTs, asserting status codes,
+// canonical receipt hashes, and database states.
+func TestIntegration_PostgresAuthenticatedHTTPWorkflows(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = os.Getenv("DATABASE_URL")
+	}
+	if databaseURL == "" {
+		if strings.EqualFold(os.Getenv("NVUTO_REQUIRE_INTEGRATION"), "true") {
+			t.Fatal("TEST_DATABASE_URL is required when NVUTO_REQUIRE_INTEGRATION=true")
+		}
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+
+	repo, err := store.NewPostgres(context.Background(), databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	svc := service.New(repo)
+	tenantID := fmt.Sprintf("tenant-http-%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+
+	// 1. Configure HMAC authentication
+	hmacSecret := "test-secret-at016-e2e-workflows-32b!"
+	t.Setenv("JWT_JWKS_URL", "")
+	t.Setenv("JWT_HMAC_SECRET", hmacSecret)
+	t.Setenv("ALLOW_HMAC_AUTH", "true")
+	t.Setenv("ALLOW_DEV_HEADERS", "false")
+
+	// Stand up actual HTTP server listening on a loopback TCP socket
+	ts := httptest.NewServer(newMux(svc))
+	defer ts.Close()
+	client := ts.Client()
+
+	signToken := func(actor, customerSubject string, roles ...string) string {
+		claims := auth.Claims{
+			TenantID:  tenantID,
+			SubjectID: customerSubject,
+			Roles:     roles,
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject:   "actor-" + actor,
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
+			},
+		}
+		raw, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(hmacSecret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	adminToken := signToken("admin-1", "", auth.RolePrivacyAdmin)
+	writerToken := signToken("writer-1", "", auth.RoleConsentWriter)
+	readerToken := signToken("reader-1", "", auth.RoleConsentReader)
+
+	doHTTP := func(method, path, token string, body any) (*http.Response, []byte) {
+		var r io.Reader
+		if body != nil {
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r = bytes.NewReader(encoded)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		respBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, respBytes
+	}
+
+	// 2. Administrative Setup: register purpose, lawful basis, notice via HTTP
+	resp, _ := doHTTP(http.MethodPost, "/v1/purposes", adminToken, map[string]any{
+		"code":                         "marketing",
+		"category":                     "marketing",
+		"allowed_channels":             []string{"email"},
+		"requires_affirmative_consent": true,
+		"requires_double_opt_in":       false,
+		"active":                       true,
+	})
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/purposes failed with status %d", resp.StatusCode)
+	}
+
+	resp, _ = doHTTP(http.MethodPost, "/v1/lawful-bases", adminToken, map[string]any{
+		"code":               "consent",
+		"allowed_categories": []string{"marketing"},
+		"requires_evidence":  true,
+		"active":             true,
+	})
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/lawful-bases failed with status %d", resp.StatusCode)
+	}
+
+	resp, _ = doHTTP(http.MethodPost, "/v1/notices", adminToken, map[string]any{
+		"version":      "2026-08",
+		"jurisdiction": "NG",
+		"published_at": now.Format(time.RFC3339Nano),
+		"active":       true,
+	})
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/notices failed with status %d", resp.StatusCode)
+	}
+
+	// 3. Create Consent via POST /v1/consents
+	subjectID := "cus-http-workflow-1"
+	createPayload := map[string]any{
+		"subject_id":     subjectID,
+		"purpose":        "marketing",
+		"channel":        "email",
+		"legal_basis":    "consent",
+		"status":         "granted",
+		"source":         "portal",
+		"jurisdiction":   "NG",
+		"notice_version": "2026-08",
+		"evidence": map[string]any{
+			"method":        "preference_center",
+			"artifact_hash": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+			"collected_at":  now.Format(time.RFC3339Nano),
+		},
+	}
+	resp, bodyBytes := doHTTP(http.MethodPost, "/v1/consents", writerToken, createPayload)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /v1/consents failed: %d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var createdConsent domain.Consent
+	if err := json.Unmarshal(bodyBytes, &createdConsent); err != nil {
+		t.Fatalf("unmarshaling created consent failed: %v", err)
+	}
+	if createdConsent.ID == "" || createdConsent.ReceiptID == "" || createdConsent.Status != domain.StatusGranted {
+		t.Fatalf("invalid created consent payload: %+v", createdConsent)
+	}
+
+	// 4. List Consents via GET /v1/consents?subject_id=...
+	resp, bodyBytes = doHTTP(http.MethodGet, "/v1/consents?subject_id="+subjectID, readerToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/consents failed: %d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+	var listResp struct {
+		Items []domain.Consent `json:"items"`
+	}
+	if err := json.Unmarshal(bodyBytes, &listResp); err != nil {
+		t.Fatalf("unmarshaling consent list failed: %v", err)
+	}
+	if len(listResp.Items) != 1 || listResp.Items[0].ID != createdConsent.ID {
+		t.Fatalf("GET /v1/consents did not return created consent: %+v", listResp.Items)
+	}
+
+	// 5. Evaluate Consent via POST /v1/evaluate
+	evalPayload := map[string]any{
+		"subject_id": subjectID,
+		"purpose":    "marketing",
+		"channel":    "email",
+	}
+	resp, bodyBytes = doHTTP(http.MethodPost, "/v1/evaluate", readerToken, evalPayload)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/evaluate failed: %d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+	var decision struct {
+		Allowed   bool   `json:"allowed"`
+		Reason    string `json:"reason"`
+		ReceiptID string `json:"receipt_id"`
+	}
+	if err := json.Unmarshal(bodyBytes, &decision); err != nil {
+		t.Fatalf("unmarshaling evaluate decision failed: %v", err)
+	}
+	if !decision.Allowed || decision.Reason != "granted" || decision.ReceiptID != createdConsent.ReceiptID {
+		t.Fatalf("unexpected evaluate decision: %+v", decision)
+	}
+
+	// 6. Fetch Receipt via GET /v1/receipts/{receipt_id} and assert cryptographic verification
+	resp, bodyBytes = doHTTP(http.MethodGet, "/v1/receipts/"+createdConsent.ReceiptID, readerToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/receipts/%s failed: %d body=%s", createdConsent.ReceiptID, resp.StatusCode, string(bodyBytes))
+	}
+	var receipt domain.ConsentReceipt
+	if err := json.Unmarshal(bodyBytes, &receipt); err != nil {
+		t.Fatalf("unmarshaling receipt failed: %v", err)
+	}
+	if receipt.ConsentID != createdConsent.ID || receipt.ReceiptHash == "" {
+		t.Fatalf("invalid receipt returned: %+v", receipt)
+	}
+	verification := service.VerifyReceipt(receipt)
+	if verification.Status != service.ReceiptHashVerified || receipt.HashVersion != service.ReceiptHashVersionCanonical {
+		t.Fatalf("receipt failed canonical cryptographic verification: %+v", verification)
+	}
+
+	// 7. Verify Database State in YSQL directly
+	ctx := context.Background()
+	var dbStatus string
+	var dbGen int64
+	err = repo.Pool().QueryRow(ctx, "SELECT status, preference_generation FROM consents WHERE tenant_id=$1 AND id=$2", tenantID, createdConsent.ID).Scan(&dbStatus, &dbGen)
+	if err != nil {
+		t.Fatalf("database query for consent failed: %v", err)
+	}
+	if dbStatus != string(domain.StatusGranted) || dbGen < 1 {
+		t.Fatalf("database row state mismatch: status=%s generation=%d", dbStatus, dbGen)
+	}
+
+	var rcpCount, audCount, outCount int
+	if err := repo.Pool().QueryRow(ctx, "SELECT count(*) FROM consent_receipts WHERE tenant_id=$1 AND consent_id=$2", tenantID, createdConsent.ID).Scan(&rcpCount); err != nil || rcpCount != 1 {
+		t.Fatalf("expected 1 receipt row in DB, got %d (err: %v)", rcpCount, err)
+	}
+	if err := repo.Pool().QueryRow(ctx, "SELECT count(*) FROM consent_audit_events WHERE tenant_id=$1 AND consent_id=$2", tenantID, createdConsent.ID).Scan(&audCount); err != nil || audCount < 1 {
+		t.Fatalf("expected at least 1 audit event in DB, got %d (err: %v)", audCount, err)
+	}
+	if err := repo.Pool().QueryRow(ctx, "SELECT count(*) FROM consent_outbox_events WHERE tenant_id=$1 AND aggregate_id=$2", tenantID, createdConsent.ID).Scan(&outCount); err != nil || outCount < 1 {
+		t.Fatalf("expected at least 1 outbox event in DB, got %d (err: %v)", outCount, err)
+	}
+
+	// 8. Withdraw Consent via POST /v1/consents/{id}/withdraw
+	resp, bodyBytes = doHTTP(http.MethodPost, "/v1/consents/"+createdConsent.ID+"/withdraw", writerToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/consents/%s/withdraw failed: %d body=%s", createdConsent.ID, resp.StatusCode, string(bodyBytes))
+	}
+	var withdrawnConsent domain.Consent
+	if err := json.Unmarshal(bodyBytes, &withdrawnConsent); err != nil {
+		t.Fatalf("unmarshaling withdrawn consent failed: %v", err)
+	}
+	if withdrawnConsent.Status != domain.StatusWithdrawn {
+		t.Fatalf("expected status withdrawn, got %s", withdrawnConsent.Status)
+	}
+
+	// 9. Re-evaluate via HTTP: must now be rejected with reason=withdrawn
+	resp, bodyBytes = doHTTP(http.MethodPost, "/v1/evaluate", readerToken, evalPayload)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/evaluate after withdraw failed: %d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+	var afterDecision struct {
+		Allowed bool   `json:"allowed"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.Unmarshal(bodyBytes, &afterDecision); err != nil {
+		t.Fatalf("unmarshaling evaluate decision failed: %v", err)
+	}
+	if afterDecision.Allowed || afterDecision.Reason != "withdrawn" {
+		t.Fatalf("expected evaluate after withdrawal to be allowed=false, reason=withdrawn; got %+v", afterDecision)
+	}
+}
+
+func TestIntegration_PostgresPolicyTransactionsAndSingleUseConfirmation(t *testing.T) {
+	TestPostgresPolicyTransactionsAndSingleUseConfirmation(t)
+}
+
+func TestIntegration_PostgresLegacyUpgradeEvaluation(t *testing.T) {
+	TestPostgresLegacyUpgradeEvaluation(t)
 }

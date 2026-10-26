@@ -268,7 +268,7 @@ func IsAdministrativeRole(role string) bool {
 // allowing it to manage or revoke administrative suppressions.
 func HasAdminAuthority(role string) bool {
 	switch role {
-	case "privacy_admin", "consent_admin", "developer", "consent_writer":
+	case "privacy_admin", "consent_admin", "developer":
 		return true
 	default:
 		return false

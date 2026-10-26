@@ -141,6 +141,10 @@ func TestPostgresProtectedAdministrativeSuppression(t *testing.T) {
 	}
 }
 
+func TestIntegration_PostgresProtectedAdministrativeSuppression(t *testing.T) {
+	TestPostgresProtectedAdministrativeSuppression(t)
+}
+
 func TestMemoryProtectedAdministrativeSuppression(t *testing.T) {
 	repo := NewMemory()
 	ctx := context.Background()

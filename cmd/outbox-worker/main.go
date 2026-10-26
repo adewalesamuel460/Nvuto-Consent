@@ -378,15 +378,17 @@ func publish(ctx context.Context, js nats.JetStreamContext, prefix string, item 
 }
 
 // verifyStreamConfig verifies that an existing JetStream stream matches the
-// required configuration (subjects, storage type, replica count, and deduplication
-// window) to detect configuration drift (T-020).
+// required production contract (subjects, storage type, replica count, deduplication
+// window, and retention policy) to detect configuration drift (T-020 / AT-020).
 func verifyStreamConfig(cfg nats.StreamConfig, stream, expectedSubject string, replicas int) error {
-	expectedSubjects := []string{expectedSubject}
-	if len(cfg.Subjects) != len(expectedSubjects) || cfg.Subjects[0] != expectedSubjects[0] {
-		return fmt.Errorf("stream %q subjects mismatch: got %v, want %v", stream, cfg.Subjects, expectedSubjects)
-	}
 	if cfg.Storage != nats.FileStorage {
-		return fmt.Errorf("stream %q storage type mismatch: got %v, want %v", stream, cfg.Storage, nats.FileStorage)
+		return fmt.Errorf("stream %q storage type mismatch: got %v, want %v (FileStorage required)", stream, cfg.Storage, nats.FileStorage)
+	}
+	if cfg.Retention != nats.LimitsPolicy {
+		return fmt.Errorf("stream %q retention policy mismatch: got %v, want %v (LimitsPolicy required)", stream, cfg.Retention, nats.LimitsPolicy)
+	}
+	if replicas >= 3 && cfg.Replicas < 3 {
+		return fmt.Errorf("stream %q replica count mismatch: got %d, want at least 3", stream, cfg.Replicas)
 	}
 	if cfg.Replicas != replicas {
 		return fmt.Errorf("stream %q replica count mismatch: got %d, want %d", stream, cfg.Replicas, replicas)
@@ -394,27 +396,58 @@ func verifyStreamConfig(cfg nats.StreamConfig, stream, expectedSubject string, r
 	if cfg.Duplicates != jetStreamDuplicateWindow {
 		return fmt.Errorf("stream %q deduplication window mismatch: got %v, want %v", stream, cfg.Duplicates, jetStreamDuplicateWindow)
 	}
+	expectedSubjects := []string{expectedSubject}
+	if len(cfg.Subjects) != len(expectedSubjects) || cfg.Subjects[0] != expectedSubjects[0] {
+		return fmt.Errorf("stream %q subjects mismatch: got %v, want %v", stream, cfg.Subjects, expectedSubjects)
+	}
+	return nil
+}
+
+// validateStreamContract fetches the actual StreamInfo for the given stream and validates
+// that its storage, replicas, subjects, deduplication window, and retention policy strictly
+// match the approved production contract (T-020).
+// If configuration drift is detected, it logs an actionable error detailing the exact
+// mismatch and returns an error so that worker startup halts immediately.
+func validateStreamContract(logger *slog.Logger, js nats.JetStreamContext, stream, prefix string, replicas int) error {
+	expectedSubject := strings.TrimSuffix(strings.TrimSpace(prefix), ".") + ".>"
+	info, err := js.StreamInfo(stream)
+	if err != nil {
+		if errors.Is(err, nats.ErrStreamNotFound) {
+			_, err = js.AddStream(&nats.StreamConfig{
+				Name:       stream,
+				Subjects:   []string{expectedSubject},
+				Storage:    nats.FileStorage,
+				Retention:  nats.LimitsPolicy,
+				Duplicates: jetStreamDuplicateWindow,
+				Replicas:   replicas,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create NATS JetStream stream %q: %w", stream, err)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to retrieve NATS JetStream stream %q info: %w", stream, err)
+	}
+
+	if err := verifyStreamConfig(info.Config, stream, expectedSubject, replicas); err != nil {
+		if logger != nil {
+			logger.Error("nats_stream_configuration_drift_detected",
+				slog.String("stream", stream),
+				slog.String("expected_subject", expectedSubject),
+				slog.Int("expected_replicas", replicas),
+				slog.Duration("expected_duplicates", jetStreamDuplicateWindow),
+				slog.String("expected_storage", "FileStorage"),
+				slog.String("remediation", "reconcile NATS stream via Terraform/IaC; worker will not mutate shared broker state"),
+				slog.String("error", err.Error()),
+			)
+		}
+		return err
+	}
 	return nil
 }
 
 func ensureStream(js nats.JetStreamContext, stream, prefix string, replicas int) error {
-	expectedSubject := strings.TrimSuffix(prefix, ".") + ".>"
-	info, err := js.StreamInfo(stream)
-	if err == nil {
-		return verifyStreamConfig(info.Config, stream, expectedSubject, replicas)
-	}
-	if !errors.Is(err, nats.ErrStreamNotFound) {
-		return err
-	}
-	_, err = js.AddStream(&nats.StreamConfig{
-		Name:       stream,
-		Subjects:   []string{expectedSubject},
-		Storage:    nats.FileStorage,
-		Retention:  nats.LimitsPolicy,
-		Duplicates: jetStreamDuplicateWindow,
-		Replicas:   replicas,
-	})
-	return err
+	return validateStreamContract(nil, js, stream, prefix, replicas)
 }
 
 func durationEnv(name string, fallback, lowest, highest time.Duration) (time.Duration, error) {
@@ -631,6 +664,10 @@ func main() {
 		}
 		replicas = parsed
 	}
+	isDevMode := !isProduction && (env == "development" || env == "dev" || env == "test" || allowDev)
+	if !isDevMode && replicas < 3 {
+		fatal("NATS_REPLICAS must be at least 3 in production (unless in local dev mode with ALLOW_DEV_MODE=true)", nil)
+	}
 	// The grace must stay below the pod's terminationGracePeriodSeconds.
 	shutdownGrace, err := durationEnv("OUTBOX_SHUTDOWN_GRACE", defaultShutdownGrace, time.Second, 5*time.Minute)
 	if err != nil {
@@ -677,8 +714,8 @@ func main() {
 	if err != nil {
 		fatal("jetstream context failed", err)
 	}
-	if err := ensureStream(js, stream, prefix, replicas); err != nil {
-		fatal("ensure stream failed", err)
+	if err := validateStreamContract(logger, js, stream, prefix, replicas); err != nil {
+		fatal("NATS JetStream stream configuration contract violation; halting worker startup", err)
 	}
 
 	healthPort := strings.TrimSpace(os.Getenv("HEALTH_PORT"))

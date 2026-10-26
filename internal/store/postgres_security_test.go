@@ -337,10 +337,10 @@ func TestAT029_PostgresAuditImmutabilityTriggerAndRoleRBAC(t *testing.T) {
 	// Insert an initial audit event
 	_, err = pool.Exec(ctx, `
 		INSERT INTO consent_audit_events (
-			id, tenant_id, actor_id, event_type, resource_type, resource_id,
-			revision, before_state, after_state, correlation_id, reason, created_at
+			id, tenant_id, actor_id, action, consent_id, resource_type, resource_id,
+			revision, before_state, after_state, correlation_id, reason, occurred_at
 		) VALUES (
-			$1, $2, 'actor-admin', 'created', 'suppression', 'test-subj:global:*',
+			$1, $2, 'actor-admin', 'created', 'con-init', 'suppression', 'test-subj:global:*',
 			1, '{}'::jsonb, '{"active":true}'::jsonb, 'corr-init', 'initial audit', now()
 		)
 	`, testEventID, testTenantID)
@@ -353,7 +353,7 @@ func TestAT029_PostgresAuditImmutabilityTriggerAndRoleRBAC(t *testing.T) {
 		if updateErr == nil {
 			t.Fatal("expected immutability trigger to block UPDATE on consent_audit_events, got nil")
 		}
-		if !strings.Contains(updateErr.Error(), "append-only") && !strings.Contains(updateErr.Error(), "reject_consent_audit_mutation") {
+		if !strings.Contains(updateErr.Error(), "append-only") && !strings.Contains(updateErr.Error(), "reject_consent_audit_mutation") && !strings.Contains(updateErr.Error(), "immutable") {
 			t.Fatalf("unexpected error message on UPDATE: %v", updateErr)
 		}
 		t.Logf("PASS: immutability trigger successfully rejected UPDATE: %v", updateErr)
@@ -364,7 +364,7 @@ func TestAT029_PostgresAuditImmutabilityTriggerAndRoleRBAC(t *testing.T) {
 		if deleteErr == nil {
 			t.Fatal("expected immutability trigger to block DELETE on consent_audit_events, got nil")
 		}
-		if !strings.Contains(deleteErr.Error(), "append-only") && !strings.Contains(deleteErr.Error(), "reject_consent_audit_mutation") {
+		if !strings.Contains(deleteErr.Error(), "append-only") && !strings.Contains(deleteErr.Error(), "reject_consent_audit_mutation") && !strings.Contains(deleteErr.Error(), "immutable") {
 			t.Fatalf("unexpected error message on DELETE: %v", deleteErr)
 		}
 		t.Logf("PASS: immutability trigger successfully rejected DELETE: %v", deleteErr)
@@ -400,8 +400,8 @@ func TestAT029_PostgresAuditImmutabilityTriggerAndRoleRBAC(t *testing.T) {
 		}
 
 		_, insertErr := tx.Exec(ctx, `
-			INSERT INTO consent_audit_events (id, tenant_id, actor_id, event_type, resource_type, resource_id, revision)
-			VALUES ('worker-test-aud', $1, 'worker', 'created', 'consent', 'res-1', 1)
+			INSERT INTO consent_audit_events (id, tenant_id, actor_id, action, consent_id, resource_type, resource_id, revision)
+			VALUES ('worker-test-aud', $1, 'worker', 'created', 'con-1', 'consent', 'res-1', 1)
 		`, testTenantID)
 		if insertErr == nil {
 			t.Fatal("expected permission denied when consent_worker_role attempts INSERT into consent_audit_events, got nil")

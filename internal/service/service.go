@@ -488,6 +488,9 @@ func governedRecords(in governedInput, now time.Time, purpose domain.Purpose, no
 		},
 		OccurredAt: now,
 	}
+	if in.ExpiresAt != nil {
+		outbox.Payload["expires_at"] = in.ExpiresAt
+	}
 	return consent, receipt, audit, outbox, nil
 }
 
@@ -659,6 +662,11 @@ func (s *Service) SetSuppression(ctx context.Context, tenantID, actorID string, 
 		OccurredAt: now,
 	}
 	return s.repo.SetSuppression(ctx, suppression, audit, outbox)
+}
+
+// FindSuppression queries an active suppression matching the given subject, purpose, and channel.
+func (s *Service) FindSuppression(ctx context.Context, tenantID, subjectID, purpose, channel string) (domain.Suppression, error) {
+	return s.repo.FindSuppression(ctx, tenantID, subjectID, purpose, channel)
 }
 
 // BatchEvaluate evaluates up to 100 requests. It stops at the first error,
@@ -884,6 +892,9 @@ func (s *Service) ConfirmDoubleOptIn(ctx context.Context, tenantID, actorID stri
 				"receipt_id":            receipt.ID,
 			},
 			OccurredAt: at,
+		}
+		if locked.ExpiresAt != nil {
+			outbox.Payload["expires_at"] = locked.ExpiresAt
 		}
 		return receipt, audit, outbox, nil
 	}

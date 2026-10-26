@@ -74,10 +74,17 @@ jobs:
 
   yugabytedb-functional:
     runs-on: ubuntu-latest
+    services:
+      nats:
+        image: nats:2.10-alpine
+        ports:
+          - 4222:4222
+        options: -js
     env:
       YUGABYTEDB_CONTAINER: nvuto-consent-yugabyte
       DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
       TEST_DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
+      NATS_URL: nats://127.0.0.1:4222
       TEST_NATS_URL: nats://127.0.0.1:4222
       UPGRADE_DATABASE_URL: postgres://yugabyte@localhost:5433/consent_upgrade?sslmode=disable
       ALLOW_MEMORY_STORE: "false"
@@ -165,7 +172,6 @@ jobs:
       - name: Prove HA-safe fenced JetStream outbox publication on YugabyteDB
         run: |
           set -o pipefail
-          docker run --rm -d --name consent-ci-nats -p 4222:4222 nats:2.10-alpine -js
           for i in {1..30}; do
             nc -z 127.0.0.1 4222 && break
             sleep 1
@@ -174,6 +180,11 @@ jobs:
             | tee test-results/outbox-worker.jsonl
           python3 scripts/ci/assert-go-test-json.py test-results/outbox-worker.jsonl \
             TestPostgresJetStreamOutboxConcurrency=1
+      - name: Prove unskipped external integration tests on live YugabyteDB and NATS (T-016 / AT-016)
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./cmd/server/... ./internal/store/... ./cmd/outbox-worker/... -run Integration \
+            | tee test-results/integration.log
       - name: Build API
         run: go build -o /tmp/consent ./cmd/server
       - name: Start API against YugabyteDB

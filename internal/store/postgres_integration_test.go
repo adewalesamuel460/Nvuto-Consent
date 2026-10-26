@@ -409,3 +409,15 @@ func TestAT012_SerializationRetryWithoutDuplicates(t *testing.T) {
 		}
 	})
 }
+
+func TestIntegration_AT012_BoundedConnectionPool(t *testing.T) {
+	TestAT012_BoundedConnectionPool(t)
+}
+
+func TestIntegration_AT012_ContextCancellationAbortsPostgresQuery(t *testing.T) {
+	TestAT012_ContextCancellationAbortsPostgresQuery(t)
+}
+
+func TestIntegration_AT012_SerializationRetryWithoutDuplicates(t *testing.T) {
+	TestAT012_SerializationRetryWithoutDuplicates(t)
+}

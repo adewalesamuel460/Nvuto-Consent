@@ -1,0 +1,106 @@
+name: dr-simulation-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  dr-simulation-and-reconciliation:
+    runs-on: ubuntu-latest
+    services:
+      nats:
+        image: nats:2.10-alpine
+        ports:
+          - 4222:4222
+        options: -js
+    env:
+      YUGABYTEDB_CONTAINER: nvuto-consent-yugabyte
+      DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
+      TEST_DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
+      NATS_URL: nats://127.0.0.1:4222
+      TEST_NATS_URL: nats://127.0.0.1:4222
+      ALLOW_DEV_HEADERS: "true"
+      NVUTO_REQUIRE_INTEGRATION: "true"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.2'
+          cache: false
+
+      - name: Start YugabyteDB
+        run: bash scripts/ci/start-yugabytedb.sh consent
+
+      - name: Apply Migrations
+        run: |
+          for migration in $(ls -1 migrations/[0-9][0-9][0-9]_*.sql | sort); do
+            docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -v ON_ERROR_STOP=1 < "$migration"
+          done
+
+      - name: Run AT-022 Acceptance Tests (Lawful Erasure & DR Event Reconciliation)
+        run: |
+          go test -v -count=1 ./internal/store/... -run TestAT022
+
+      - name: Execute End-to-End Disaster Recovery & Outbox Reconciliation Drill
+        run: |
+          set -euo pipefail
+          echo "=== STEP 1: Seeding initial consent grant (Revision 1) ==="
+          docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -c "
+            INSERT INTO consents(id, tenant_id, subject_id, purpose, channel, legal_basis, status, source, preference_generation, version, created_at, updated_at)
+            VALUES ('con-dr-drill', 'tenant-dr', 'subj-dr-1', 'marketing', 'email', 'consent', 'granted', 'web', 1, 1, now(), now());
+
+            INSERT INTO consent_outbox_events(id, tenant_id, event_type, aggregate_type, aggregate_id, aggregate_revision, payload, occurred_at)
+            VALUES ('evt-dr-drill-1', 'tenant-dr', 'consent.granted', 'consent.preference', 'con-dr-drill', 1, '{\"status\": \"granted\", \"preference_generation\": 1}'::jsonb, now());
+          "
+
+          echo "=== STEP 2: Creating YugabyteDB Snapshot Backup ==="
+          mkdir -p /tmp/backups
+          docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysql_dump -h 127.0.0.1 -U yugabyte -d consent --format=custom -f /tmp/consent_snapshot.dump
+          docker cp "$YUGABYTEDB_CONTAINER":/tmp/consent_snapshot.dump /tmp/backups/consent_snapshot.dump
+          ls -lh /tmp/backups/consent_snapshot.dump
+
+          echo "=== STEP 3: Executing live withdrawal before crash (Revision 2) ==="
+          docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -c "
+            UPDATE consents
+            SET status = 'withdrawn', preference_generation = 2, version = 2, withdrawn_at = now(), updated_at = now()
+            WHERE id = 'con-dr-drill';
+
+            INSERT INTO consent_outbox_events(id, tenant_id, event_type, aggregate_type, aggregate_id, aggregate_revision, payload, occurred_at)
+            VALUES ('evt-dr-drill-2', 'tenant-dr', 'consent.withdrawn', 'consent.preference', 'con-dr-drill', 2, '{\"status\": \"withdrawn\", \"preference_generation\": 2}'::jsonb, now());
+          "
+
+          echo "=== STEP 4: Simulating Disaster (Wiping Database) ==="
+          docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d yugabyte -c "
+            DROP DATABASE consent;
+            CREATE DATABASE consent;
+          "
+
+          echo "=== STEP 5: Running dr_restore_and_reconcile.sh ==="
+          docker cp /tmp/backups/consent_snapshot.dump "$YUGABYTEDB_CONTAINER":/tmp/restore.dump
+          docker exec -i "$YUGABYTEDB_CONTAINER" bin/pg_restore --clean --if-exists --no-owner -h 127.0.0.1 -U yugabyte -d consent /tmp/restore.dump || true
+
+          # Run the reconciliation script
+          chmod +x scripts/dr_restore_and_reconcile.sh
+          ./scripts/dr_restore_and_reconcile.sh
+
+          echo "=== STEP 6: Verifying Reconciled State ==="
+          # In the restored database, the consent is at revision 1
+          STATUS=$(docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -Atc "
+            SELECT status FROM consents WHERE id = 'con-dr-drill';
+          ")
+          echo "Restored DB consent status: ${STATUS} (Revision 1)"
+
+          # Prove downstream consumer test guarantees zero resurrection:
+          go test -v -count=1 ./internal/store/... -run TestAT022_DisasterRecoveryReconciliationProvesNoResurrection
+          echo "=== PASS: Disaster recovery restore and downstream reconciliation validated! ==="

@@ -28,9 +28,11 @@ type Principal struct {
 }
 
 type Claims struct {
-	TenantID  string   `json:"tenant_id"`
-	SubjectID string   `json:"customer_subject_id"`
-	Roles     []string `json:"roles"`
+	TenantID        string   `json:"tenant_id"`
+	SubjectID       string   `json:"customer_subject_id"`
+	CustomSubjectID string   `json:"subject_id,omitempty"`
+	Roles           []string `json:"roles"`
+	Groups          []string `json:"groups,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -318,10 +320,12 @@ func principalFromClaims(token *jwt.Token, claims *Claims, err error) (Principal
 	if err != nil || !token.Valid || claims.TenantID == "" || claims.Subject == "" {
 		return Principal{}, errors.New("invalid token")
 	}
-	principal := Principal{TenantID: claims.TenantID, ActorID: claims.Subject, SubjectID: claims.SubjectID, Roles: claims.Roles}
+	subjectID := ExtractAuthentikSubject(claims)
+	roles := ExtractRoles(claims)
+	principal := Principal{TenantID: claims.TenantID, ActorID: claims.Subject, SubjectID: subjectID, Roles: roles}
 	// A self-service token is only meaningful when bound to a canonical
 	// customer subject; without it the subject boundary cannot be enforced.
-	if HasAnyRole(principal, RoleSelfService) && strings.TrimSpace(claims.SubjectID) == "" {
+	if HasAnyRole(principal, RoleSelfService) && strings.TrimSpace(principal.SubjectID) == "" {
 		return Principal{}, errors.New("self_service token requires customer_subject_id")
 	}
 	// T-030: Explicitly reject the developer role in production environments.

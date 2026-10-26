@@ -23,6 +23,9 @@ deploy/overlays/*/secrets.env
 deploy/overlays/*/nats.creds
 *.env
 !*.env.example
+
+# Build and test temporary directory
+build-tmp/
 !deploy/overlays/*/config.env
 *.creds
 !*.creds.example

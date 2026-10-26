@@ -154,3 +154,7 @@ func TestPostgresOutboxLeaseFencing(t *testing.T) {
 		t.Fatalf("published rows must never hold a claim token: %d %v", tokenOnPublished, err)
 	}
 }
+
+func TestIntegration_PostgresOutboxLeaseFencing(t *testing.T) {
+	TestPostgresOutboxLeaseFencing(t)
+}

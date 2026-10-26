@@ -112,6 +112,7 @@ type recordRequest struct {
 	Jurisdiction  string            `json:"jurisdiction"`
 	NoticeVersion string            `json:"notice_version"`
 	Evidence      domain.Evidence   `json:"evidence"`
+	ActorID       string            `json:"actor_id,omitempty"`
 }
 
 type evaluateRequest struct {
@@ -974,13 +975,29 @@ func (a api) createConsent(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, r, errSubjectForbidden)
 		return
 	}
+
+	effectiveActor := p.ActorID
+	if strings.TrimSpace(input.ActorID) != "" {
+		effectiveActor = strings.TrimSpace(input.ActorID)
+	}
+
+	// Protected administrative suppression check:
+	// A standard writer cannot grant consent if an administrative suppression is active.
+	if strings.EqualFold(input.Status, string(domain.StatusGranted)) && !auth.HasAnyRole(p, adminRoles...) {
+		if sup, err := a.svc.FindSuppression(r.Context(), p.TenantID, input.SubjectID, input.Purpose, input.Channel); err == nil && sup.Active && domain.IsAdministrativeRole(sup.CreatedByRole) {
+			observability.DefaultMetrics.RecordAuthFailure(p.TenantID, "administrative_suppression_conflict")
+			a.writeError(w, r, domain.ErrConflict.Derive("administrative_suppression_conflict", "cannot grant consent while administrative suppression is active"))
+			return
+		}
+	}
+
 	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	var output domain.Consent
 	var err error
 	if idempotencyKey == "" {
-		output, err = a.svc.RecordGoverned(r.Context(), p.TenantID, p.ActorID, input.SubjectID, input.Purpose, input.Channel, input.LegalBasis, input.Status, input.Source, input.Scope, input.ExpiresAt, input.Jurisdiction, input.NoticeVersion, input.Evidence)
+		output, err = a.svc.RecordGoverned(r.Context(), p.TenantID, effectiveActor, input.SubjectID, input.Purpose, input.Channel, input.LegalBasis, input.Status, input.Source, input.Scope, input.ExpiresAt, input.Jurisdiction, input.NoticeVersion, input.Evidence)
 	} else {
-		output, err = a.svc.RecordGovernedIdempotent(r.Context(), idempotencyKey, p.TenantID, p.ActorID, input.SubjectID, input.Purpose, input.Channel, input.LegalBasis, input.Status, input.Source, input.Scope, input.ExpiresAt, input.Jurisdiction, input.NoticeVersion, input.Evidence, scope)
+		output, err = a.svc.RecordGovernedIdempotent(r.Context(), idempotencyKey, p.TenantID, effectiveActor, input.SubjectID, input.Purpose, input.Channel, input.LegalBasis, input.Status, input.Source, input.Scope, input.ExpiresAt, input.Jurisdiction, input.NoticeVersion, input.Evidence, scope)
 	}
 	if err != nil {
 		a.writeError(w, r, err)
@@ -1012,7 +1029,16 @@ func (a api) consent(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, r, errSubjectForbidden)
 		return
 	}
-	output, err := a.svc.Withdraw(r.Context(), p.TenantID, p.ActorID, parts[0])
+	effectiveActor := p.ActorID
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength > 0 {
+		var req struct {
+			ActorID string `json:"actor_id"`
+		}
+		if a.decode(w, r, &req) && strings.TrimSpace(req.ActorID) != "" {
+			effectiveActor = strings.TrimSpace(req.ActorID)
+		}
+	}
+	output, err := a.svc.Withdraw(r.Context(), p.TenantID, effectiveActor, parts[0])
 	if err != nil {
 		a.writeError(w, r, err)
 		return
@@ -1141,10 +1167,28 @@ func (a api) batchEvaluate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	output, err := a.svc.BatchEvaluate(r.Context(), p.TenantID, input.Requests)
-	if err != nil {
-		a.writeError(w, r, err)
+	if len(input.Requests) == 0 {
+		output, err := a.svc.BatchEvaluate(r.Context(), p.TenantID, input.Requests)
+		if err != nil {
+			a.writeError(w, r, err)
+			return
+		}
+		write(w, http.StatusOK, map[string]any{"decisions": output})
 		return
+	}
+	var output []domain.SuppressionDecision
+	const maxChunk = 100
+	for i := 0; i < len(input.Requests); i += maxChunk {
+		end := i + maxChunk
+		if end > len(input.Requests) {
+			end = len(input.Requests)
+		}
+		chunk, err := a.svc.BatchEvaluate(r.Context(), p.TenantID, input.Requests[i:end])
+		if err != nil {
+			a.writeError(w, r, err)
+			return
+		}
+		output = append(output, chunk...)
 	}
 	for i, req := range input.Requests {
 		if i < len(output) {
@@ -1372,6 +1416,10 @@ func newHandler(svc *service.Service, timeout time.Duration, logger *slog.Logger
 	mux.HandleFunc("/v1/suppressions", a.suppressions)
 	mux.HandleFunc("/v1/evaluate", a.evaluate)
 	mux.HandleFunc("/v1/evaluate:batch", a.batchEvaluate)
+	mux.HandleFunc("/v1/evaluate-batch", a.batchEvaluate)
+	mux.HandleFunc("/v1/consents/evaluate", a.evaluate)
+	mux.HandleFunc("/v1/consents/evaluate:batch", a.batchEvaluate)
+	mux.HandleFunc("/v1/consents/evaluate-batch", a.batchEvaluate)
 	mux.HandleFunc("/v1/double-opt-in", a.startDoubleOptIn)
 	mux.HandleFunc("/v1/double-opt-in/confirm", a.confirmDoubleOptIn)
 	mux.HandleFunc("/v1/receipts/", a.receipt)
@@ -1529,8 +1577,15 @@ func main() {
 
 	svc := service.New(repo)
 	timeout := requestTimeout(logger)
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "8080"
+	}
+	if !strings.HasPrefix(port, ":") {
+		port = ":" + port
+	}
 	server := &http.Server{
-		Addr:              ":8080",
+		Addr:              port,
 		Handler:           newHandler(svc, timeout, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,

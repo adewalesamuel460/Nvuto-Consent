@@ -26,7 +26,7 @@ func installPolicyFixture(t *testing.T, svc *Service, tenant string) {
 	if _, err := svc.RegisterLawfulBasis(context.Background(), tenant, "admin", domain.LawfulBasis{Code: "contract", AllowedCategories: []string{"service"}, Active: true}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.PublishNotice(context.Background(), tenant, "admin", domain.PrivacyNotice{Version: "2026-08", Jurisdiction: "NG", PublishedAt: time.Now().UTC(), Active: true}); err != nil {
+	if _, err := svc.PublishNotice(context.Background(), tenant, "admin", domain.PrivacyNotice{Version: "2026-08", Jurisdiction: "NG", PublishedAt: time.Now().UTC().Add(-time.Hour), Active: true}); err != nil {
 		t.Fatal(err)
 	}
 }

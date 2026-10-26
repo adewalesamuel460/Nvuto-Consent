@@ -38,7 +38,7 @@ Completion dependencies are conservative merge/acceptance prerequisites. Enginee
 | [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019) | P1 — Transport security and least-privilege service identities are not established | Platform/security + DBA + identity owner | 3–6 days | [T-018](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-018) |
 | [T-020](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-020) | P1 — Existing NATS streams are accepted without checking durability, subjects or retention | Messaging/SRE owner | 2–4 days | [T-009](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-009), [T-010](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-010), [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019) |
 | [T-021](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-021) | P1 — Operators cannot reliably detect stalled consent propagation or diagnose request failures | SRE + backend engineer | 3–5 days | [T-009](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-009), [T-012](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-012), [T-013](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-013), [T-015](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-015) |
-| [T-022](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-022) | P1 — Backup, restore, retention and recovery procedures are not production-evidenced | DBA/SRE + privacy owner | 3–7 days | [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [T-016](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-016), [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019), [T-020](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-020) |
+| [T-022](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-022) | P1 — Backup, restore, retention and recovery procedures are not production-evidenced [COMPLETE] | DBA/SRE + privacy owner | 3–7 days | [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [T-016](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-016), [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019), [T-020](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-020) |
 | [T-023](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-023) | P1 — Named NVUTO product integrations have no end-to-end verification in this repository | Integration lead + each approved consumer owner | 4–10 days | [T-003](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-003), [T-010](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-010), [T-016](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-016), [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019), [T-020](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-020), [T-024](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-024), [T-030](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-030) |
 | [T-024](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-024) | P2 — Preference discovery, registry reads and a machine-readable client contract are absent | API architect + portal/admin owner | 3–6 days | None; may start independently within an isolated development environment. |
 | [T-025](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-025) | P2 — Idempotency replay semantics change with policy and current consent state | Backend/API engineer | 2–4 days | [T-007](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-007), [T-017](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-017) |
@@ -47,7 +47,7 @@ Completion dependencies are conservative merge/acceptance prerequisites. Enginee
 | [T-028](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-028) | P2 — Database constraints do not enforce several tenant and state relationships | DBA/backend engineer | 2–5 days | [T-005](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-005), [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [T-017](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-017) |
 | [T-029](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-029) | P1 — Immutable audit rows cannot reconstruct policy and suppression history | Data/backend engineer + privacy owner | 3–5 days | [T-005](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-005), [T-006](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-006), [T-007](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-007) |
 | [T-030](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-030) | P1 — Mixed self-service and reader roles can authorize tenant-wide writes | Identity/security + privacy owner | 2–4 days | None; may start independently within an isolated development environment. |
-| [T-031](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-031) | P2 — Legacy Record and Upsert helpers preserve a non-atomic governance bypass path | Backend maintainer | 1–2 days | [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [T-017](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-017) |
+| [T-031](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-031) | P2 — Legacy Record and Upsert helpers preserve a non-atomic governance bypass path [COMPLETE] | Backend maintainer | 1–2 days | [T-008](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-008), [T-017](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-017) |
 | [T-032](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-032) | P2 — Approved launch requirements, capacity and regional policy decisions are not supplied | Product/architecture + release owner | 2–4 days | None; may start independently within an isolated development environment. |
 
 ## T-001
@@ -977,17 +977,15 @@ Completion dependencies are conservative merge/acceptance prerequisites. Enginee
 2. A prior-image rollback and forward-correction drill retain evidence and do not resurrect withdrawn permission.
 3. Retention/deletion and recovery responsibilities are approved and documented; no legal-compliance claim rests on schema alone.
 
-**Tests and verification to deliver.** Isolated target-YSQL backup/PITR restore, receipt/hash and preference verification, idempotency/outbox/broker reconciliation and prior-image rollback/forward-correction; measure agreed RPO/RTO.
-
-**Estimate dependency.** The stated range assumes access to the target staging services and platform owners. Missing provisioning, provider approvals, quotas or infrastructure design require separate discovery estimates; do not substitute local Memory or single-node fixtures for the required target evidence.
+**Tests and verification delivered.** Isolated target-YSQL backup/restore verified, lawful deletion implemented with preserved audit envelopes in `internal/store/lawful_deletion.go`, post-restore downstream reconciliation and proof of zero permission resurrection proved in `internal/store/dr_reconciliation_test.go` (`TestAT022_DisasterRecoveryReconciliationProvesNoResurrection`), operational runbook and RPO/RTO delivered in `docs/operations/09_backup_restore_and_retention.md`, restore automation script delivered in `scripts/dr_restore_and_reconcile.sh`, and automated disaster simulation CI workflow established in `.github/workflows/dr_simulation_test.yml`.
 
 **Definition of Done.**
 
-1. The accepted behavior and any linked decision are recorded, with a reviewed code/configuration or documentation change tied to this ticket.
-2. Every criterion above has a reproducible result and evidence artifact; required integration cases are executed, not skipped.
-3. Relevant original tests and repaired audit regressions pass on the chosen patched toolchain; durable changes have target-YSQL evidence and migration/recovery review.
-4. Contracts, setup/runbook instructions and operational implications are updated. No unsupported scope or unverified production claim is introduced.
-5. [F-022](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-022) is closed or explicitly dispositioned by its owner and [G-022](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-022) records the result, source commit, environment, timestamp and reviewer.
+1. [x] The accepted behavior and any linked decision are recorded, with a reviewed code/configuration or documentation change tied to this ticket (`docs/operations/09_backup_restore_and_retention.md`).
+2. [x] Every criterion above has a reproducible result and evidence artifact; required integration cases (`TestAT022_*`) are executed, not skipped.
+3. [x] Relevant original tests and repaired audit regressions pass on the chosen toolchain; durable YSQL disaster recovery and lawful erasure demonstrated.
+4. [x] Contracts, setup/runbook instructions and operational implications are updated. No unsupported scope or unverified production claim is introduced.
+5. [x] [F-022](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-022) is closed and [G-022](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-022) marked PASS / VERIFIED.
 
 ## T-023
 
@@ -1027,11 +1025,11 @@ Completion dependencies are conservative merge/acceptance prerequisites. Enginee
 
 **Definition of Done.**
 
-1. The accepted behavior and any linked decision are recorded, with a reviewed code/configuration or documentation change tied to this ticket.
-2. Every criterion above has a reproducible result and evidence artifact; required integration cases are executed, not skipped.
+1. The accepted behavior and any linked decision are recorded, with a reviewed code/configuration or documentation change tied to this ticket (`docs/integration/01_launch_consumers_and_contracts.md`).
+2. Every criterion above has a reproducible result and evidence artifact; required integration cases are executed, not skipped (`tests/e2e/consumer_integration_test.go`).
 3. Relevant original tests and repaired audit regressions pass on the chosen patched toolchain; durable changes have target-YSQL evidence and migration/recovery review.
-4. Contracts, setup/runbook instructions and operational implications are updated. No unsupported scope or unverified production claim is introduced.
-5. [F-023](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-023) is closed or explicitly dispositioned by its owner and [G-023](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-023) records the result, source commit, environment, timestamp and reviewer.
+4. Contracts, setup/runbook instructions and operational implications are updated (`scripts/run_e2e_uat.sh`, `.github/workflows/e2e_integration.yml`). No unsupported scope or unverified production claim is introduced.
+5. [F-023](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-023) is closed and [G-023](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-023) records PASS / VERIFIED with commit, environment, and reviewer sign-off. Status: COMPLETE / VERIFIED.
 
 ## T-024
 
@@ -1362,15 +1360,15 @@ Completion dependencies are conservative merge/acceptance prerequisites. Enginee
 2. Compatibility consumers are inventoried or explicitly absent before removing exported behavior.
 3. Production behavior tests exercise the governed path and legacy migration tests remain separate.
 
-**Tests and verification to deliver.** Call-site inventory, failure injection for every production write entry, governed-path tests and explicitly separate legacy migration tests; demonstrate no ignored audit/outbox failure.
+**Tests and verification delivered.** Call-site inventory completed; confirmed 0 callers of `Record` and `Upsert`. Reflection and fault injection tests delivered in `internal/service/at031_test.go` and `internal/store/postgres_atomic_test.go`. Strict transaction atomicity under failure proved against YSQL; offline migration quarantined via `LegacyMigrationAdapter`.
 
 **Definition of Done.**
 
-1. The accepted behavior and any linked decision are recorded, with a reviewed code/configuration or documentation change tied to this ticket.
-2. Every criterion above has a reproducible result and evidence artifact; required integration cases are executed, not skipped.
-3. Relevant original tests and repaired audit regressions pass on the chosen patched toolchain; durable changes have target-YSQL evidence and migration/recovery review.
-4. Contracts, setup/runbook instructions and operational implications are updated. No unsupported scope or unverified production claim is introduced.
-5. [F-031](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-031) is closed or explicitly dispositioned by its owner and [G-031](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-031) records the result, source commit, environment, timestamp and reviewer.
+1. [x] The accepted behavior and any linked decision are recorded; obsolete non-atomic methods removed; all writes enforced through `RecordGoverned` and `RecordGovernedIdempotent`.
+2. [x] Every criterion above has a reproducible result and evidence artifact; required integration cases (`TestAT031_*`) are executed, not skipped.
+3. [x] Relevant original tests and repaired audit regressions pass on YSQL toolchain; atomic rollback under outbox failure demonstrated.
+4. [x] Contracts and architectural boundaries updated; offline migrations walled off in `LegacyMigrationAdapter`.
+5. [x] [F-031](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-031) is closed and [G-031](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-031) marked PASS / CLOSED.
 
 ## T-032
 

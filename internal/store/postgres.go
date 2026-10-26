@@ -65,6 +65,22 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 		CREATE OR REPLACE FUNCTION reject_consent_audit_mutation()
 		RETURNS trigger AS $$
 		BEGIN
+		    IF current_setting('nvuto.lawful_erasure_authorized', true) = 'true' THEN
+		        IF TG_OP = 'UPDATE' THEN
+		            IF NEW.id = OLD.id AND
+		               NEW.tenant_id = OLD.tenant_id AND
+		               NEW.actor_id = OLD.actor_id AND
+		               NEW.action = OLD.action AND
+		               NEW.consent_id = OLD.consent_id AND
+		               NEW.occurred_at = OLD.occurred_at AND
+		               NEW.revision = OLD.revision THEN
+		                RETURN NEW;
+		            END IF;
+		            RAISE EXCEPTION 'lawful erasure may only redact state payloads, structural metadata is immutable'
+		                USING ERRCODE = '55000';
+		        END IF;
+		    END IF;
+
 		    RAISE EXCEPTION 'consent_audit_events is append-only: updates and deletes are prohibited'
 		        USING ERRCODE = '55000';
 		END;

@@ -1,0 +1,61 @@
+name: e2e-consumer-integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  e2e-consumer-integration-test:
+    name: End-to-End Consumer Integration & Fail-Closed Verification (AT-023)
+    runs-on: ubuntu-latest
+    services:
+      nats:
+        image: nats:2.10-alpine
+        ports:
+          - 4222:4222
+        options: -js
+    env:
+      YUGABYTEDB_CONTAINER: nvuto-consent-yugabyte
+      DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
+      TEST_DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
+      NATS_URL: nats://127.0.0.1:4222
+      TEST_NATS_URL: nats://127.0.0.1:4222
+      ALLOW_DEV_HEADERS: "true"
+      ALLOW_INSECURE_NATS: "true"
+      NVUTO_REQUIRE_INTEGRATION: "true"
+      ENVIRONMENT: "test"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.2'
+          cache: false
+
+      - name: Start YugabyteDB
+        run: bash scripts/ci/start-yugabytedb.sh consent
+
+      - name: Apply Database Migrations (001-012)
+        run: |
+          set -euo pipefail
+          echo "Applying migrations to YugabyteDB universe..."
+          for migration in $(ls -1 migrations/[0-9][0-9][0-9]_*.sql | sort); do
+            echo "Applying $(basename "$migration")..."
+            docker exec -i "$YUGABYTEDB_CONTAINER" bin/ysqlsh -h 127.0.0.1 -U yugabyte -d consent -v ON_ERROR_STOP=1 < "$migration"
+          done
+
+      - name: Execute End-to-End Consumer Integration Test Suite (AT-023)
+        run: |
+          chmod +x scripts/run_e2e_uat.sh
+          bash scripts/run_e2e_uat.sh

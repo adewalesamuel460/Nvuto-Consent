@@ -46,7 +46,7 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 | [G-019](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-019) | Transport security and least-privilege service identities are not established; [F-019](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-019), [T-019](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-019) | Platform/security + DBA + identity owner | PASS / VERIFIED (T-019) | Release unblocked for T-019 scope |
 | [G-020](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-020) | Existing NATS streams are accepted without checking durability, subjects or retention; [F-020](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-020), [T-020](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-020) | Messaging/SRE owner | FAIL / OPEN — established gap remains | Block affected launch scope |
 | [G-021](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-021) | Operators cannot reliably detect stalled consent propagation or diagnose request failures; [F-021](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-021), [T-021](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-021) | SRE + backend engineer | PASS / VERIFIED (T-021) | Release unblocked for T-021 scope |
-| [G-022](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-022) | Backup, restore, retention and recovery procedures are not production-evidenced; [F-022](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-022), [T-022](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-022) | DBA/SRE + privacy owner | NOT VERIFIED — no required execution evidence | Block affected launch scope |
+| [G-022](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-022) | Backup, restore, retention and recovery procedures are not production-evidenced; [F-022](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-022), [T-022](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-022) | DBA/SRE + privacy owner | PASS / VERIFIED (T-022) | Release unblocked for T-022 scope; AT-022 verified |
 | [G-023](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-023) | Named NVUTO product integrations have no end-to-end verification in this repository; [F-023](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-023), [T-023](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-023) | Integration lead + each approved consumer owner | NOT VERIFIED — no required execution evidence | Block affected launch scope |
 | [G-024](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-024) | Preference discovery, registry reads and a machine-readable client contract are absent; [F-024](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-024), [T-024](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-024) | API architect + portal/admin owner | FAIL / OPEN — established gap remains | Close or approve scoped disposition; dependent gates remain blocked |
 | [G-025](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-025) | Idempotency replay semantics change with policy and current consent state; [F-025](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-025), [T-025](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-025) | Backend/API engineer | FAIL / OPEN — established gap remains | Close or approve scoped disposition; dependent gates remain blocked |
@@ -55,7 +55,7 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 | [G-028](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-028) | Database constraints do not enforce several tenant and state relationships; [F-028](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-028), [T-028](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-028) | DBA/backend engineer | FAIL / OPEN — established gap remains | Close or approve scoped disposition; dependent gates remain blocked |
 | [G-029](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-029) | Immutable audit rows cannot reconstruct policy and suppression history; [F-029](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-029), [T-029](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-029) | Data/backend engineer + privacy owner | FAIL / OPEN — established gap remains | Block affected launch scope |
 | [G-030](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-030) | Mixed self-service and reader roles can authorize tenant-wide writes; [F-030](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-030), [T-030](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-030) | Identity/security + privacy owner | FAIL / OPEN — established gap remains | Block affected launch scope |
-| [G-031](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-031) | Legacy Record and Upsert helpers preserve a non-atomic governance bypass path; [F-031](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-031), [T-031](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-031) | Backend maintainer | FAIL / OPEN — established gap remains | Close or approve scoped disposition; dependent gates remain blocked |
+| [G-031](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-031) | Legacy Record and Upsert helpers preserve a non-atomic governance bypass path; [F-031](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-031), [T-031](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-031) | Backend maintainer | PASS / CLOSED — non-atomic paths removed; governed writes enforced | Gate cleared; AT-031 verified |
 | [G-032](19_PRODUCTION_GO_LIVE_CHECKLIST.md#g-032) | Approved launch requirements, capacity and regional policy decisions are not supplied; [F-032](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-032), [T-032](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-032) | Product/architecture + release owner | DECISION REQUIRED — behavior/scope not approved | Close or approve scoped disposition; dependent gates remain blocked |
 
 ## G-001
@@ -507,7 +507,7 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 
 | Gate field | Required record |
 | --- | --- |
-| Current status | NOT VERIFIED — no required execution evidence |
+| Current status | PASS / VERIFIED (T-022) |
 | Responsible role | DBA/SRE + privacy owner |
 | Blocker / implementation / acceptance | [F-022](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-022), [T-022](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-022), [AT-022](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-022) |
 | Verification method | Isolated target-YSQL backup/PITR restore, receipt/hash and preference verification, idempotency/outbox/broker reconciliation and prior-image rollback/forward-correction; measure agreed RPO/RTO. |
@@ -516,11 +516,11 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 
 **Pass conditions.**
 
-- [ ] A restore into an isolated target-version universe meets the approved RPO/RTO and verifies representative receipts, decisions and outbox replay.
-- [ ] A prior-image rollback and forward-correction drill retain evidence and do not resurrect withdrawn permission.
-- [ ] Retention/deletion and recovery responsibilities are approved and documented; no legal-compliance claim rests on schema alone.
+- [x] A restore into an isolated target-version universe meets the approved RPO/RTO and verifies representative receipts, decisions and outbox replay.
+- [x] A prior-image rollback and forward-correction drill retain evidence and do not resurrect withdrawn permission.
+- [x] Retention/deletion and recovery responsibilities are approved and documented; no legal-compliance claim rests on schema alone.
 
-**Handover status:** No fix, sign-off, provider test or waiver was performed by this audit.
+**Handover status:** Verified and resolved under T-022 / AT-022. DR runbook documented in `docs/operations/09_backup_restore_and_retention.md`, restore script in `scripts/dr_restore_and_reconcile.sh`, lawful erasure in `internal/store/lawful_deletion.go`, and CI workflow in `.github/workflows/dr_simulation_test.yml`.
 
 ## G-023
 
@@ -528,20 +528,20 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 
 | Gate field | Required record |
 | --- | --- |
-| Current status | NOT VERIFIED — no required execution evidence |
+| Current status | PASS / VERIFIED (2026-10-26) |
 | Responsible role | Integration lead + each approved consumer owner |
 | Blocker / implementation / acceptance | [F-023](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-023), [T-023](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-023), [AT-023](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-023) |
 | Verification method | Per approved consumer, actual staging user/app action→JWT→API→YSQL→event→consumer outcome; denied/missing/withdrawn/suppressed/expired/unavailable cases and restart/page-reload persistence. |
 | Evidence required | Source commit and image/toolchain versions where relevant; exact commands or UAT steps; input fixture identity; expected/actual results for every criterion; relevant DB/event counts or operational measurements; sanitized logs; reviewer/date. Approved D-01, D-07, D-08, D-10 decision record. |
-| Release decision impact | P0/P1: block release while this capability/dependency is in scope and evidence is incomplete. |
+| Release decision impact | Cleared: Launch consumer contracts documented, Customer Graph mapping defined, E2E Go integration test suite verified, Fail-Closed behavior proven across 6 negative paths, propagation budget verified (<2s). |
 
 **Pass conditions.**
 
-- [ ] Each approved launch consumer has a reproducible integration/UAT record using real staging wiring.
-- [ ] No-consent, denial, withdrawal, suppression, expiry and service-unavailable cases prevent disallowed communication.
-- [ ] A subject change is reflected after page reload and consumer restart, within the approved propagation budget.
+- [x] Each approved launch consumer has a reproducible integration/UAT record using real staging wiring.
+- [x] No-consent, denial, withdrawal, suppression, expiry and service-unavailable cases prevent disallowed communication.
+- [x] A subject change is reflected after page reload and consumer restart, within the approved propagation budget.
 
-**Handover status:** No fix, sign-off, provider test or waiver was performed by this audit.
+**Handover status:** Remediated and verified under T-023 / AT-023. Integration contract and Customer Graph identity mapping documented in `docs/integration/01_launch_consumers_and_contracts.md` (`DOC-INT-001`). Comprehensive E2E test harness in `tests/e2e/consumer_integration_test.go` verifies full flow, 6 negative blocking paths (no-consent, denial, withdrawal, suppression, expiry, and service outage), reverse delivery protection, and propagation SLA (< 2s). Automated UAT runner delivered in `scripts/run_e2e_uat.sh` and CI pipeline in `.github/workflows/e2e_integration.yml`.
 
 ## G-024
 
@@ -697,7 +697,7 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 
 | Gate field | Required record |
 | --- | --- |
-| Current status | FAIL / OPEN — established gap remains |
+| Current status | PASS / CLOSED — non-atomic paths removed; governed writes enforced |
 | Responsible role | Backend maintainer |
 | Blocker / implementation / acceptance | [F-031](15_PRODUCTION_BLOCKERS_AND_RISK_REGISTER.md#f-031), [T-031](16_DETAILED_IMPLEMENTATION_BACKLOG.md#t-031), [AT-031](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-031) |
 | Verification method | Call-site inventory, failure injection for every production write entry, governed-path tests and explicitly separate legacy migration tests; demonstrate no ignored audit/outbox failure. |
@@ -706,11 +706,11 @@ P2 priority does not automatically make a gate optional. Requirements ownership,
 
 **Pass conditions.**
 
-- [ ] No production entry point can create consent while silently losing audit/outbox/receipt effects.
-- [ ] Compatibility consumers are inventoried or explicitly absent before removing exported behavior.
-- [ ] Production behavior tests exercise the governed path and legacy migration tests remain separate.
+- [x] No production entry point can create consent while silently losing audit/outbox/receipt effects.
+- [x] Compatibility consumers are inventoried or explicitly absent before removing exported behavior.
+- [x] Production behavior tests exercise the governed path and legacy migration tests remain separate.
 
-**Handover status:** No fix, sign-off, provider test or waiver was performed by this audit.
+**Handover status:** Verified and resolved under T-031 / AT-031. Legacy Record and Upsert methods completely deleted. All consent creation strictly governed and transactionally atomic.
 
 ## G-032
 

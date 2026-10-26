@@ -260,3 +260,11 @@ func TestPostgresJetStreamEnsureStreamDriftDetection(t *testing.T) {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 }
+
+func TestIntegration_PostgresJetStreamOutboxConcurrency(t *testing.T) {
+	TestPostgresJetStreamOutboxConcurrency(t)
+}
+
+func TestIntegration_PostgresJetStreamEnsureStreamDriftDetection(t *testing.T) {
+	TestPostgresJetStreamEnsureStreamDriftDetection(t)
+}

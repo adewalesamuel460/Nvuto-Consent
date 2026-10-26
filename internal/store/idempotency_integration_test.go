@@ -291,3 +291,7 @@ func assertTenantRowCounts(t *testing.T, repo *Postgres, tenant string, want int
 		}
 	}
 }
+
+func TestIntegration_PostgresGovernedIdempotencyConcurrentReplay(t *testing.T) {
+	TestPostgresGovernedIdempotencyConcurrentReplay(t)
+}
