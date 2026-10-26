@@ -16,12 +16,6 @@ jobs:
   e2e-consumer-integration-test:
     name: End-to-End Consumer Integration & Fail-Closed Verification (AT-023)
     runs-on: ubuntu-latest
-    services:
-      nats:
-        image: nats:2.10-alpine
-        ports:
-          - 4222:4222
-        options: -js
     env:
       YUGABYTEDB_CONTAINER: nvuto-consent-yugabyte
       DATABASE_URL: postgres://yugabyte@localhost:5433/consent?sslmode=disable
@@ -42,6 +36,14 @@ jobs:
         with:
           go-version: '1.27.2'
           cache: false
+
+      - name: Start NATS JetStream
+        run: |
+          docker run -d --name consent-ci-nats -p 4222:4222 nats:2.10-alpine -js
+          for i in {1..30}; do
+            nc -z 127.0.0.1 4222 && break
+            sleep 1
+          done
 
       - name: Start YugabyteDB
         run: bash scripts/ci/start-yugabytedb.sh consent
