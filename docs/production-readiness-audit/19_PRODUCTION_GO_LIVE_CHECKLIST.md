@@ -11,6 +11,118 @@
 
 P2 priority does not automatically make a gate optional. Requirements ownership, the authoritative read contract or a role decision can be a prerequisite for a critical journey. Release management must record scope, owner, test environment/version, immutable artifact/source identity, results and approval. Do not approve all eight consumer apps solely because this backend starts.
 
+## Phase 1: Consent Integrity, Evidence & Governance
+
+These release gates govern the cryptographic, temporal, and policy invariants of NVUTO Consent and must be formally signed off by the Privacy Owner and Lead Engineer prior to traffic routing.
+
+- [ ] **G-001** (**P0**): Stale DOI challenges cannot restore permission after later denial or withdrawal. (Verified via [AT-001](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-001))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-003** (**P1**): Self-service initiation does not expose raw confirmation secret; trusted delivery verified. (Verified via [AT-003](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-003))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-004** (**P1**): Receipt hashes survive pgx/YSQL/JSON round-trip serialization. (Verified via [AT-004](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-004))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-005** (**P1**): Notice and receipt records cryptographically bind accepted notice content and full decision. (Verified via [AT-005](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-005))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-006** (**P1**): Evaluation time and current-state ordering implement a deterministic consent timeline. (Verified via [AT-006](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-006))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-007** (**P1**): Stronger policy requirements re-enforced against existing grants and pending confirmations. (Verified via [AT-007](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-007))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-008** (**P1**): Upgraded legacy grants cannot bypass governed policy checks when notice_version is blank. (Verified via [AT-008](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-008))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-029** (**P1**): Immutable audit rows reconstruct full policy and suppression history. (Verified via [AT-029](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-029))
+  > Sign-off: _______________________ (Date: _____________)
+
+## Phase 2: Security, Identity & Access Control
+
+These release gates govern the authentication boundaries, vulnerability assessments, transport security, and least-privilege RBAC rules of NVUTO Consent and must be formally signed off by the Platform Security Lead and Identity & Access Management (IAM) Owner prior to traffic routing.
+
+- [ ] **G-002** (**P1**): DOI confirmation enforces self-service `customer_subject_id` boundary. (Verified via [AT-002](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-002))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-011** (**P1**): Pinned Go toolchain and dependencies pass govulncheck and container/SBOM scans. (Verified via [AT-011](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-011))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-014** (**P1**): Unknown JWT `kid` values cannot trigger unbounded JWKS refresh amplification. (Verified via [AT-014](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-014))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-019** (**P1**): End-to-end TLS and least-privilege YSQL/JetStream/cluster identities verified. (Verified via [AT-019](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-019))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-030** (**P1**): Mixed `self_service` and reader roles cannot authorize tenant-wide writes. (Verified via [AT-030](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-030))
+  > Sign-off: _______________________ (Date: _____________)
+
+## Phase 3: Reliability, Persistence, Messaging & Operations
+
+These release gates govern system resilience, outbox worker lease fencing, event ordering contracts, database transaction budgets, telemetry, and disaster recovery procedures of NVUTO Consent and must be formally signed off by the Site Reliability Engineering (SRE) Lead and Data Infrastructure Owner prior to production traffic routing.
+
+- [ ] **G-009** (**P1**): Outbox worker lease completion and retry fenced to current claim owner. (Verified via [AT-009](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-009))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-010** (**P1**): CloudEvents carry monotonic ordering/reconciliation contract. (Verified via [AT-010](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-010))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-012** (**P1**): Database operations respect request cancellation and bounded transaction budgets. (Verified via [AT-012](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-012))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-013** (**P2**): Internal database errors return safe `5xx`/`503` responses instead of `422`. (Verified via [AT-013](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-013))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-015** (**P1**): Readiness probe verifies auth configuration and required schema migrations. (Verified via [AT-015](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-015))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-016** (**P1**): Full HTTP/YSQL integration, transaction contention, and multi-node HA verified. (Verified via [AT-016](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-016))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-017** (**P1**): CI executes durable idempotency concurrency test and `001→002→003` upgrade verification. (Verified via [AT-017](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-017))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-018** (**P1**): Immutable container digests and reproducible deployment/rollback verified in staging. (Verified via [AT-018](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-018))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-020** (**P1**): Worker validates existing NATS JetStream stream durability, subjects, and retention. (Verified via [AT-020](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-020))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-021** (**P1**): Outbox lag alerts, structured error correlation, and operational dashboards verified. (Verified via [AT-021](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-021))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-022** (**P1**): Target YSQL backup, PITR restore, and outbox/broker reconciliation drill completed within RPO/RTO. (Verified via [AT-022](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-022))
+  > Sign-off: _______________________ (Date: _____________)
+
+## Phase 4: Consumer Integration, Contract Completeness & Final GO Sign-Off
+
+These final gates govern downstream consumer validation, schema contract lock-in, and cross-functional operational authorizations, and must be formally signed off by the Product Owner, Privacy/Legal Counsel, and Release Management before the official production Go-Live sequence is initiated.
+
+- [ ] **G-023** (**P1**): Approved NVUTO launch consumers (`INT-01..INT-08`) pass end-to-end staging UAT. (Verified via [AT-023](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-023))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-024** (**P2**): Preference discovery, registry read ownership, and OpenAPI contract published. (Verified via [AT-024](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-024))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-025** (**P2**): Idempotency replay contract under policy/state changes verified. (Verified via [AT-025](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-025))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-026** (**P2**): Memory-store composite key collision fixed and aligned with durable store. (Verified via [AT-026](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-026))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-027** (**P2**): Strict JSON decoding (reject trailing values) and input normalization verified. (Verified via [AT-027](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-027))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-028** (**P2**): Database tenant/state foreign-key and check constraints enforced. (Verified via [AT-028](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-028))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-031** (**P2**): Legacy non-atomic `Record`/`Upsert` bypass removed or restricted. (Verified via [AT-031](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-031))
+  > Sign-off: _______________________ (Date: _____________)
+
+- [ ] **G-032** (**P2**): Approved launch requirements, capacity SLOs, and regional privacy decisions signed off by Product, Privacy/Legal, Security, QA, and SRE/Release owners. (Verified via [AT-032](14_TESTING_QA_AND_VERIFICATION_REPORT.md#at-032))
+  > Sign-off: _______________________ (Date: _____________)
+
 ## Existing positive evidence (does not clear the open gates)
 
 | Verification | Observed result | Boundary |
